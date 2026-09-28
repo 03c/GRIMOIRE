@@ -214,9 +214,14 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
         sycl::local_accessor<float, 1> e2m1_slm(16, hc);
 
 
+        // WG_SUBGROUPS sub-groups x R rows = rows_per_wg rows per group.
+        // This launched rows_per_wg SUB-GROUPS before, so at R > 1 every
+        // group also recomputed its neighbour's rows (same values, written
+        // twice) -- R times the work, which is what the "R=4 slower than
+        // R=1" measurement below was actually seeing.
         hc.parallel_for(
-            sycl::nd_range<1>(size_t(n_groups) * rows_per_wg * SG_SIZE,
-                              size_t(rows_per_wg) * SG_SIZE),
+            sycl::nd_range<1>(size_t(n_groups) * WG_SUBGROUPS * SG_SIZE,
+                              size_t(WG_SUBGROUPS) * SG_SIZE),
             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
                 float* lut  = lut_slm.template get_multi_ptr<sycl::access::decorated::no>().get();
                 float* slut = e8m0_slm.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -428,10 +433,11 @@ sycl::event mova_decode_impl(sycl::queue& q, const QuantWeight& w, const float* 
                              int M, int N, int E, int top_k,
                              const std::vector<sycl::event>& deps) {
     // Rows per sub-group.  Each row is top_k independent streams already;
-    // B70_MOVA_ROWS sweeps it without a rebuild.
+    // B70_MOVA_ROWS sweeps it without a rebuild.  Measured on K2, 256
+    // tokens: 1 -> 4.375 s, 2 -> 4.504 s, 4 -> 4.776 s.
     static const int rows = []{ const char* e = std::getenv("B70_MOVA_ROWS");
-        int v = (e && *e) ? std::atoi(e) : 2;
-        return (v == 1 || v == 2 || v == 4) ? v : 2; }();
+        int v = (e && *e) ? std::atoi(e) : 1;
+        return (v == 1 || v == 2 || v == 4) ? v : 1; }();
     switch (rows) {
         case 1:  return mova_decode_impl_r<F, 1>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
         case 4:  return mova_decode_impl_r<F, 4>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);

@@ -1639,6 +1639,70 @@ sycl::event launch_router_topk_k2(
     int32_t* out_expert, float* out_weight,
     bool normalize, float scaling,
     const std::vector<sycl::event>& deps) {
+    // Register-resident form: every expert's sigmoid is computed ONCE and
+    // kept in its lane, so a selection pass is PL compares and two
+    // sub-group reductions.  The loop below reloads the logits and redoes
+    // exp() for every expert on every one of the top_k passes -- measured
+    // 16.9 us for 8 of K2's 100 experts, per MoE layer and again for MoVA.
+    // Same ranking (lowest index wins a tie), same winner weight (the
+    // unbiased sigmoid of its own logit), same normalise-then-scale order,
+    // so the two produce identical routes and weights.
+    constexpr int PL = 8;
+    if (n_experts <= SG_SIZE * PL) {
+        return q.submit([&](sycl::handler& h) {
+            h.depends_on(deps);
+            h.parallel_for(
+                sycl::nd_range<1>(size_t(tokens) * SG_SIZE, SG_SIZE),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                    const auto sg = it.get_sub_group();
+                    const int lane = int(sg.get_local_id()[0]);
+                    const int t = int(it.get_group(0));
+                    const float* row = logits + int64_t(t) * n_experts;
+                    int32_t* oe = out_expert + int64_t(t) * top_k;
+                    float* ow = out_weight + int64_t(t) * top_k;
+                    constexpr float ninf = -std::numeric_limits<float>::infinity();
+                    float sel[PL], sc[PL];
+                    #pragma unroll
+                    for (int i = 0; i < PL; ++i) {
+                        const int e = lane + i * SG_SIZE;
+                        sc[i] = 0.0f; sel[i] = ninf;
+                        if (e < n_experts) {
+                            sc[i]  = 1.0f / (1.0f + sycl::exp(-row[e]));
+                            sel[i] = sc[i] + (bias ? bf16_to_f32(bias[e]) : 0.0f);
+                        }
+                    }
+                    for (int s = 0; s < top_k; ++s) {
+                        // e rises with i inside a lane: strict > keeps the
+                        // lowest index on a tie, as the loop form does
+                        float cv = ninf; int ci = INT_MAX;
+                        #pragma unroll
+                        for (int i = 0; i < PL; ++i)
+                            if (sel[i] > cv) { cv = sel[i]; ci = lane + i * SG_SIZE; }
+                        const float bv = sycl::reduce_over_group(
+                            sg, cv, sycl::maximum<float>());
+                        const int bi = sycl::reduce_over_group(
+                            sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
+                            sycl::minimum<int>());
+                        float w = 0.0f;
+                        #pragma unroll
+                        for (int i = 0; i < PL; ++i)
+                            if (lane + i * SG_SIZE == bi) { w = sc[i]; sel[i] = ninf; }
+                        w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
+                        if (lane == 0) { oe[s] = bi; ow[s] = w; }   // UNBIASED
+                    }
+                    if (lane == 0) {
+                        if (normalize) {
+                            float sum = 0.0f;
+                            for (int s = 0; s < top_k; ++s) sum += ow[s];
+                            if (sum > 0.0f)
+                                for (int s = 0; s < top_k; ++s) ow[s] /= sum;
+                        }
+                        if (scaling != 1.0f)
+                            for (int s = 0; s < top_k; ++s) ow[s] *= scaling;
+                    }
+                });
+        });
+    }
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(
