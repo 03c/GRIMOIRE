@@ -1058,13 +1058,15 @@ sycl::event launch_qk_norm_rope_batched(
                 float* p = isq ? qv + (int64_t(t) * q_heads + hi) * dim
                                : kv + (int64_t(t) * k_heads + hi) * dim;
                 const bf16_t* w = isq ? qw : kw;
-                float ss = 0.0f;
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    ss = sycl::fma(p[d], p[d], ss);
-                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
-                const float scale = sycl::rsqrt(ss / float(dim) + eps);
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                if (w) {    // null weight = no q/k norm (K2-Horizon): RoPE only
+                    float ss = 0.0f;
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        ss = sycl::fma(p[d], p[d], ss);
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                }
                 sycl::group_barrier(sg);
                 const int pos = start_pos + t;
                 for (int j = lane; j < rot / 2; j += SG_SIZE) {
@@ -1107,13 +1109,17 @@ sycl::event launch_qk_norm_rope_batched_qg(
                                : kv + (int64_t(t) * k_heads + hi) * dim;
                 const float* src = isq ? qg + (int64_t(t) * q_heads + hi) * 2 * dim : p;
                 const bf16_t* w = isq ? qw : kw;
-                float ss = 0.0f;
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    ss = sycl::fma(src[d], src[d], ss);
-                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
-                const float scale = sycl::rsqrt(ss / float(dim) + eps);
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    p[d] = src[d] * (scale * (weight_offset + bf16_to_f32(w[d])));
+                if (w) {    // null weight = no q/k norm: copy, RoPE only
+                    float ss = 0.0f;
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        ss = sycl::fma(src[d], src[d], ss);
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        p[d] = src[d] * (scale * (weight_offset + bf16_to_f32(w[d])));
+                } else {
+                    for (int d = lane; d < dim; d += SG_SIZE) p[d] = src[d];
+                }
                 sycl::group_barrier(sg);
                 const int pos = start_pos + t;
                 for (int j = lane; j < rot / 2; j += SG_SIZE) {
@@ -1169,13 +1175,15 @@ sycl::event launch_qk_norm_rope_proportional_batched(
                 float* p = isq ? qv + (int64_t(t) * q_heads + hi) * dim
                                : kv + (int64_t(t) * k_heads + hi) * dim;
                 const bf16_t* w = isq ? qw : kw;
-                float ss = 0.0f;
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    ss = sycl::fma(p[d], p[d], ss);
-                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
-                const float scale = sycl::rsqrt(ss / float(dim) + eps);
-                for (int d = lane; d < dim; d += SG_SIZE)
-                    p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                if (w) {    // null weight = no q/k norm (K2-Horizon): RoPE only
+                    float ss = 0.0f;
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        ss = sycl::fma(p[d], p[d], ss);
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                }
                 sycl::group_barrier(sg);
                 const int pos = start_pos + t;
                 for (int i = lane; i < rot; i += SG_SIZE) {
@@ -1884,15 +1892,17 @@ sycl::event launch_qk_norm_rope_bf16_batched(sycl::queue&q,sycl_bf16*qv,
       kv+(int64_t(t)*k_heads+hi)*dim;const bf16_t*w=isq?qw:kw;float ss=0;
     for(int d=lane;d<dim;d+=SG_SIZE){float v=float(p[d]);ss=sycl::fma(v,v,ss);}
     ss=sycl::reduce_over_group(sg,ss,sycl::plus<float>());
-    float scale=sycl::rsqrt(ss/float(dim)+eps);int pos=start_pos+t;
+    // null weight = no q/k norm (K2-Horizon): factor 1, RoPE only
+    float scale=w?sycl::rsqrt(ss/float(dim)+eps):1.0f;int pos=start_pos+t;
+    auto nf=[&](int d){return w?scale*(1.0f+bf16_to_f32(w[d])):1.0f;};
     for(int j=lane;j<rot/2;j+=SG_SIZE){
-      float a=float(p[j])*scale*(1.0f+bf16_to_f32(w[j]));
-      float b=float(p[j+rot/2])*scale*(1.0f+bf16_to_f32(w[j+rot/2]));
+      float a=float(p[j])*nf(j);
+      float b=float(p[j+rot/2])*nf(j+rot/2);
       float inv=sycl::exp(-float(2*j)/float(rot)*sycl::log(theta));
       float ang=float(pos)*inv,cs=sycl::cos(ang),sn=sycl::sin(ang);
       p[j]=sycl_bf16(a*cs-b*sn);p[j+rot/2]=sycl_bf16(a*sn+b*cs);}
     for(int d=rot+lane;d<dim;d+=SG_SIZE)
-      p[d]=sycl_bf16(float(p[d])*scale*(1.0f+bf16_to_f32(w[d])));
+      p[d]=sycl_bf16(float(p[d])*nf(d));
    });});
 }
 

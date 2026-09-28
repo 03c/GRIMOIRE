@@ -812,12 +812,17 @@ sycl::event launch_qk_norm_rope(sycl::queue& q, float* qv, float* kv,
                 const int hi = is_q ? head : head - q_heads;
                 float* p = (is_q ? qv : kv) + int64_t(hi) * dim;
                 const bf16_t* w = is_q ? qw : kw;
-                float ss = 0.0f;
-                for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
-                ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
-                const float scale = sycl::rsqrt(ss / float(dim) + eps);
-                for (int i = lane; i < dim; i += SG_SIZE)
-                    p[i] *= scale * (1.0f + bf16_to_f32(w[i]));
+                // No q/k norm weight (K2-Horizon: query_key_norm=false) means
+                // no q/k norm at all -- RoPE only.  Reading w[] through the
+                // null pointer faulted on the device and hung the engine.
+                if (w) {
+                    float ss = 0.0f;
+                    for (int i = lane; i < dim; i += SG_SIZE) ss = sycl::fma(p[i], p[i], ss);
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                    for (int i = lane; i < dim; i += SG_SIZE)
+                        p[i] *= scale * (1.0f + bf16_to_f32(w[i]));
+                }
                 sycl::group_barrier(sg);
                 const int pos = *d_pos;
                 for (int j = lane; j < rot / 2; j += SG_SIZE) {

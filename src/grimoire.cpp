@@ -9201,7 +9201,19 @@ const float* Grimoire::forward(int token) {
     for (int i = layer_begin; i < layer_end; ++i) {
         LayerDev& d = L[i];
         const bool mk = timeline && (i == tl_lin || i == tl_full);
-        auto MK = [&](const char* t) { if (mk) mark(t); };
+        // GRIMOIRE_TRACE_DECODE=1: wait + print after every marked step of
+        // the FIRST decoded token (see GRIMOIRE_TRACE_PREFILL)
+        static const bool trace_dec = std::getenv("GRIMOIRE_TRACE_DECODE") != nullptr;
+        static int trace_dec_tokens = 0;
+        if (trace_dec && i == layer_begin) ++trace_dec_tokens;
+        auto MK = [&](const char* t) {
+            if (mk) mark(t);
+            if (trace_dec && trace_dec_tokens == 1) {
+                q.wait();
+                std::fprintf(stderr, "[trace-d] L%d %s\n", i, t);
+                std::fflush(stderr);
+            }
+        };
 
         // ---- attention block ------------------------------------------
         // h is the residual stream throughout. rmsnorm_residual folds
@@ -12618,7 +12630,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     std::chrono::high_resolution_clock::time_point tl_prev;
     std::map<std::string,double> tl_sums;
     std::vector<std::string> tl_order;
+    // GRIMOIRE_TRACE_PREFILL=1: wait + print after EVERY region of every
+    // layer, flushed -- the last line before a device hang names the region
+    // that hung (the K2-Horizon engine reset of 2026-09-26).
+    static const bool trace_prefill=std::getenv("GRIMOIRE_TRACE_PREFILL")!=nullptr;
     auto pp_mark=[&](const char* completed_region){
+        if(trace_prefill){
+            q.wait();
+            std::fprintf(stderr,"[trace-p] L%d %s\n",cur_layer,completed_region);
+            std::fflush(stderr);
+        }
         if(host_time){
             if(!tl_active) return;
             if(!(time_all||cur_layer==time_layer)) return;
@@ -14193,7 +14214,23 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
         std::fprintf(stderr,"load: %s\n",err.c_str());e.release();return 1;
     }
     try {
-        const auto ids=tk.encode(tk.apply_chat_template(prompt));
+        auto ids=tk.encode(tk.apply_chat_template(prompt));
+        // GRIMOIRE_PROMPT_IDS="1,2,3": run exactly these token ids (skips the
+        // tokenizer and chat template) -- to compare against a reference
+        // model on identical input.  GRIMOIRE_PRINT_IDS=1 prints the ids used.
+        if(const char* pi=std::getenv("GRIMOIRE_PROMPT_IDS")){
+            ids.clear();
+            for(const char* c=pi;*c;){
+                char* end=nullptr;const long v=std::strtol(c,&end,10);
+                if(end==c){++c;continue;}
+                ids.push_back(int32_t(v));c=end;
+            }
+        }
+        if(std::getenv("GRIMOIRE_PRINT_IDS")){
+            std::fprintf(stderr,"prompt ids (%zu):",ids.size());
+            for(int32_t t:ids)std::fprintf(stderr," %d",t);
+            std::fprintf(stderr,"\n");
+        }
         std::vector<int32_t> out;
         ResponseDecoder decoder(tk,tk.special_id("<|begin_of_text|>")>=0);
         auto emit=[](const std::string& piece,bool) {

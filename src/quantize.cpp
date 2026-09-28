@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <exception>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 namespace b70 {
 namespace {
@@ -32,6 +36,28 @@ uint8_t pick_e8m0(float amax, int emax_elem) {
 }
 
 } // namespace
+
+// Rows are independent and every loop below writes only its own rows, so
+// big matrices are split across threads (bit-identical output).  Loading a
+// BF16 checkpoint quantizes every weight here, on the host: K2-Horizon's
+// 75 GB took ~6 minutes on one thread.
+template <class F>
+static void for_rows(int N, size_t work, F&& fn) {
+    const int hw = int(std::thread::hardware_concurrency());
+    const int T = work < (size_t(1) << 20) ? 1 : std::max(1, std::min(16, std::min(hw, N)));
+    if (T <= 1) { fn(0, N); return; }
+    std::vector<std::thread> th;
+    std::exception_ptr err;
+    std::mutex mu;
+    for (int t = 0; t < T; ++t)
+        th.emplace_back([&, t] {
+            const int n0 = int(int64_t(N) * t / T), n1 = int(int64_t(N) * (t + 1) / T);
+            try { fn(n0, n1); }
+            catch (...) { std::lock_guard<std::mutex> g(mu); if (!err) err = std::current_exception(); }
+        });
+    for (auto& x : th) x.join();
+    if (err) std::rethrow_exception(err);
+}
 
 PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
     if (!src || N <= 0 || K <= 0 || K > std::numeric_limits<int>::max() / 2)
@@ -61,7 +87,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
 
     // -----------------------------------------------------------------
     case Fmt::BF16: {
-        for (int n = 0; n < N; ++n) {
+        for_rows(N, count, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
             uint8_t* row = w.payload.data() + int64_t(n) * w.row_bytes;
             for (int k = 0; k < K; ++k) {
                 bf16_t b = f32_to_bf16(src[int64_t(n) * K + k]);
@@ -69,6 +96,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                 row[2 * k + 1] = uint8_t(b.bits >> 8);
             }
         }
+        });
         break;
     }
 
@@ -82,7 +110,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
         const float target = (fmt == Fmt::INT8)     ? 127.0f
                            : (fmt == Fmt::FP8_E4M3) ? 448.0f
                                                     : 57344.0f;
-        for (int n = 0; n < N; ++n) {
+        for_rows(N, count, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
             const float* in  = src + int64_t(n) * K;
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             const float  am  = absmax(in, K);
@@ -102,6 +131,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                 }
             }
         }
+        });
         break;
     }
 
@@ -114,7 +144,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
         w.scales_raw.assign(size_t(N) * G * sizeof(bf16_t), 0);
         w.zeros.assign(size_t(N) * G, 0);
         bf16_t* sc = reinterpret_cast<bf16_t*>(w.scales_raw.data());
-        for (int n = 0; n < N; ++n) {
+        for_rows(N, count, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
             const float* in  = src + int64_t(n) * K;
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             for (int g = 0; g < G; ++g) {
@@ -153,6 +184,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                 }
             }
         }
+        });
         break;
     }
 
@@ -163,7 +195,8 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
         const int B      = w.row_scales;
         const int emax   = (fmt == Fmt::MXFP8) ? kEmaxE4M3 : kEmaxE2M1;
         w.scales_raw.assign(size_t(N) * B, 0);
-        for (int n = 0; n < N; ++n) {
+        for_rows(N, count, [&](int n0, int n1) {
+        for (int n = n0; n < n1; ++n) {
             const float* in  = src + int64_t(n) * K;
             uint8_t*     row = w.payload.data() + int64_t(n) * w.row_bytes;
             for (int b = 0; b < B; ++b) {
@@ -185,6 +218,7 @@ PackedWeight quantize(const float* src, int N, int K, Fmt fmt) {
                 }
             }
         }
+        });
         break;
     }
     }
