@@ -10091,6 +10091,20 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
                 gemv_any(w,x+int64_t(r)*w.w.K,y+int64_t(r)*w.w.N,{});
             return;
         }
+        // A draft block is 15-16 rows.  launch_gemm_xmx only has a fast
+        // path from 32 rows up (gemm_fast_supported); below that it falls
+        // to gemm_flt, whose 512-row tile turns every drafter projection
+        // and the target's 248K-row lm_head into a near-serial pass --
+        // MEASURED in pure mode: DFlash2 at 1.7 tok/s on Qwen3.8-27B and
+        // 2.3 on Ornith, ~1 s per draft+verify step.  The bridge's M16
+        // kernel used to hide this.  Same routing as prefill's mm() for
+        // verify batches: the batched GEMV reads each weight once per 4
+        // rows and is bit-identical per row to decode's GEMV.
+        if(!dense && rows<=16 && w.w.payload && !w.has_i4() &&
+           !std::getenv("GRIMOIRE_DFLASH_DRAFT_XMX")){
+            launch_gemv_batch(q,w.w,x,y,rows,{});
+            return;
+        }
         launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
         if(dense&&w.w.fmt==Fmt::MXFP4&&w.w.payload){
             dense(&q,dflash2.bf,w.w.payload,
@@ -10482,12 +10496,18 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
     if(dflash2.selector_ok){
         const int steps=M-1, K=16, TK=dflash2.selector_top_k;
         const int rank=dflash2.selector_rank;
-        // topk16_rows assumes a packed row; the draft logits can be padded
-        // (draft_logits_stride != draft_vocab), so feed it one row at a time.
-        for(int r=0;r<steps;++r)
-            launch_topk16_rows(q,dflash2.logits+int64_t(r)*draft_stride,1,
-                               draft_vocab,dflash2.sel_ids+int64_t(r)*K,
-                               dflash2.sel_unary+int64_t(r)*K,{});
+        // All draft rows in ONE launch; the stride covers padded logits rows
+        // (draft_logits_stride != draft_vocab).  GRIMOIRE_TOPK16_LOOP=1 is
+        // the old one-sub-group-per-row kernel, one launch per row.
+        static const bool topk_loop=std::getenv("GRIMOIRE_TOPK16_LOOP")!=nullptr;
+        if(topk_loop){
+            for(int r=0;r<steps;++r)
+                launch_topk16_rows(q,dflash2.logits+int64_t(r)*draft_stride,1,
+                                   draft_vocab,dflash2.sel_ids+int64_t(r)*K,
+                                   dflash2.sel_unary+int64_t(r)*K,{});
+        }else launch_topk16_rows_strided(q,dflash2.logits,steps,draft_vocab,
+                                         draft_stride,dflash2.sel_ids,
+                                         dflash2.sel_unary,{});
         if(vocab_map){
             // candidates are rows of the REDUCED head; the codebooks are
             // indexed by real vocabulary id, so map before scoring.
@@ -12336,7 +12356,14 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if (cfg.is_muse) {
         if (seqb) return prefill_sandwich(tokens, next_tokens, false, seqb);
         if(std::getenv("GRIMOIRE_MUSE_SEQUENTIAL_PREFILL"))return false;
-        return prefill_muse(tokens,next_tokens,allow_exact_restore);
+        // prefill_muse is the bridge path (paged FA2 + oneDNN W4A16/FP16).
+        // With a bridge missing it declines BEFORE submitting any work, and
+        // in pure mode that left every Muse prompt to the one-token-at-a-
+        // time fallback: MEASURED 475.6 s for a 5947-token prompt.
+        // prefill_sandwich is the same sandwich graph on GRIMOIRE's own
+        // kernels -- the multi-sequence path already runs Muse through it.
+        if (prefill_muse(tokens,next_tokens,allow_exact_restore)) return true;
+        return prefill_sandwich(tokens, next_tokens, allow_exact_restore, seqb);
     }
     // gemma-4 has its own batched prefill: the loop below is the Qwen
     // residual graph -- attention output added raw, normalised on the way
@@ -14449,7 +14476,12 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     static const bool spec_stats=[]{ const char* s=std::getenv("GRIMOIRE_SPEC_STATS");
         return s && *s && std::atoi(s)!=0; }();
     SpecStats stats;
-    if(spec_stats && (o.dflash||o.mtp)) o.stats=&stats;
+    // GRIMOIRE_SPEC_TIME=1: per-phase time of a speculative round (snapshot,
+    // draft, verify, commit), each fenced -- the split an A/B between a
+    // cheaper and a more accurate drafter needs.  Implies the stats line.
+    static const bool spec_time=std::getenv("GRIMOIRE_SPEC_TIME")!=nullptr;
+    if((spec_stats||spec_time) && (o.dflash||o.mtp)) o.stats=&stats;
+    if(spec_time && o.stats) stats.fence=[&e]{ e.sync(); };
     FinishReason reason=FinishReason::Length;
     try {
         const int n=generate_tokens(e,prompt_ids,o,out_ids,on_token,reason);
@@ -14460,6 +14492,14 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
                         o.dflash?(e.dflash2.v2?"DFlash2":"DFlash"):"MTP",
                         o.draft_depth, stats.per_step(), stats.accepted,
                         stats.drafted, 100.0*stats.rate(), stats.steps);
+        if(o.stats && stats.steps && spec_time){
+            const double s=double(stats.steps);
+            std::printf("  spec time per step (ms, fenced): snapshot %.2f  draft %.2f  "
+                        "verify %.2f  commit %.2f  = %.2f\n",
+                        stats.snap_ms/s, stats.draft_ms/s, stats.verify_ms/s,
+                        stats.commit_ms/s,
+                        (stats.snap_ms+stats.draft_ms+stats.verify_ms+stats.commit_ms)/s);
+        }
         return n;
     } catch(...) {
         // A failed verifier may have advanced recurrent state. A subsequent

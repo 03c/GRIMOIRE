@@ -213,8 +213,216 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
             });
     });
 }
+// ---------------------------------------------------------------------
+// GQA-shared split-K decode.
+//
+// launch_flash_decode_impl gives every QUERY head its own sub-group, so a KV
+// head's bytes are fetched once per query head that shares it (4x on K2, 6x
+// on Qwen3.8-27B), and it fetches them one byte per lane: a lane scores one
+// key, so each of the head_dim K loads moves 16 useful bytes, and V costs
+// head_dim/16 byte gathers per key.  MEASURED on K2 at a 5768-token context:
+// 421 us per layer (+32 merge) for 11.8 MB of FP8 KV, two-thirds of the
+// whole decode token.  Load-message count, not bandwidth, is the limit --
+// batching those loads (same message count) measured no change at all.
+//
+// Here one sub-group owns (kv head, split, chunk of GC query heads):
+//   K: a lane owns KPL=4 consecutive keys, so ONE 32-bit load per dim gives
+//      4 keys, and every loaded K value is used by all GC heads;
+//   V: a lane owns HD/16 CONTIGUOUS dims, one 8- or 16-byte load per key,
+//      again shared by the GC heads.
+// Dot products keep the old kernel's operands and FMA order over d, so the
+// scores are bit-identical; the online softmax runs over 64-key blocks
+// instead of 16, which changes rounding only.  The split partition and the
+// [head][split][head_dim] partials are unchanged, so launch_flash_merge is
+// untouched.  GRIMOIRE_FLASH_DECODE_OLD=1 restores the per-head kernel.
+// ---------------------------------------------------------------------
+template <int HD, int GC>
+static sycl::event flash_decode_gqa(sycl::queue& q, const AttnParams& p,
+                                    const std::vector<sycl::event>& deps) {
+    constexpr int DPL = HD / SG_SIZE;          // V dims per lane
+    constexpr int KPL = 4;                     // keys per lane per block
+    constexpr int KB  = SG_SIZE * KPL;         // 64 keys per block
+    static_assert(DPL % 8 == 0, "V is read 8 bytes at a time");
+    const int G      = p.num_heads / p.num_kv_heads;
+    const int chunks = G / GC;
+    const int splits = decode_splits(p);
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const AttnParams pp = p;
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(pp.num_kv_heads) * chunks * splits * SG_SIZE,
+                              size_t(SG_SIZE)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                constexpr float NINF = -std::numeric_limits<float>::infinity();
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  gid  = int(it.get_group(0));
+                const int  part = gid % splits;
+                const int  rest = gid / splits;
+                const int  kvh  = rest / chunks;
+                const int  head0 = kvh * G + (rest % chunks) * GC;
+
+                // The same slice launch_flash_decode_impl gives this split.
+                const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+                const int lo    = pp.window_left > 0
+                                ? sycl::max(0, seq - pp.window_left) : 0;
+                const int span  = seq - lo;
+                const int per   = (span + splits - 1) / splits;
+                const int s_beg = lo + part * per;
+                const int s_end = sycl::min(s_beg + per, seq);
+
+                const uint8_t* kh = pp.k_cache + int64_t(kvh) * HD * pp.seq_cap;
+                const uint8_t* vh = pp.v_cache + int64_t(kvh) * pp.seq_cap * HD;
+                const float*   qb = pp.q + int64_t(head0) * HD;
+
+                float m[GC], l[GC], acc[GC][DPL];
+                #pragma unroll
+                for (int g = 0; g < GC; ++g) {
+                    m[g] = NINF; l[g] = 0.0f;
+                    #pragma unroll
+                    for (int i = 0; i < DPL; ++i) acc[g][i] = 0.0f;
+                }
+
+                // Blocks start 4-aligned so each lane's 4 keys are one aligned
+                // 32-bit word; keys before s_beg are masked.  seq_cap % 4 == 0
+                // (checked at dispatch) keeps the last word inside its row.
+                for (int b0 = s_beg & ~(KPL - 1); b0 < s_end; b0 += KB) {
+                    const int sk = b0 + lane * KPL;
+
+                    // ---- scores: 4 keys x GC heads per 32-bit K load ------
+                    float sc[GC][KPL];
+                    #pragma unroll
+                    for (int g = 0; g < GC; ++g)
+                        #pragma unroll
+                        for (int k = 0; k < KPL; ++k) sc[g][k] = 0.0f;
+                    if (sk < s_end) {
+                        const uint8_t* kc = kh + sk;
+                        #pragma unroll 8
+                        for (int d = 0; d < HD; ++d) {
+                            const uint32_t kw = *reinterpret_cast<const uint32_t*>(
+                                kc + int64_t(d) * pp.seq_cap);
+                            float kf[KPL];
+                            #pragma unroll
+                            for (int k = 0; k < KPL; ++k)
+                                kf[k] = e4m3_to_f32(uint8_t(kw >> (8 * k)));
+                            #pragma unroll
+                            for (int g = 0; g < GC; ++g) {
+                                const float qd = qb[g * HD + d];
+                                #pragma unroll
+                                for (int k = 0; k < KPL; ++k)
+                                    sc[g][k] = sycl::fma(qd, kf[k], sc[g][k]);
+                            }
+                        }
+                    }
+                    bool live[KPL];
+                    #pragma unroll
+                    for (int k = 0; k < KPL; ++k) {
+                        const int s = sk + k;
+                        live[k] = s >= s_beg && s < s_end;
+                        if (live[k] && pp.qbits) {        // QSA: selected blocks + tail
+                            const int tail = seq / pp.qrat * pp.qrat;
+                            const int b = s / pp.qrat;
+                            live[k] = s >= tail || ((pp.qbits[b >> 5] >> (b & 31)) & 1u);
+                        }
+                    }
+
+                    // ---- sub-group-uniform online softmax, per head ------
+                    float pr[GC][KPL];
+                    #pragma unroll
+                    for (int g = 0; g < GC; ++g) {
+                        float sv[KPL], mx = NINF;
+                        #pragma unroll
+                        for (int k = 0; k < KPL; ++k) {
+                            sv[k] = live[k] ? sc[g][k] * pp.softmax_scale : NINF;
+                            mx = sycl::fmax(mx, sv[k]);
+                        }
+                        const float mblk = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+                        const float mnew = sycl::fmax(m[g], mblk);
+                        // exp(-inf - -inf) is NaN; a still-empty accumulator
+                        // must not be scaled by it.
+                        const float corr = sycl::isinf(m[g]) ? 0.0f : sycl::exp(m[g] - mnew);
+                        float ps = 0.0f;
+                        #pragma unroll
+                        for (int k = 0; k < KPL; ++k) {
+                            pr[g][k] = sycl::isinf(sv[k]) ? 0.0f : sycl::exp(sv[k] - mnew);
+                            ps += pr[g][k];
+                        }
+                        l[g] = sycl::fma(l[g], corr,
+                                         sycl::reduce_over_group(sg, ps, sycl::plus<float>()));
+                        #pragma unroll
+                        for (int i = 0; i < DPL; ++i) acc[g][i] *= corr;
+                        m[g] = mnew;
+                    }
+
+                    // ---- V: one 8/16-byte load per key, keys ascending ---
+                    const int kn = sycl::min(KB, s_end - b0);
+                    for (int o = 0; o * KPL < kn; ++o) {
+                        #pragma unroll
+                        for (int kk = 0; kk < KPL; ++kk) {
+                            const int j = o * KPL + kk;
+                            if (j >= kn) break;
+                            float pj[GC];
+                            bool any = false;
+                            #pragma unroll
+                            for (int g = 0; g < GC; ++g) {
+                                pj[g] = sycl::group_broadcast(sg, pr[g][kk], o);
+                                any |= pj[g] != 0.0f;
+                            }
+                            if (!any) continue;          // masked key: no V read
+                            const uint8_t* vr = vh + int64_t(b0 + j) * HD + lane * DPL;
+                            float vf[DPL];
+                            #pragma unroll
+                            for (int w = 0; w < DPL / 8; ++w) {
+                                const uint64_t vw = *reinterpret_cast<const uint64_t*>(vr + 8 * w);
+                                #pragma unroll
+                                for (int b = 0; b < 8; ++b)
+                                    vf[8 * w + b] = e4m3_to_f32(uint8_t(vw >> (8 * b)));
+                            }
+                            #pragma unroll
+                            for (int g = 0; g < GC; ++g)
+                                #pragma unroll
+                                for (int i = 0; i < DPL; ++i)
+                                    acc[g][i] = sycl::fma(pj[g], vf[i], acc[g][i]);
+                        }
+                    }
+                }
+
+                // UNNORMALIZED partials + (m, l), exactly what the merge reads.
+                #pragma unroll
+                for (int g = 0; g < GC; ++g) {
+                    const int64_t pidx = int64_t(head0 + g) * splits + part;
+                    float* po = pp.partials + pidx * HD + lane * DPL;
+                    #pragma unroll
+                    for (int i = 0; i < DPL; ++i) po[i] = acc[g][i];
+                    if (lane == 0) {
+                        pp.part_m[pidx] = (s_beg >= s_end) ? NINF : m[g];
+                        pp.part_l[pidx] = (s_beg >= s_end) ? 0.0f : l[g];
+                    }
+                }
+            });
+    });
+}
+
 sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                                 const std::vector<sycl::event>& deps) {
+    static const bool old = std::getenv("GRIMOIRE_FLASH_DECODE_OLD") != nullptr;
+    // GC (heads per sub-group) is the largest divisor of the GQA group that
+    // keeps GC * head_dim/16 accumulators at 48 or fewer per lane.
+    if (!old && p.num_kv_heads > 0 && p.num_heads % p.num_kv_heads == 0 &&
+        (p.seq_cap % 4) == 0) {
+        const int G = p.num_heads / p.num_kv_heads;
+        if (p.head_dim == 128) {
+            if (G % 4 == 0) return flash_decode_gqa<128, 4>(q, p, deps);
+            if (G % 3 == 0) return flash_decode_gqa<128, 3>(q, p, deps);
+            if (G % 2 == 0) return flash_decode_gqa<128, 2>(q, p, deps);
+            return flash_decode_gqa<128, 1>(q, p, deps);
+        }
+        if (p.head_dim == 256) {
+            if (G % 3 == 0) return flash_decode_gqa<256, 3>(q, p, deps);
+            if (G % 2 == 0) return flash_decode_gqa<256, 2>(q, p, deps);
+            return flash_decode_gqa<256, 1>(q, p, deps);
+        }
+    }
     return p.head_dim > MAX_HEAD_DIM
          ? launch_flash_decode_impl<MAX_DPL_WIDE>(q, p, deps)
          : launch_flash_decode_impl<MAX_DPL>(q, p, deps);

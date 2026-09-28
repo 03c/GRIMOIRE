@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -24,6 +25,13 @@ struct SpecStats {
     long long accepted=0;   // draft tokens the verifier kept
     double per_step() const { return steps ? double(accepted)/double(steps) : 0.0; }
     double rate()     const { return drafted ? double(accepted)/double(drafted) : 0.0; }
+    // GRIMOIRE_SPEC_TIME=1: the caller installs a device fence and the loop
+    // times every phase of a round to it.  Diagnosis only -- the fences
+    // serialise host and device, so the sum runs a little above the
+    // untimed step.  Unset (the default, and every host test), no fence
+    // is called and nothing below is touched.
+    std::function<void()> fence;
+    double snap_ms=0, draft_ms=0, verify_ms=0, commit_ms=0;
 };
 struct GenerationOptions {
     int max_tokens=0, eos=-1, eot=-1, draft_depth=0;
@@ -177,7 +185,18 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
         if((o.dflash||o.mtp)&&k>0) {
             const int saved=e.pos;
             bool degraded=false;   // draft discarded unjudged, see below
+            const bool timed=o.stats&&o.stats->fence;
+            std::chrono::steady_clock::time_point t_lap;
+            auto lap=[&](double* acc){
+                if(!timed)return;
+                o.stats->fence();
+                const auto t=std::chrono::steady_clock::now();
+                if(acc)*acc+=std::chrono::duration<double,std::milli>(t-t_lap).count();
+                t_lap=t;
+            };
+            lap(nullptr);
             e.snapshot_recurrent();
+            if(timed)lap(&o.stats->snap_ms);
             std::vector<int32_t> candidates{tok};
             if(o.dflash) {
                 std::vector<int32_t> block;
@@ -193,8 +212,11 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 }
             }
             for(int t:candidates)if(t<0||t>=e.cfg.vocab)throw std::runtime_error("invalid draft token");
+            if(timed)lap(&o.stats->draft_ms);
             std::vector<int32_t> verified;
-            if(!e.prefill(candidates,&verified)) {
+            const bool batched_ok=e.prefill(candidates,&verified);
+            if(timed)lap(&o.stats->verify_ms);
+            if(!batched_ok) {
                 // The batched verify declined.  prefill() returns false
                 // only BEFORE it submits any work -- an unavailable
                 // batched path, or scratch it could not allocate -- so
@@ -266,6 +288,7 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
                 // position.
                 e.commit_spec_prefix(saved,accepted);
             }
+            if(timed)lap(&o.stats->commit_ms);
             for(int i=1;i<accepted;++i)if(!emit(candidates[i]))return int(out.size());
             tok=verified[accepted-1];
         } else {

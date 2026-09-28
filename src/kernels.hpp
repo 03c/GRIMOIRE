@@ -692,6 +692,11 @@ sycl::event launch_topk16_rows(
     sycl::queue& q, const float* logits, int rows, int vocab,
     int32_t* out_ids, float* out_values,
     const std::vector<sycl::event>& deps = {});
+// Same result, one launch for all rows; row r starts at logits + r*stride.
+sycl::event launch_topk16_rows_strided(
+    sycl::queue& q, const float* logits, int rows, int vocab, int64_t stride,
+    int32_t* out_ids, float* out_values,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_dflash2_selector_edges(
     sycl::queue& q, const bf16_t* predecessor, const bf16_t* successor,
     const int32_t* candidate_ids, const float* unary,

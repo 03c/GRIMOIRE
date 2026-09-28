@@ -1421,10 +1421,121 @@ sycl::event launch_dflash2_grouped_conv(
     });
 }
 
+// Top-16 per row, ordered by value descending then index ascending -- the
+// first 16 elements of that strict total order, so the result is unique and
+// any correct method returns exactly what the loop form below returns.
+//
+// The loop form gives a row to ONE sub-group that makes 16 passes over the
+// whole vocabulary, re-checking the picks so far on every element: MEASURED
+// ~65 ms per 248K-entry row, 974 ms of a ~1 s DFlash2 draft (15 rows, one
+// launch each).  Here a row gets a 512-lane work-group: one strided pass in
+// which each lane keeps its own sorted top-16 in registers (most elements are
+// rejected by a single compare), then a per-sub-group merge and a final
+// merge of the 32 sub-group lists through SLM.  Both merges take the next
+// pick as "the best element strictly after the previous pick", which needs
+// no list of what was already chosen.  All rows in one launch; `stride` lets
+// padded logits rows (draft_logits_stride) go in that same launch.
+namespace {
+inline bool topk_better(float av, int32_t ai, float bv, int32_t bi) {
+    return av > bv || (av == bv && ai < bi);
+}
+}
+sycl::event launch_topk16_rows_strided(
+    sycl::queue& q, const float* logits, int rows, int vocab, int64_t stride,
+    int32_t* out_ids, float* out_values,
+    const std::vector<sycl::event>& deps) {
+    constexpr int K = 16, SGS = 32, WG = SGS * SG_SIZE;
+    constexpr float NINF = -std::numeric_limits<float>::infinity();
+    constexpr float PINF =  std::numeric_limits<float>::infinity();
+    return q.submit([&](sycl::handler& h){
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1>   s_val(size_t(SGS) * K, h);
+        sycl::local_accessor<int32_t, 1> s_idx(size_t(SGS) * K, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg  = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int sgi  = int(sg.get_group_id()[0]);
+                const int lid  = int(it.get_local_id(0));
+                const int row  = int(it.get_group(0));
+                const float* lr = logits + int64_t(row) * stride;
+
+                // this lane's sorted top-16 (best first)
+                float   val[K];
+                int32_t idx[K];
+                #pragma unroll
+                for (int j = 0; j < K; ++j) { val[j] = NINF; idx[j] = INT_MAX; }
+                for (int v = lid; v < vocab; v += WG) {
+                    float cv = lr[v];
+                    int32_t ci = v;
+                    if (!topk_better(cv, ci, val[K - 1], idx[K - 1])) continue;
+                    #pragma unroll
+                    for (int j = 0; j < K; ++j)            // insert by carrying
+                        if (topk_better(cv, ci, val[j], idx[j])) {
+                            const float tv = val[j]; const int32_t ti = idx[j];
+                            val[j] = cv; idx[j] = ci; cv = tv; ci = ti;
+                        }
+                }
+
+                // merge the 16 lanes' lists -> this sub-group's top-16
+                float tv = PINF; int32_t ti = -1;           // "before everything"
+                float mv = NINF; int32_t mi = INT_MAX;       // lane `pick` keeps pick `pick`
+                for (int pick = 0; pick < K; ++pick) {
+                    float bv = NINF; int32_t bi = INT_MAX;
+                    #pragma unroll
+                    for (int j = 0; j < K; ++j)
+                        if (topk_better(tv, ti, val[j], idx[j]) &&
+                            topk_better(val[j], idx[j], bv, bi)) { bv = val[j]; bi = idx[j]; }
+                    const float   win = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
+                    const int32_t wid = sycl::reduce_over_group(
+                        sg, bv == win ? bi : INT_MAX, sycl::minimum<int32_t>());
+                    if (lane == pick) { mv = win; mi = wid; }
+                    tv = win; ti = wid;
+                }
+                s_val[sgi * K + lane] = mv;
+                s_idx[sgi * K + lane] = mi;
+                sycl::group_barrier(it.get_group());
+
+                // sub-group 0 merges the 32 lists (512 candidates, 32 per lane)
+                if (sgi == 0) {
+                    float   cv[SGS];
+                    int32_t cidx[SGS];
+                    #pragma unroll
+                    for (int t = 0; t < SGS; ++t) {
+                        cv[t]   = s_val[t * K + lane];
+                        cidx[t] = s_idx[t * K + lane];
+                    }
+                    float fv = PINF; int32_t fi = -1;
+                    for (int pick = 0; pick < K; ++pick) {
+                        float bv = NINF; int32_t bi = INT_MAX;
+                        #pragma unroll
+                        for (int t = 0; t < SGS; ++t)
+                            if (topk_better(fv, fi, cv[t], cidx[t]) &&
+                                topk_better(cv[t], cidx[t], bv, bi)) { bv = cv[t]; bi = cidx[t]; }
+                        const float   win = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
+                        const int32_t wid = sycl::reduce_over_group(
+                            sg, bv == win ? bi : INT_MAX, sycl::minimum<int32_t>());
+                        if (lane == 0) {
+                            out_ids[int64_t(row) * K + pick]    = wid;
+                            out_values[int64_t(row) * K + pick] = win;
+                        }
+                        fv = win; fi = wid;
+                    }
+                }
+            });
+    });
+}
+
 sycl::event launch_topk16_rows(
     sycl::queue& q, const float* logits, int rows, int vocab,
     int32_t* out_ids, float* out_values,
     const std::vector<sycl::event>& deps) {
+    // GRIMOIRE_TOPK16_LOOP=1 keeps the original one-sub-group-per-row form
+    // below as the reference for an A/B.
+    static const bool loop = std::getenv("GRIMOIRE_TOPK16_LOOP") != nullptr;
+    if (!loop)
+        return launch_topk16_rows_strided(q, logits, rows, vocab, vocab,
+                                          out_ids, out_values, deps);
     constexpr int K=16;
     return q.submit([&](sycl::handler& h){
         h.depends_on(deps);
