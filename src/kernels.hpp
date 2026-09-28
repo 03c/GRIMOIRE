@@ -558,6 +558,14 @@ sycl::event launch_softplus_gate(sycl::queue& q, const float* attn,
 // Fused MoVA value projection: routes stay on the device.  `w` is the E
 // experts packed expert-major as one [E*N][K] weight; rex/rwt are the
 // [M][top_k] routing table the K2 router wrote.  See ops.cpp.
+// The same projection for decode and small M: sub-group-cooperative dot
+// products with x staged in SLM (moe_kernels.cpp).  mova_value_packed is
+// kept as the plain reference (GRIMOIRE_MOVA_REF=1).
+sycl::event launch_mova_value_decode(
+    sycl::queue& q, const QuantWeight& w, const float* x,
+    const int32_t* rex, const float* rwt, float* y,
+    int M, int N, int E, int top_k,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_mova_value_packed(
     sycl::queue& q, const QuantWeight& w, const float* x,
     const int32_t* rex, const float* rwt, float* y,

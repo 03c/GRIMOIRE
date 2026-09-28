@@ -300,6 +300,145 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
     });
 }
 
+// ---------------------------------------------------------------------
+// K2 MoVA value projection, routed on the device (decode and small M).
+//
+//   y[n] = sum_j w_j * silu( V[e_j][n] . x )        e_j, w_j from rex/rwt
+//
+// V is the E value experts packed expert-major, one [E*N][K] weight, so
+// expert e's row n is global row e*N + n.  The structure is moe_down's --
+// x staged in SLM, the decode LUTs, GemvStep, the routing table read in the
+// kernel -- with one difference: SiLU sits between the dot product and the
+// router weight, so each slot is reduced across the sub-group before it is
+// accumulated.  moe_down can defer its single reduction because its
+// combine is linear; this one cannot.
+//
+// Replaces mova_value_packed_impl (ops.cpp) on this path, which gave each
+// output row to ONE work-item walking all K serially per expert: 1,024
+// work-items per layer at M=1, latency-bound, ~8 tok/s end to end on K2.
+// ---------------------------------------------------------------------
+template <Fmt F, int R>
+sycl::event mova_decode_impl_r(sycl::queue& q, const QuantWeight& w,
+                               const float* x,            // [M][K]
+                               const int32_t* rex,        // [M][top_k]
+                               const float* rwt,          // [M][top_k]
+                               float* y,                  // [M][N] out
+                               int M, int N, int E, int top_k,
+                               const std::vector<sycl::event>& deps) {
+    const int K = w.K;
+    const int rows_per_wg = WG_SUBGROUPS * R;
+    const int groups_per_token = (N + rows_per_wg - 1) / rows_per_wg;
+    const int n_groups = M * groups_per_token;
+
+    return q.submit([&](sycl::handler& hc) {
+        hc.depends_on(deps);
+        const QuantWeight wc = w;
+        sycl::local_accessor<float, 1> slmx(size_t(K), hc);
+        sycl::local_accessor<float, 1> lut_slm(256, hc);
+        sycl::local_accessor<float, 1> e8m0_slm(256, hc);
+        sycl::local_accessor<float, 1> e2m1_slm(16, hc);
+
+        // WG_SUBGROUPS sub-groups of R rows each = rows_per_wg rows per
+        // work-group.  (moe_down launches rows_per_wg sub-groups, which for
+        // R > 1 makes neighbouring groups recompute each other's rows.)
+        hc.parallel_for(
+            sycl::nd_range<1>(size_t(n_groups) * WG_SUBGROUPS * SG_SIZE,
+                              size_t(WG_SUBGROUPS) * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                float* lut  = lut_slm.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* slut = e8m0_slm.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* nlut = e2m1_slm.template get_multi_ptr<sycl::access::decorated::no>().get();
+                {
+                    const int lid_ = int(it.get_local_id(0));
+                    const int lsz_ = int(it.get_local_range(0));
+                    if constexpr (F == Fmt::FP8_E4M3 || F == Fmt::MXFP8)
+                        for (int b_ = lid_; b_ < 256; b_ += lsz_) lut[b_] = e4m3_to_f32(uint8_t(b_));
+                    else if constexpr (F == Fmt::FP8_E5M2)
+                        for (int b_ = lid_; b_ < 256; b_ += lsz_) lut[b_] = e5m2_to_f32(uint8_t(b_));
+                    if constexpr (Traits<F>::block == kMXBlock)
+                        for (int b_ = lid_; b_ < 256; b_ += lsz_) slut[b_] = e8m0_to_f32(uint8_t(b_));
+                    if constexpr (F == Fmt::MXFP4)
+                        for (int b_ = lid_; b_ < 16; b_ += lsz_) nlut[b_] = e2m1_to_f32(uint8_t(b_));
+                }
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  lid  = int(it.get_local_id(0));
+                const int  lsz  = int(it.get_local_range(0));
+
+                const int token = int(it.get_group(0)) / groups_per_token;
+                const int local_group = int(it.get_group(0)) % groups_per_token;
+                const float* xt = x + int64_t(token) * K;
+                for (int c = lid; c < K; c += lsz) slmx[c] = xt[c];
+                sycl::group_barrier(it.get_group());
+                const float* xs = slmx.template
+                    get_multi_ptr<sycl::access::decorated::no>().get();
+
+                const int n_base = local_group * rows_per_wg
+                                 + int(sg.get_group_id()[0]) * R;
+                float total[R];
+                #pragma unroll
+                for (int r = 0; r < R; ++r) total[r] = 0.0f;
+
+                for (int slot = 0; slot < top_k; ++slot) {
+                    const int64_t route = int64_t(token) * top_k + slot;
+                    const int   e  = rex[route];
+                    if (e < 0 || e >= E) continue;       // router produced no route
+                    const float rw = rwt[route];
+
+                    float acc[R];
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+                    for (int base = 0; base + GEMV_STEP <= K; base += GEMV_STEP) {
+                        const int k0 = base + lane * GEMV_EPL;
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            const int n = n_base + r;
+                            if (n >= N) continue;
+                            const int64_t row = int64_t(e) * N + n;
+                            const uint8_t* rp = wc.payload + row * wc.row_bytes;
+                            acc[r] += GemvStep<F, GEMV_EPL>::run(wc, rp, xs,
+                                          lut, slut, nlut, int(row), k0);
+                        }
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const int n = n_base + r;
+                        const int64_t row = int64_t(e) * N + (n < N ? n : 0);
+                        if (n < N)
+                            for (int c = (K / GEMV_STEP) * GEMV_STEP + lane; c < K; c += SG_SIZE)
+                                acc[r] = sycl::fma(wc.at(int(row), c), xs[c], acc[r]);
+                        // every lane gets the full dot: silu is applied
+                        // redundantly per lane, and total[] stays uniform
+                        const float s = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+                        total[r] = sycl::fma(rw, s / (1.0f + sycl::exp(-s)), total[r]);
+                    }
+                }
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int n = n_base + r;
+                    if (lane == 0 && n < N) y[int64_t(token) * N + n] = total[r];
+                }
+            });
+    });
+}
+
+template <Fmt F>
+sycl::event mova_decode_impl(sycl::queue& q, const QuantWeight& w, const float* x,
+                             const int32_t* rex, const float* rwt, float* y,
+                             int M, int N, int E, int top_k,
+                             const std::vector<sycl::event>& deps) {
+    // Rows per sub-group.  Each row is top_k independent streams already;
+    // B70_MOVA_ROWS sweeps it without a rebuild.
+    static const int rows = []{ const char* e = std::getenv("B70_MOVA_ROWS");
+        int v = (e && *e) ? std::atoi(e) : 2;
+        return (v == 1 || v == 2 || v == 4) ? v : 2; }();
+    switch (rows) {
+        case 1:  return mova_decode_impl_r<F, 1>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case 4:  return mova_decode_impl_r<F, 4>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        default: return mova_decode_impl_r<F, 2>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+    }
+}
+
 template <Fmt F>
 sycl::event moe_down_impl(sycl::queue& q, const MoeLayer& L,
                           const int32_t* d_expert, const float* d_weight,
@@ -348,6 +487,23 @@ sycl::event launch_moe_gate_up(sycl::queue& q, const MoeLayer& L,
         case Fmt::FP8_E4M3: return moe_gate_up_impl<Fmt::FP8_E4M3>(q, L, d_expert, x, h, 1, deps);
         case Fmt::FP8_E5M2: return moe_gate_up_impl<Fmt::FP8_E5M2>(q, L, d_expert, x, h, 1, deps);
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, 1, deps);
+    }
+    return {};
+}
+
+sycl::event launch_mova_value_decode(sycl::queue& q, const QuantWeight& w,
+                                     const float* x, const int32_t* rex,
+                                     const float* rwt, float* y,
+                                     int M, int N, int E, int top_k,
+                                     const std::vector<sycl::event>& deps) {
+    switch (w.fmt) {
+        case Fmt::MXFP4:    return mova_decode_impl<Fmt::MXFP4>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::INT4:     return mova_decode_impl<Fmt::INT4>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::MXFP8:    return mova_decode_impl<Fmt::MXFP8>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::INT8:     return mova_decode_impl<Fmt::INT8>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::FP8_E4M3: return mova_decode_impl<Fmt::FP8_E4M3>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::FP8_E5M2: return mova_decode_impl<Fmt::FP8_E5M2>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
+        case Fmt::BF16:     return mova_decode_impl<Fmt::BF16>(q, w, x, rex, rwt, y, M, N, E, top_k, deps);
     }
     return {};
 }

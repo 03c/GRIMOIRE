@@ -2724,6 +2724,13 @@ struct Grimoire {
     // which is the bar before any speed claim.  The device-resident form
     // wants the 64 experts packed expert-major into a single weight so a
     // grouped GEMV can index them with no sync at all.
+    // GRIMOIRE_MOVA_REF=1: the packed paths use the plain one-work-item-
+    // per-row kernel (launch_mova_value_packed) instead of the sub-group
+    // one -- the reference to A/B launch_mova_value_decode against.
+    static bool mova_ref() {
+        static const bool v = std::getenv("GRIMOIRE_MOVA_REF") != nullptr;
+        return v;
+    }
     sycl::event mova_value_m1(LayerDev& d, const float* x, float* y,
                               const std::vector<sycl::event>& deps) {
         // Packed form: no readback at all, and one kernel instead of
@@ -2738,7 +2745,11 @@ struct Grimoire {
             ev = launch_router_topk_k2(q, mova_logits, d.v_router_bias,
                                        1, E, K, mova_rex, mova_rwt,
                                        /*normalize=*/K > 1, cfg.router_scale, {ev});
-            return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+            if (mova_ref())
+                return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+                                                mova_rex, mova_rwt, y,
+                                                1, d.v_experts_n, E, K, {ev});
+            return launch_mova_value_decode(q, d.v_experts_packed.w, x,
                                             mova_rex, mova_rwt, y,
                                             1, d.v_experts_n, E, K, {ev});
         }
@@ -2818,7 +2829,11 @@ struct Grimoire {
                                                    M, E, K, rex, rwt,
                                                    /*normalize=*/K > 1,
                                                    cfg.router_scale, {});
-            return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+            if (mova_ref())
+                return launch_mova_value_packed(q, d.v_experts_packed.w, x,
+                                                rex, rwt, y, M, d.v_experts_n,
+                                                E, K, {ev});
+            return launch_mova_value_decode(q, d.v_experts_packed.w, x,
                                             rex, rwt, y, M, d.v_experts_n,
                                             E, K, {ev});
         }
@@ -9171,6 +9186,15 @@ const float* Grimoire::forward(int token) {
             if (tl_lin  < 0 && L[i].kind == LayerKind::LINEAR_ATTN) tl_lin  = i;
             if (tl_full < 0 && L[i].kind == LayerKind::FULL_ATTN)   tl_full = i;
         }
+    // GRIMOIRE_TIMELINE_LAYER=<n>: detail layer n instead of the first
+    // full-attention one -- on K2 that is dense layer 0, which has neither
+    // MoVA nor MoE, the two things worth looking at.
+    if (timeline) {
+        static const int tl_pick = [] {
+            const char* e = std::getenv("GRIMOIRE_TIMELINE_LAYER");
+            return e ? std::atoi(e) : -1; }();
+        if (tl_pick >= 0 && tl_pick < cfg.n_layers) tl_full = tl_pick;
+    }
 
     mark("start");
     if (pp_enabled() && pp_rank > 0) {
