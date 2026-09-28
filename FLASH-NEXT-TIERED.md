@@ -82,3 +82,45 @@ double-quantize every expert weight (coarser pow-2 scales, 32-wide blocks).
 5. PLE rows from SSD.
 6. Flash-Next end to end: coherent text; then a layer-by-layer reference check.
 7. Speed: CPU expert compute, hit-count placement, PLE on a small-recordsize dataset.
+
+## Status 2026-09-26 evening (commits 49675fc, 75639ec and later)
+
+WORKS, coherent, on gpu0: short prompt and the 5987-token Sherlock prompt ("The user has pasted a
+very long excerpt from "A Scandal in Bohemia" by Arthur Conan Doyle, the").
+
+Run it:
+```
+EXTRA_ENV="GRIMOIRE_EXPERT_VRAM_PER_LAYER=112
+GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin" \
+  bash tools/g0run.sh fn -m /models/Qwen3.8-Flash-Next-NVFP4 --proj bf16 --ctx 8192 -p "..." -n 64
+```
+- `--proj bf16`: NVIDIA ships every non-expert weight in BF16; keep it (9.2 GiB in VRAM).
+- 112 experts/layer in VRAM (13.9 GB), 400/layer in pinned RAM (49.5 GB). Load ~2 min.
+- PLE table: `/mnt/storage/Models/grimoire-ple/flash-next-ple.bin` (51.2 GB, written by
+  tools/ple_flatten.py) on ZFS dataset `storage/Models/grimoire-ple` (recordsize 8K,
+  compression off) -- at 128K records every 160-byte row cost 128 KB of I/O (6.1 s -> 1.0 s
+  for a 6K prompt).  Without GRIMOIRE_PLE_FILE the rows are read from the checkpoint shards.
+- GRIMOIRE_Q4_TIMING=1 prints prefill/decode stage times (synced; diagnosis only).
+
+Model bugs found against HF transformers modeling_qwen4_exp.py (the reference now):
+DeltaNet output gate is sigmoid (`output_gate_type`), PLE context before the sequence is EOS,
+config lookup must take the shallowest key (nested mtp.num_hidden_layers = 1).
+
+Measured (6K prompt, synced stages): PLE 1.0 s, HC 0.8 s, DeltaNet 0.4 s, full attention
+6.0 s (gather kernels; rows < 2051 now take the dense flash path), MoE 8.0 s before the
+streaming ring.  Decode per token (synced): MoE 26 (CPU experts 17), DeltaNet 12, HC 9.5,
+attention 4, PLE 4, head 2.5 ms.  CPU experts: 0.35 ms/layer = 61 GB/s (dynamic chunks).
+
+Speed work in flight / next: streaming ring for prefill experts (copy queue + VRAM ring,
+GRIMOIRE_EXPERT_RING slots), fused HC decode kernels (7 -> 3 launches/mix), hot-expert
+placement from GRIMOIRE_EXPERT_HITS statistics, masked XMX flash for sparse QSA rows.
+
+### 2026-09-28
+- QSA is now actually executed (the config types sparse layers "full_attention"; HF gives every
+  attention layer an indexer).  Sparse rows run the XMX flash kernel masked by the indexer's
+  block selection (prefill: launch_flash_prefill_qsa; decode: AttnParams.qbits) -- same text as
+  the gather kernels (GRIMOIRE_QSA_GATHER=1) on the 6K prompt, 28x faster.
+- Routing skew: the hottest 22% of each layer's experts take ~82% of routes (2.88M routes).
+  GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits accumulates counts at exit and the
+  next load puts the most-routed experts in VRAM (the repo dir is read-only in the container).
+- K2-Horizon hung a kernel on gpu0 (engine reset; see commit message).  Do not run K2 until fixed.

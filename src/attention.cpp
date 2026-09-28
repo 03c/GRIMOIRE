@@ -150,7 +150,13 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                     // K is D-major: kh[d * seq_cap + s], so the 16 lanes
                     // read 16 consecutive floats for each d.
                     float score = -std::numeric_limits<float>::infinity();
-                    if (s < s_end) {
+                    bool live = s < s_end;
+                    if (live && pp.qbits) {        // QSA: selected blocks + tail
+                        const int tail = seq / pp.qrat * pp.qrat;
+                        const int b = s / pp.qrat;
+                        live = s >= tail || ((pp.qbits[b >> 5] >> (b & 31)) & 1u);
+                    }
+                    if (live) {
                         float dot = 0.0f;
                         for (int d = 0; d < HD; ++d)
                             dot = sycl::fma(qh[d], e4m3_to_f32(

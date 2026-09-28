@@ -679,7 +679,16 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                     // (rule 10), recorded in qsa_attention so
                     // unsupported_reason() can refuse by name, and never
                     // silently executed as dense attention.
-                    const bool qsa    = v == "qwen_sparse_attention";
+                    // The published Flash-Next config types its sparse layers
+                    // plain "full_attention": HF's Qwen4ExpTextAttention gives
+                    // EVERY attention layer an indexer, and the checkpoint
+                    // ships indexer weights for all of them.  Executing those
+                    // as dense attention matches QSA only while every block
+                    // fits the budget (<= ~2K tokens) and is a different
+                    // model after that.
+                    const bool qsa    = v == "qwen_sparse_attention" ||
+                                        (cfg.is_qwen4_exp && v == "full_attention" &&
+                                         cfg.indexer_n_heads > 0 && cfg.indexer_budget > 0);
                     const bool full   = v == "full_attention" ||
                                         v == "sliding_attention" ||
                                         qsa ||

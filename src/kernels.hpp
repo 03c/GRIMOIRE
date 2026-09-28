@@ -272,6 +272,12 @@ struct AttnParams {
     // full history where a window was meant is completely silent -- it is
     // identical until the context passes the window, then quietly wrong.
     int window_left = 0;
+
+    // Qwen4-Exp QSA (decode, one query row): a bitmap over key blocks of
+    // qrat tokens -- a key is attended iff its block's bit is set or it lies
+    // in the incomplete tail block [seq/qrat*qrat, seq).  nullptr = dense.
+    const uint32_t* qbits = nullptr;
+    int qwords = 0, qrat = 4;
 };
 
 // Pick enough chunks to fill the machine without shredding the sequence.
@@ -389,6 +395,13 @@ sycl::event launch_ple_embed_gather(sycl::queue& q, const void* table,
     int ngram_heads, int head_dim, int64_t table_rows,
     const std::vector<sycl::event>& deps = {});
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
+sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int rows,
+    int topk, uint32_t* bits, int words, const std::vector<sycl::event>& deps = {});
+// gemm_fast.cpp: the XMX flash prefill with a per-row QSA block bitmap.
+sycl::event launch_flash_prefill_qsa(sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int start_pos, int num_heads,
+    int num_kv_heads, int head_dim, int seq_cap, float softmax_scale,
+    const uint32_t* qbits, int qwords, int qrat, const std::vector<sycl::event>& deps = {});
 sycl::event launch_qsa_attention(sycl::queue& q, const float* qv,
     const uint8_t* k_cache, const uint8_t* v_cache, const int32_t* idx,
     float* out, int rows, int n_heads, int kv_heads, int head_dim,
@@ -439,6 +452,16 @@ sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
 // and combine() injects the block output back into every stream.  The
 // two projections use the ordinary GEMV -- only these three have no
 // existing kernel.
+// Fused one-token hyper-connection mix (ops.cpp), BF16 weights.
+sycl::event launch_hc_combine_norm1(sycl::queue& q, float* hyper, const float* pend,
+    const float* pinj, const bf16_t* w, float* normed, int hc_count, int hidden,
+    float eps, const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_down_inject1(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+    const float* normed, float* lora, float* inj, int lowrank, int hc_count, int wide,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_hc_up_mean1(sycl::queue& q, const bf16_t* up, const float* lora,
+    const float* normed, float* block, int hc_count, int hidden, int lowrank,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_hc_norm(sycl::queue& q, const float* x, const bf16_t* w,
     float* out, int rows, int hc_count, int hidden, float eps,
     const std::vector<sycl::event>& deps = {});

@@ -80,5 +80,16 @@ sycl::event launch_nvfp4_expert_gemm(sycl::queue& q, const uint8_t* block,
                                      int M, sycl::ext::oneapi::bfloat16* scratch,
                                      const std::vector<sycl::event>& deps);
 
+// One expert's whole FFN for its M prompt rows (gemm_fast.cpp): gate|up
+// with SwiGLU fused into the GEMM (bf16 h into hbuf [M][I]), then down into
+// out [M][H] fp32.  *block_done: after it, `block` is no longer read.
+sycl::event launch_nvfp4_expert_ffn(sycl::queue& q, const uint8_t* block,
+                                    const NvExpertLayout& L, float sg, float su, float sd,
+                                    const sycl::ext::oneapi::bfloat16* A,
+                                    sycl::ext::oneapi::bfloat16* hbuf, float* out, int M,
+                                    sycl::ext::oneapi::bfloat16* scratch,
+                                    const std::vector<sycl::event>& deps,
+                                    sycl::event* block_done);
+
 } // namespace b70
 #endif

@@ -1892,6 +1892,120 @@ sycl::event launch_hc_gated_mean(sycl::queue& q, const float* up_out,
 // NOTE the residual is the UNNORMALISED `hyper`, not `normed`.  Adding to
 // the normalised copy loses the stream the layer is built on and is
 // silent -- the shapes are identical either way.
+// ---------------------------------------------------------------------
+// Fused hyper-connection mix for ONE token (decode), BF16 weights.  The
+// same arithmetic as launch_hc_combine + launch_hc_norm + GEMV(down) +
+// launch_hc_silu + GEMV(inject) + GEMV(up) + launch_hc_gated_mean, in
+// three launches instead of seven (96 mixes per Flash-Next token: the
+// seven small launches cost ~9.5 ms of it).
+// ---------------------------------------------------------------------
+// A: [combine] + grouped (1 + w) RMSNorm.  One work-group per stream.
+sycl::event launch_hc_combine_norm1(sycl::queue& q, float* hyper, const float* pend,
+                                    const float* pinj, const bf16_t* w, float* normed,
+                                    int hc_count, int hidden, float eps,
+                                    const std::vector<sycl::event>& deps) {
+    constexpr int WG = 256;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(hc_count) * WG, WG), [=](sycl::nd_item<1> it) {
+            const int c = int(it.get_group(0)), lane = int(it.get_local_id(0));
+            float* x = hyper + int64_t(c) * hidden;
+            float z = 0.0f;
+            if (pend) z = 2.0f / (1.0f + sycl::exp(-(pinj[c] / float(hc_count))));
+            float acc = 0.0f;
+            for (int i = lane; i < hidden; i += WG) {
+                float v = x[i];
+                if (pend) { v += pend[i] * z; x[i] = v; }
+                acc += v * v;
+            }
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            const float inv = sycl::rsqrt(acc / float(hidden) + eps);
+            const bf16_t* ws = w + int64_t(c) * hidden;
+            float* o = normed + int64_t(c) * hidden;
+            for (int i = lane; i < hidden; i += WG)
+                o[i] = x[i] * inv * (1.0f + bf16_to_f32(ws[i]));
+        });
+    });
+}
+
+namespace {
+// dot of a bf16 row with an fp32 vector, one sub-group, 8 elements per lane
+// per step (n % 128 == 0).
+inline float sg_dot_bf16(const sycl::sub_group& sg, const bf16_t* row, const float* x, int n) {
+    const int lane = int(sg.get_local_id()[0]);
+    float acc = 0.0f;
+    for (int k = lane * 8; k < n; k += SG_SIZE * 8) {
+        const sycl::uint4 v = *reinterpret_cast<const sycl::uint4*>(row + k);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t u = v[j];
+            acc = sycl::fma(sycl::bit_cast<float>(u << 16), x[k + 2 * j], acc);
+            acc = sycl::fma(sycl::bit_cast<float>(u & 0xFFFF0000u), x[k + 2 * j + 1], acc);
+        }
+    }
+    return sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+}
+} // namespace
+
+// B: lora[r] = silu(down[r] . normed / hc) for r < lowrank, and (when inj_w)
+// inj[c] = inject[c] . normed.  One sub-group per output row.
+sycl::event launch_hc_down_inject1(sycl::queue& q, const bf16_t* down, const bf16_t* inj_w,
+                                   const float* normed, float* lora, float* inj,
+                                   int lowrank, int hc_count, int wide,
+                                   const std::vector<sycl::event>& deps) {
+    const int rows = lowrank + (inj_w ? hc_count : 0);
+    const int groups = (rows + WG_SUBGROUPS - 1) / WG_SUBGROUPS;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * WG_SUBGROUPS * SG_SIZE,
+                                         size_t(WG_SUBGROUPS) * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int r = int(it.get_group(0)) * WG_SUBGROUPS + int(sg.get_group_id()[0]);
+                if (r >= rows) return;
+                const bool is_inj = r >= lowrank;
+                const bf16_t* row = is_inj ? inj_w + int64_t(r - lowrank) * wide
+                                           : down + int64_t(r) * wide;
+                const float d = sg_dot_bf16(sg, row, normed, wide);
+                if (sg.get_local_id()[0] == 0) {
+                    if (is_inj) inj[r - lowrank] = d;
+                    else { const float v = d / float(hc_count); lora[r] = v / (1.0f + sycl::exp(-v)); }
+                }
+            });
+    });
+}
+
+// C: block[h] = (1/hc) sum_c sigmoid(up[c*H+h] . lora) * normed[c*H+h].
+// One sub-group per h; lora staged in SLM.
+sycl::event launch_hc_up_mean1(sycl::queue& q, const bf16_t* up, const float* lora,
+                               const float* normed, float* block, int hc_count,
+                               int hidden, int lowrank,
+                               const std::vector<sycl::event>& deps) {
+    const int groups = (hidden + WG_SUBGROUPS - 1) / WG_SUBGROUPS;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> sl(size_t(lowrank), h);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * WG_SUBGROUPS * SG_SIZE,
+                                         size_t(WG_SUBGROUPS) * SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int lid = int(it.get_local_id(0));
+                for (int i = lid; i < lowrank; i += WG_SUBGROUPS * SG_SIZE) sl[i] = lora[i];
+                sycl::group_barrier(it.get_group());
+                const auto sg = it.get_sub_group();
+                const int hh = int(it.get_group(0)) * WG_SUBGROUPS + int(sg.get_group_id()[0]);
+                if (hh >= hidden) return;
+                const float* ls = sl.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float acc = 0.0f;
+                for (int c = 0; c < hc_count; ++c) {
+                    const int64_t i = int64_t(c) * hidden + hh;
+                    const float g = sg_dot_bf16(sg, up + i * lowrank, ls, lowrank);
+                    acc += normed[i] / (1.0f + sycl::exp(-g));
+                }
+                if (sg.get_local_id()[0] == 0) block[hh] = acc / float(hc_count);
+            });
+    });
+}
+
 sycl::event launch_hc_combine(sycl::queue& q, const float* hyper,
                               const float* inj_out, const float* block,
                               float* out, int rows, int hc_count, int hidden,
@@ -2119,62 +2233,103 @@ sycl::event launch_qsa_topk_blocks(sycl::queue& q, const float* logits,
                                    int32_t* out, int rows, int n_blocks,
                                    int topk, const int32_t* visible,
                                    const std::vector<sycl::event>& deps) {
-    constexpr int WG = 128;
+    // One work-group per query row.  Two cases:
+    //  * vis <= topk: every visible block is selected -- no ranking at all
+    //    (every row of a prompt shorter than indexer_budget).
+    //  * vis >  topk: find the topk-th largest score by a 4-pass radix
+    //    select on order-preserving 32-bit keys (256-bin SLM histogram per
+    //    pass), then one ordered scan keeps every key above the threshold
+    //    and the lowest-index ties at it -- the same set, and the same tie
+    //    rule, as the previous argmax-per-slot loop, which rescanned all
+    //    blocks for each of the topk picks (O(topk^2 * n)) and cost ~500 ms
+    //    per full-attention layer at 6K tokens.  The set is emitted in
+    //    INDEX order; attention over it does not depend on the order.
+    constexpr int WG = 256;
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
-        sycl::local_accessor<float, 1>   bv(WG, h);
-        sycl::local_accessor<int32_t, 1> bi(WG, h);
+        sycl::local_accessor<uint32_t, 1> hist(256, h);
+        sycl::local_accessor<uint32_t, 1> sel(4, h);   // prefix, mask, remaining
         h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG),
             [=](sycl::nd_item<1> it) {
                 const int row  = int(it.get_group(0));
                 const int lane = int(it.get_local_id(0));
                 const float* lg = logits + int64_t(row) * n_blocks;
                 int32_t* o = out + int64_t(row) * topk;
-                const int vis = visible ? visible[row] : n_blocks;
-                for (int k = lane; k < topk; k += WG) o[k] = -1;
-                sycl::group_barrier(it.get_group());
-                for (int k = 0; k < topk; ++k) {
-                    float best = -std::numeric_limits<float>::infinity();
-                    int32_t at = -1;
-                    for (int n = lane; n < n_blocks; n += WG) {
-                        if (n >= vis) continue;
-                        bool taken = false;
-                        for (int j = 0; j < k; ++j) taken = taken || (o[j] == n);
-                        if (taken) continue;
-                        const float v = lg[n];
-                        // Strict >, scanned in increasing n, reproduces
-                        // torch.topk's stable choice among equal logits.
-                        if (v > best) { best = v; at = n; }
-                    }
-                    bv[lane] = best; bi[lane] = at;
+                int vis = visible ? visible[row] : n_blocks;
+                vis = vis < n_blocks ? vis : n_blocks;
+                if (vis <= topk) {
+                    for (int k = lane; k < topk; k += WG) o[k] = k < vis ? k : -1;
+                    return;
+                }
+                auto key_of = [](float f) {
+                    const uint32_t u = sycl::bit_cast<uint32_t>(f);
+                    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+                };
+                if (lane == 0) { sel[0] = 0u; sel[1] = 0u; sel[2] = uint32_t(topk); }
+                for (int pass = 0; pass < 4; ++pass) {
+                    const int shift = 24 - 8 * pass;
+                    hist[lane] = 0u;
                     sycl::group_barrier(it.get_group());
-                    for (int s = WG/2; s; s >>= 1) {
-                        if (lane < s) {
-                            const bool take = bv[lane+s] > bv[lane] ||
-                                (bv[lane+s] == bv[lane] && bi[lane+s] >= 0 &&
-                                 (bi[lane] < 0 || bi[lane+s] < bi[lane]));
-                            if (take) { bv[lane] = bv[lane+s]; bi[lane] = bi[lane+s]; }
+                    const uint32_t prefix = sel[0], mask = sel[1];
+                    for (int n = lane; n < vis; n += WG) {
+                        const uint32_t k = key_of(lg[n]);
+                        if ((k & mask) == prefix) {
+                            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                                             sycl::memory_scope::work_group,
+                                             sycl::access::address_space::local_space>
+                                a(hist[(k >> shift) & 0xFFu]);
+                            a.fetch_add(1u);
                         }
-                        sycl::group_barrier(it.get_group());
                     }
-                    if (lane == 0) o[k] = bi[0];
                     sycl::group_barrier(it.get_group());
-                    if (bi[0] < 0) break;      // fewer visible blocks than topk
+                    if (lane == 0) {
+                        uint32_t need = sel[2], acc = 0u;
+                        int b = 255;
+                        for (; b > 0; --b) {
+                            if (acc + hist[b] >= need) break;
+                            acc += hist[b];
+                        }
+                        sel[0] = prefix | (uint32_t(b) << shift);
+                        sel[1] = mask | (0xFFu << shift);
+                        sel[2] = need - acc;          // still needed AT this prefix
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+                if (lane == 0) {
+                    const uint32_t thr = sel[0];
+                    uint32_t ties = sel[2];
+                    int c = 0;
+                    for (int n = 0; n < vis && c < topk; ++n) {
+                        const uint32_t k = key_of(lg[n]);
+                        if (k > thr) o[c++] = n;
+                        else if (k == thr && ties) { o[c++] = n; --ties; }
+                    }
+                    for (; c < topk; ++c) o[c] = -1;
                 }
             });
     });
 }
 
-// Stage 3.  Selected blocks -> token indices, plus the TAIL.
-//
-// A hole (-1) stays a hole: clamping it to 0 would make every short
-// sequence attend to its first block over and over, which is silent.
-//
-// The last compress_ratio-1 columns are the block still being filled.
-// Stage 1 only ranks COMPLETE blocks, so those tokens -- the query's own
-// among them -- are unreachable through the top-k and the reference
-// appends them unconditionally.  Host reference and the citation:
-// b70/qwen4_exp.hpp, qsa_expand_blocks.
+// Selected block lists [rows][topk] (-1 = hole) -> bitmap [rows][words] for
+// the masked flash kernel (launch_flash_prefill_qsa).
+sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int rows,
+                                  int topk, uint32_t* bits, int words,
+                                  const std::vector<sycl::event>& deps) {
+    sycl::event z = q.memset(bits, 0, size_t(rows) * words * sizeof(uint32_t), deps);
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(z);
+        h.parallel_for(sycl::range<1>(size_t(rows) * topk), [=](sycl::id<1> id) {
+            const int row = int(id[0] / topk);
+            const int b = blocks[id[0]];
+            if (b < 0 || (b >> 5) >= words) return;
+            sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>
+                a(bits[size_t(row) * words + (b >> 5)]);
+            a.fetch_or(1u << (b & 31));
+        });
+    });
+}
+
 sycl::event launch_qsa_expand_blocks(sycl::queue& q, const int32_t* blocks,
                                      int32_t* out, int rows, int block_topk,
                                      int compress_ratio, int token_topk,

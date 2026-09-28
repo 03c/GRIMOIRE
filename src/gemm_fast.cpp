@@ -284,7 +284,7 @@ sycl::event dequant_mxfp4_stream(sycl::queue& q, const QuantWeight& w, sycl_bf16
 // Needs K % 128 == 0 and N % 256 == 0.  `pay`/`scl` may be host memory.
 sycl::event dequant_nvfp4_stream(sycl::queue& q, const uint8_t* pay, const uint8_t* scl,
                                  int N, int K, sycl_bf16* dst,
-                                 const std::vector<sycl::event>& deps) {
+                                 const std::vector<sycl::event>& deps, int ilv_fi = 0) {
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         const int KB = K / 128, NB = N / 256;
@@ -296,7 +296,11 @@ sycl::event dequant_nvfp4_stream(sycl::queue& q, const uint8_t* pay, const uint8
             const int kb = L / NB;
             const uint8_t* row = pay + int64_t(n) * rb + kb * 64;
             const uint8_t* sr = scl + int64_t(n) * rs + kb * 8;
-            uint32_t* o = reinterpret_cast<uint32_t*>(dst) + int64_t(kb) * 64 * N + n;
+            // ilv_fi: the SwiGLU interleave of dequant_mxfp4_stream
+            const int col = ilv_fi == 0 ? n
+                          : n < ilv_fi ? (n / 32) * 64 + n % 32
+                                       : ((n - ilv_fi) / 32) * 64 + 32 + (n - ilv_fi) % 32;
+            uint32_t* o = reinterpret_cast<uint32_t*>(dst) + int64_t(kb) * 64 * N + col;
             #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 const float s0 = e4m3_to_f32(sr[2 * c]), s1 = e4m3_to_f32(sr[2 * c + 1]);
@@ -362,9 +366,10 @@ sycl::event dequant_any(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
 //          computes a gate tile and the matching up tile and writes
 //          h bf16 [M][FI] = silu(gate) * up -- launch_swiglu_batched's
 //          formula on the same fp32 values, rounded as launch_f32_to_bf16.
-//   SC (EPI 0 only): C *= s0 for columns < split, s1 from split on -- an
-//          NVFP4 expert's per-projection F32 scales, applied in fp32.  split
-//          is a multiple of TN, so one fragment never straddles it.
+//   SC: the NVFP4 per-projection F32 scales, applied in fp32.  EPI 0:
+//          C *= s0 for columns < split, s1 from split on (split is a
+//          multiple of TN, so one fragment never straddles it).  EPI 1:
+//          gate *= s0 and up *= s1 before silu(gate) * up.
 template <int EPI, bool SC = false>
 sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* B,
                            void* out, int M, int N, int K,
@@ -485,6 +490,12 @@ sycl::event gemm_bf16_vnni(sycl::queue& q, const sycl_bf16* A, const sycl_bf16* 
                 for (int m = 0; m < MC1 / TM; ++m)
                     #pragma unroll
                     for (int n = 0; n < 2; ++n) {
+                        if constexpr (SC)
+                            matrix::joint_matrix_apply(sg, acc[m][n], acc[m][n + 2],
+                                [=](float& g, float& u) {
+                                    const float gs = g * s0, us = u * s1;
+                                    g = sycl::native::divide(gs, 1.0f + sycl::native::exp(-gs)) * us; });
+                        else
                         matrix::joint_matrix_apply(sg, acc[m][n], acc[m][n + 2],
                             [](float& g, float& u) {
                                 g = sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u; });
@@ -734,10 +745,17 @@ sycl::event flash_esimd(sycl::queue& q, sycl::event dep, const sycl_bf16* Qb, in
 }
 
 template <int D>
+// qbits (QSA, optional): per query row, a bitmap over key blocks of qrat
+// tokens -- a key is attended iff it is causal AND (its block's bit is set
+// OR it lies in the row's own incomplete tail block).  That is exactly the
+// token set Qwen4-Exp's indexer selects (top-k complete blocks + the tail),
+// so a sparse row is computed by the XMX kernel, masked, instead of by the
+// scalar gather kernel.
 sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                             const uint8_t* vc, float* out, int tokens, int start, int H,
                             int KVH, int seq_cap, float scale,
-                            const std::vector<sycl::event>& deps) {
+                            const std::vector<sycl::event>& deps,
+                            const uint32_t* qbits = nullptr, int qwords = 0, int qrat = 4) {
     constexpr int NF = D / TN, WG = FA_NSG * SG_SIZE;
     FlashScratch& fs = flash_scratch_for(q);
     const int kend = start + tokens, Sp = (kend + FA_BK - 1) / FA_BK * FA_BK;
@@ -782,7 +800,7 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 bf16_rne(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
         });
     });
-    if (flash_use_esimd())
+    if (flash_use_esimd() && !qbits)
         return flash_esimd<D>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
@@ -854,8 +872,18 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 for (int r = 0; r < RB; ++r) {
                     const int t = r0 + r, qpos = start + t;
                     const float sv0 = ss[r * BK + lane], sv1 = ss[r * BK + lane + SG_SIZE];
-                    const float v0 = (t < tokens && s0 + lane <= qpos) ? sv0 : NINF;
-                    const float v1 = (t < tokens && s0 + lane + SG_SIZE <= qpos) ? sv1 : NINF;
+                    bool a0 = t < tokens && s0 + lane <= qpos;
+                    bool a1 = t < tokens && s0 + lane + SG_SIZE <= qpos;
+                    if (qbits && t < tokens) {
+                        const int tail = (qpos + 1) / qrat * qrat;
+                        const uint32_t* rb = qbits + size_t(t) * qwords;
+                        const int k0 = s0 + lane, k1 = k0 + SG_SIZE;
+                        const int b0 = k0 / qrat, b1 = k1 / qrat;
+                        a0 = a0 && (k0 >= tail || ((rb[b0 >> 5] >> (b0 & 31)) & 1u));
+                        a1 = a1 && (k1 >= tail || ((rb[b1 >> 5] >> (b1 & 31)) & 1u));
+                    }
+                    const float v0 = a0 ? sv0 : NINF;
+                    const float v1 = a1 ? sv1 : NINF;
                     const float bm = sycl::reduce_over_group(sg, sycl::fmax(v0, v1),
                                                              sycl::maximum<float>());
                     const float mn = sycl::fmax(m[r], bm);
@@ -926,6 +954,19 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
 }
 
 } // namespace
+
+sycl::event launch_flash_prefill_qsa(sycl::queue& q, const float* qv, const uint8_t* k_cache,
+                                     const uint8_t* v_cache, float* out, int tokens,
+                                     int start_pos, int num_heads, int num_kv_heads,
+                                     int head_dim, int seq_cap, float softmax_scale,
+                                     const uint32_t* qbits, int qwords, int qrat,
+                                     const std::vector<sycl::event>& deps) {
+    return head_dim == 128
+        ? flash_fast_impl<128>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+                               num_kv_heads, seq_cap, softmax_scale, deps, qbits, qwords, qrat)
+        : flash_fast_impl<256>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+                               num_kv_heads, seq_cap, softmax_scale, deps, qbits, qwords, qrat);
+}
 
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads) {
     static const bool off = std::getenv("GRIMOIRE_NO_FAST_FLASH") != nullptr;
@@ -2090,6 +2131,26 @@ bool gemm_fast_swiglu_supported(const QuantWeight& w, int M) {
 sycl::event launch_gemm_fast_swiglu(sycl::queue& q, const QuantWeight& w, const sycl_bf16* x,
                                     sycl_bf16* h, int M, const std::vector<sycl::event>& deps) {
     return gemm_fast_run<1>(q, w, x, h, M, deps);
+}
+
+// One tiered NVFP4 expert's whole FFN for its M rows, the block read only
+// by the first three launches:
+//   gate|up decoded SwiGLU-interleaved -> GEMM with silu(g*sg)*(u*su) fused,
+//   bf16 h [M][I] -> down decoded -> GEMM, out fp32 [M][H] *= sd.
+// *block_done = the event after which `block` is no longer read (a ring
+// slot holding it can be refilled then).
+sycl::event launch_nvfp4_expert_ffn(sycl::queue& q, const uint8_t* block,
+                                    const NvExpertLayout& L, float sg, float su, float sd,
+                                    const sycl_bf16* A, sycl_bf16* hbuf, float* out, int M,
+                                    sycl_bf16* scratch, const std::vector<sycl::event>& deps,
+                                    sycl::event* block_done) {
+    const int H = L.H, I = L.I;
+    sycl::event e = dequant_nvfp4_stream(q, block + L.gu_p, block + L.gu_s, 2 * I, H,
+                                         scratch, deps, I);
+    e = gemm_bf16_vnni<1, true>(q, A, scratch, hbuf, M, 2 * I, H, {e}, 0, sg, su, 0);
+    e = dequant_nvfp4_stream(q, block + L.dn_p, block + L.dn_s, H, I, scratch, {e});
+    if (block_done) *block_done = e;
+    return gemm_bf16_vnni<0, true>(q, hbuf, scratch, out, M, H, I, {e}, 0, sd, sd, H);
 }
 
 // One tiered NVFP4 expert (b70/tiered_moe.hpp): decode its block into the
