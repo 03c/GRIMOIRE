@@ -4374,9 +4374,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             if (cfg.is_k2) {
                 d.k2_sparse = src.k2_sparse;
                 // Softplus output gate, present on EVERY K2 layer.
-                if (cfg.attn_gate && src.attn_gate.ok())
+                if (cfg.attn_gate && src.attn_gate.ok()) {
                     d.o_gate = quantize_upload_t(lq, ck, src.attn_gate, PF,
                         "self_attn.gate_proj", &ok);
+                    // per-head rows like q_proj: TP shards them the same way
+                    shard(d.o_gate, lq);
+                }
                 if (k2_mova) {
                     // BF16 and unsharded: 0.16 MB, and N=64 cannot go on a
                     // 256-wide tile.
@@ -9152,8 +9155,9 @@ const float* Grimoire::forward(int token) {
     if (cfg.is_muse) return forward_muse(token);
     if (cfg.is_gemma4) return forward_gemma4(token);
     if (cfg.is_qwen4_exp) return forward_qwen4_exp(token);
-    // the DAG path has no tiered-expert branch (and is opt-in and broken)
-    if (dag && !tp_enabled() && !tm_any) return forward_dag(token);
+    // the DAG path has no tiered-expert branch and no K2 output gate or K2
+    // router (and is opt-in and broken)
+    if (dag && !tp_enabled() && !tm_any && !cfg.is_k2) return forward_dag(token);
     const int H  = cfg.hidden;
     const int Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
@@ -9413,8 +9417,14 @@ const float* Grimoire::forward(int token) {
             }
             if (i == probe_layer) probe("FA attn core", s.attn_out, qheads * d.head_dim);
 
-            // apply the output gate before projecting back
-            if (gated) {
+            // apply the output gate before projecting back.  K2 ships the
+            // gate as its OWN projection (self_attn.gate_proj -> d.o_gate),
+            // so q_proj is not [q | gate] and `gated` is false for it; the
+            // gate still applies on every layer.  Skipping it was silent:
+            // attention ran, every output was just unscaled.
+            const bool sep_gate = !gated && d.o_gate.output_rows() > 0;
+            if (sep_gate) gemv_any(d.o_gate, s.h2, s.gsplit, none);
+            if (gated || sep_gate) {
                 const int gn = cfg.n_heads * d.head_dim;
                 if (cfg.attn_gate == 2)
                     launch_softplus_gate(q, s.attn_out, s.gsplit, s.attn_out,
@@ -9439,8 +9449,16 @@ const float* Grimoire::forward(int token) {
             const int I = cfg.moe_inter;
             gemv_any(d.router, s.h2, s.rlogits, none);
             MK("  router gemv");
-            launch_router_topk(q, s.rlogits, cfg.n_experts, cfg.top_k,
-                               s.d_expert, s.d_weight, true, none);
+            // K2: sigmoid scores, selection-only bias, sum-normalise, then
+            // router_scaling_factor -- the prefill's router.  The generic
+            // kernel softmaxes the top-k, a different mixture entirely.
+            if (cfg.is_k2)
+                launch_router_topk_k2(q, s.rlogits, d.router_bias, 1,
+                    cfg.n_experts, cfg.top_k, s.d_expert, s.d_weight,
+                    cfg.norm_topk_prob, cfg.router_scale, none);
+            else
+                launch_router_topk(q, s.rlogits, cfg.n_experts, cfg.top_k,
+                                   s.d_expert, s.d_weight, true, none);
             MK("  router topk");
             if (i == probe_layer) probe("L0 router logits", s.rlogits, cfg.n_experts);
             if (i == probe_layer && debug) {
@@ -12347,7 +12365,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     int W = mtp.ok ? 2*H : H;
     for (const auto& d : L) {
         const DevQuant* ws[] = {&d.la_qkv,&d.la_z,&d.la_out,&d.la_ab,&d.la_all,&d.q_proj,&d.k_proj,
-            &d.v_proj,&d.o_proj,&d.router,&d.sh_gu,&d.sh_down,&d.sh_gate_q};
+            &d.v_proj,&d.o_proj,&d.router,&d.sh_gu,&d.sh_down,&d.sh_gate_q,&d.o_gate};
         for (auto* w : ws) { W = std::max(W, w->output_rows()); W = std::max(W, w->w.K); }
     }
     auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
@@ -13378,6 +13396,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // a MoVA layer has no v_proj at all; it must take the
                 // routed path below, not this fused bf16 one.
                 !d.k2_sparse &&
+                // nor does it apply a separate output gate (K2 gate_proj)
+                d.o_gate.output_rows() == 0 &&
                 // launch_qk_norm_rope_bf16_batched only knows partial_rope.
                 // A proportional-RoPE layer taking this path would rotate
                 // with the wrong frequencies and the wrong pairing, and
@@ -13593,6 +13613,22 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
             }
             pp_mark("attn flash");
+            // K2: separate softplus output gate (self_attn.gate_proj), on
+            // every layer -- see forward().  bn still holds this layer's
+            // normalised input; t2 is the [q|gate] split's scratch, unused
+            // when q_proj is not gated.
+            if(!gated && d.o_gate.output_rows()>0){
+                const int64_t gn=int64_t(M)*cfg.n_heads*d.head_dim;
+                if(attention_bf){
+                    launch_bf16_to_f32(q,attention_bf,t3,size_t(gn));
+                    attention_bf=nullptr;
+                }
+                mm(d.o_gate,bn,t2);
+                if(cfg.attn_gate==2)
+                    launch_softplus_gate(q,t3,t2,t3,gn,kK2GateBeta,{});
+                else launch_gate_sigmoid_mul(q,t3,t2,gn,{});
+                pp_mark("attn output gate");
+            }
             if(attention_bf){
                 const sycl_bf16* o_in=attention_bf;
                 if(gated){launch_gate_sigmoid_mul_bf16_io(q,attention_bf,t2,xb,
@@ -14242,6 +14278,11 @@ int grimoire_generate(const std::string& dir, Fmt proj_fmt, int max_seq,
             [&](int32_t t){return decoder.push(t,emit);},&reason);
         decoder.finish(emit);
         std::printf("\n");
+        if(std::getenv("GRIMOIRE_PRINT_IDS")){
+            std::fprintf(stderr,"greedy ids (%zu):",out.size());
+            for(int32_t t:out)std::fprintf(stderr," %d",t);
+            std::fprintf(stderr,"\n");
+        }
         std::fprintf(stderr,"prompt=%zu generated=%d finish=%s elapsed=%.3fs\n",ids.size(),n,
             finish_reason_name(reason),std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
         e.release();return 0;

@@ -38,11 +38,20 @@ from transformers import AutoConfig
 cfg = AutoConfig.from_pretrained(M, trust_remote_code=True)
 with init_empty_weights():
     skel = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+# ONE entry per expert ModuleList, not one per expert leaf: transformers'
+# expand_device_map scans every map entry for every parameter, so 16,380
+# leaf entries kept the loader spinning for 15+ minutes before it read a
+# single weight.
 dm = {}
 for name, mod in skel.named_modules():
     if list(mod.children()) or not list(mod.parameters(recurse=False)):
         continue
-    dm[name] = "disk" if (".mlp.experts." in name or ".v_experts." in name) else "cpu"
+    for tag in (".mlp.experts.", ".v_experts."):
+        if tag in name:
+            dm[name[:name.index(tag) + len(tag) - 1]] = "disk"
+            break
+    else:
+        dm[name] = "cpu"
 del skel
 print("device map:", sum(v == "cpu" for v in dm.values()), "cpu leaves,",
       sum(v == "disk" for v in dm.values()), "disk leaves", flush=True)

@@ -220,6 +220,12 @@ sycl::event launch_rmsnorm_residual2(sycl::queue& q, float* h,
                                      const bf16_t* weight, float* out,
                                      int n, float eps,
                                      const std::vector<sycl::event>& deps) {
+    // K2's grouped norm (plain w, per-group variance) -- as in
+    // launch_rmsnorm_residual.  Without this the decode MoE join silently
+    // applied Qwen's ungrouped (1 + w) to every K2 layer after the first.
+    if (norm_is_grouped(n))
+        return launch_rmsnorm_grouped(q, h, r0, r1, weight, out, nullptr, 1, n,
+                                      g_norm_groups, eps, g_norm_weight_offset, deps);
     if (norm_split() && n >= 1024)
         return rmsnorm_split(q, h, r0, r1, weight, out, n, eps, true, deps);
     const int WG = norm_wg();
