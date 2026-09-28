@@ -13443,7 +13443,74 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // scratch is not wide enough for the MoVA expert count,
                 // fall back rather than overrun it.
                 const int NV = d.kv_heads * d.head_dim;
-                if (cfg.mova_experts <= std::max(1, cfg.n_experts) &&
+                const int EV = cfg.mova_experts;
+                const int KV = std::min(cfg.mova_top_k, EV);
+                // GROUPED MoVA -- the pure-mode MoE recipe.  One router GEMM
+                // over all M rows, the device top-k, ONE readback of the
+                // [M][KV] table, rows permuted expert-major, one XMX GEMM
+                // per selected expert on its slice of the packed [E*N][K]
+                // weight, then y = sum_j w_j * silu(v_j).  Same arithmetic
+                // as mova_value_batched; what changes is that each expert
+                // is read once per prompt, not once per token.  MEASURED
+                // before, 5768-token prompt: "attn kv proj" 76.6 s of a
+                // 78.6 s prefill (M router GEMVs + a per-token kernel).
+                // GRIMOIRE_MOVA_PER_TOKEN=1 keeps the old path for an A/B.
+                static const bool mova_per_token =
+                    std::getenv("GRIMOIRE_MOVA_PER_TOKEN") != nullptr;
+                const bool grouped_mova = !mova_per_token && !seqb &&
+                    M >= 32 && device_can_matrix(q) && !tp_enabled() &&
+                    d.v_experts_packed.w.N == EV * NV && d.v_experts_n == NV &&
+                    KV > 0 && KV <= alloc_top_k && EV <= std::max(1, cfg.n_experts) &&
+                    NV <= H;
+                if (grouped_mova) {
+                    const int RV = M * KV;
+                    mm(d.v_router, bn, rlog);                           // [M][EV]
+                    launch_router_topk_k2(q, rlog, d.v_router_bias, M, EV, KV,
+                                          rex, rwt, /*normalize=*/KV > 1,
+                                          cfg.router_scale);
+                    const size_t rv = static_cast<size_t>(RV);
+                    std::vector<int32_t> hex(rv), hp(rv), hi(rv);
+                    std::vector<int> cnt(static_cast<size_t>(EV), 0),
+                                     off(static_cast<size_t>(EV) + 1, 0);
+                    q.memcpy(hex.data(), rex, size_t(RV) * sizeof(int32_t)).wait();
+                    for (int x : hex) if (x >= 0 && x < EV) ++cnt[size_t(x)];
+                    for (int e = 0; e < EV; ++e) off[size_t(e) + 1] = off[size_t(e)] + cnt[size_t(e)];
+                    std::vector<int> cur(off);
+                    // A route the router did not produce stays out of every
+                    // expert's rows; the combine skips it (inverse -1).
+                    for (int r = 0; r < RV; ++r) {
+                        const int e = hex[size_t(r)];
+                        if (e < 0 || e >= EV) { hi[size_t(r)] = -1; continue; }
+                        const int p = cur[size_t(e)]++;
+                        hp[size_t(p)] = r / KV; hi[size_t(r)] = p;
+                    }
+                    const int rows = off[size_t(EV)];
+                    // hp/hi are pageable host vectors that die with this
+                    // block: the copies must finish before they do.
+                    q.memcpy(ptoken, hp.data(), size_t(rows) * sizeof(int32_t));
+                    q.memcpy(pinv, hi.data(), size_t(RV) * sizeof(int32_t)).wait();
+                    if (rows > 0) launch_permute_rows_bf16(q, bn, ptoken, xperm, rows, H);
+                    for (int e = 0; e < EV; ++e) if (cnt[size_t(e)]) {
+                        const QuantWeight w = slice_quant_rows(d.v_experts_packed.w, e * NV, NV);
+                        launch_gemm_xmx(q, w, xperm + int64_t(off[size_t(e)]) * H,
+                                        yperm + int64_t(off[size_t(e)]) * NV, cnt[size_t(e)]);
+                    }
+                    // SiLU on the EXPERT OUTPUT, before the router weight --
+                    // combine_routed_experts(activation=F.silu).
+                    const int32_t* inv = pinv; const float* wv = rwt;
+                    const float* src = yperm; float* dst = t4;
+                    q.parallel_for(sycl::range<2>(size_t(M), size_t(NV)), [=](sycl::id<2> id) {
+                        const int t = int(id[0]), n = int(id[1]);
+                        float v = 0.0f;
+                        for (int s = 0; s < KV; ++s) {
+                            const int p = inv[t * KV + s];
+                            if (p < 0) continue;
+                            const float a = src[int64_t(p) * NV + n];
+                            v = sycl::fma(wv[t * KV + s], a / (1.0f + sycl::exp(-a)), v);
+                        }
+                        dst[int64_t(t) * NV + n] = v;
+                    });
+                } else if (cfg.mova_experts <= std::max(1, cfg.n_experts) &&
                     cfg.mova_top_k <= alloc_top_k) {
                     mova_value_batched(d, bn, t4, M, rlog, rex, rwt,
                                        mova_idx_host, mova_wt_host);
