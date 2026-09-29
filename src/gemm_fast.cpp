@@ -1451,12 +1451,13 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
             namespace xmx = sycl::ext::intel::esimd::xmx;
             es::slm_init<1024 + 2 * STEP>();
             const int lid = int(it.get_local_id(0));
-            if (lid < 8)
-                es::slm_block_store<uint32_t, 32>(lid * 128, es::block_load<uint32_t, 32>(lut + lid * 32));
             const int g = int(it.get_group(0));
             const int t = g / nG, ng = g % nG;
-            const int ti = lid / TNT, tj = lid % TNT;
             const int e = tile_e[t];
+            if (e < 0) return;                        // padding of a device-built table
+            if (lid < 8)
+                es::slm_block_store<uint32_t, 32>(lid * 128, es::block_load<uint32_t, 32>(lut + lid * 32));
+            const int ti = lid / TNT, tj = lid % TNT;
             const int M = cnt[e];
             const int m0 = tile_mb[t] * MC2 + ti * MT;
             const bool active = m0 < M;               // idle threads still dequantize
@@ -1608,6 +1609,9 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 // Grouped MoE entry points (see gemm_mxfp4_fused_grouped).  The host builds
 // the m-tile table in units of moe_grouped_rows() rows per tile.
 int moe_grouped_rows() { return MC2; }
+bool moe_mxfp4_grouped_esimd(const QuantWeight& w, int Ne, bool swiglu) {
+    return moe_mxfp4_grouped_supported(w, Ne) && moe_esimd_ok(w, Ne, swiglu);
+}
 bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne) {
     return w.fmt == Fmt::MXFP4 && w.payload && w.scales && Ne > 0 &&
            Ne % NC2 == 0 && w.K % KC1 == 0 && (w.N % Ne) == 0;

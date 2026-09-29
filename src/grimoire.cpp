@@ -14139,6 +14139,30 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         launch_moe_unpermute_bf16(q,moe_down_out,pinv,rwt,r0,
                                                   M,cfg.top_k,H);
                     pp_mark("MoE gather");
+                }else if(cfg.top_k==8 && cfg.n_experts<=1024 && (H%8)==0 &&
+                         !std::getenv("GRIMOIRE_MOE_HOST_ROUTE") &&
+                         !(xe2_grouped && d.xe2_signed_int4) &&
+                         !std::getenv("GRIMOIRE_MOE_GROUPED_OFF") &&
+                         moe_mxfp4_grouped_supported(d.moe.gate_up,2*I) &&
+                         moe_mxfp4_grouped_supported(d.moe.down,H) &&
+                         moe_mxfp4_grouped_esimd(d.moe.gate_up,2*I,true) &&
+                         moe_mxfp4_grouped_esimd(d.moe.down,H,false)){
+                    // Routing on the device (launch_moe_route_grouped): the host
+                    // counting sort below cost two blocking syncs per layer.  The
+                    // tile table is padded to moe_tab_tiles with expert -1, which
+                    // the ESIMD GEMM skips, so the host never needs the count.
+                    // GRIMOIRE_MOE_HOST_ROUTE=1 = the host path.
+                    const int E=cfg.n_experts;
+                    int32_t* d_te=moe_tab; int32_t* d_tm=moe_tab+moe_tab_tiles;
+                    int32_t* d_off=moe_tab+2*moe_tab_tiles; int32_t* d_cnt=d_off+E;
+                    launch_moe_route_grouped(q,bn,rex,xperm,d_cnt,d_off,pinv,d_te,d_tm,
+                                             moe_tab_tiles,M,H,E,moe_grouped_rows());
+                    sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                    launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
+                                             d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                    launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,yperm,
+                                             d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                    launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
                 }else{
                     std::vector<int32_t> hex(R), hp(R), hi(R), count(cfg.n_experts,0), off(cfg.n_experts+1,0);
                     q.memcpy(hex.data(),rex,size_t(R)*sizeof(int32_t)).wait();

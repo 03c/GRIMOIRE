@@ -2167,6 +2167,93 @@ sycl::event launch_moe_unpermute_bf16(sycl::queue& q, const sycl_bf16* src,
         });});
 }
 
+// Device-side routing for the grouped MoE GEMM: replaces the host counting
+// sort (expert ids copied to the host, positions and the tile table copied
+// back: two blocking syncs per layer).  Row order inside an expert follows
+// atomic arrival order and can change between runs; every row's GEMM output
+// depends only on that row, and the unpermute sums the top-k contributions
+// in slot order, so the layer output does not change.
+void launch_moe_route_grouped(sycl::queue& q, const float* hidden, const int32_t* topk_ids,
+    sycl_bf16* xperm, int32_t* counts, int32_t* offsets, int32_t* inverse,
+    int32_t* tile_e, int32_t* tile_mb, int tmax, int tokens, int hidden_size,
+    int num_experts, int mc) {
+    constexpr int TOPK = 8, WG = 256, SW = 1024;
+    const int routes = tokens * TOPK;
+    q.memset(counts, 0, size_t(num_experts) * sizeof(int32_t));
+    // 1. rank of each route inside its expert: SLM counts per work-group, one
+    //    device atomic per (work-group, expert) reserves a contiguous range
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> lc(sycl::range<1>(num_experts), h);
+        h.parallel_for(sycl::nd_range<1>(size_t((routes + WG - 1) / WG) * WG, WG),
+          [=](sycl::nd_item<1> it) {
+            const int lid = int(it.get_local_id(0));
+            for (int e = lid; e < num_experts; e += WG) lc[e] = 0;
+            sycl::group_barrier(it.get_group());
+            const int r = int(it.get_global_id(0));
+            int expert = 0, rank = 0;
+            if (r < routes) {
+                expert = topk_ids[r];
+                sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                    sycl::access::address_space::local_space> a(lc[expert]);
+                rank = a.fetch_add(1);
+            }
+            sycl::group_barrier(it.get_group());
+            for (int e = lid; e < num_experts; e += WG) {
+                const int n = lc[e];
+                if (n) {
+                    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                        sycl::access::address_space::global_space> a(counts[e]);
+                    lc[e] = a.fetch_add(n);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            if (r < routes) inverse[r] = rank + lc[expert];
+        });
+    });
+    // 2. expert offsets and the m-tile table: one work-group, one expert per lane
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(SW, SW), [=](sycl::nd_item<1> it) {
+            const int e = int(it.get_local_id(0));
+            const int c = e < num_experts ? counts[e] : 0;
+            const int nt = (c + mc - 1) / mc;
+            const int rbase = sycl::exclusive_scan_over_group(it.get_group(), c, sycl::plus<int>());
+            const int tbase = sycl::exclusive_scan_over_group(it.get_group(), nt, sycl::plus<int>());
+            const int ttot = sycl::reduce_over_group(it.get_group(), nt, sycl::plus<int>());
+            if (e < num_experts) offsets[e] = rbase;
+            for (int i = 0; i < nt; ++i) { tile_e[tbase + i] = e; tile_mb[tbase + i] = i; }
+            for (int t = ttot + e; t < tmax; t += SW) { tile_e[t] = -1; tile_mb[t] = 0; }
+        });
+    });
+    // 3. permuted bf16 rows: one work-group per token converts its row once and
+    //    writes it to its TOPK expert rows; inverse becomes the absolute row
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(size_t(tokens) * WG, WG), [=](sycl::nd_item<1> it) {
+            const int lid = int(it.get_local_id(0)), token = int(it.get_group(0));
+            int dst[TOPK];
+            #pragma unroll
+            for (int s = 0; s < TOPK; ++s) {
+                const int r = token * TOPK + s;
+                dst[s] = inverse[r] + offsets[topk_ids[r]];
+            }
+            for (int d = lid * 8; d < hidden_size; d += WG * 8) {
+                const sycl::vec<float, 8> f = *reinterpret_cast<const sycl::vec<float, 8>*>(
+                    hidden + int64_t(token) * hidden_size + d);
+                sycl::vec<sycl_bf16, 8> v;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) v[j] = sycl_bf16(f[j]);   // as launch_permute_rows_bf16
+                #pragma unroll
+                for (int s = 0; s < TOPK; ++s)
+                    *reinterpret_cast<sycl::vec<sycl_bf16, 8>*>(
+                        xperm + int64_t(dst[s]) * hidden_size + d) = v;
+            }
+            sycl::group_barrier(it.get_group());      // every lane has read inverse
+            #pragma unroll
+            for (int s = 0; s < TOPK; ++s)
+                if (lid == s) inverse[token * TOPK + s] = dst[s];
+        });
+    });
+}
+
 void launch_moe_remap_bf16_top8(sycl::queue& q, const sycl_bf16* hidden,
     const int32_t* topk_ids, sycl_bf16* remapped, int32_t* rows_per_expert,
     int32_t* expert_offsets, int32_t* inverse, int tokens, int hidden_size,
