@@ -134,14 +134,14 @@ sycl::event gemm_flt(sycl::queue& q, const QuantWeight& w,
                                 scale = static_cast<const float*>(wc.scales)[gni];
                             } else if constexpr (F == Fmt::INT4) {
                                 scale = bf16_to_f32(static_cast<const bf16_t*>(wc.scales)
-                                    [int64_t(gni) * wc.row_scales + gki / kInt4Group]);
+                                    [int64_t(gni) * wc.row_scales + (gki >> wc.int4_gshift())]);
                             } else if constexpr (F == Fmt::MXFP8 || F == Fmt::MXFP4) {
                                 scale = e8m0_to_f32(static_cast<const uint8_t*>(wc.scales)
                                     [int64_t(gni) * wc.row_scales + gki / kMXBlock]);
                             }
                             if constexpr (F == Fmt::INT4)
                                 v = decode_int4(row, gki, scale,
-                                    wc.zeros[int64_t(gni) * wc.row_scales + gki / kInt4Group]);
+                                    wc.zeros[int64_t(gni) * wc.row_scales + (gki >> wc.int4_gshift())]);
                             else
                                 v = decode_elem<F>(row, gki, scale);
                         }
@@ -294,7 +294,7 @@ sycl::event gemm_int(sycl::queue& q, const QuantWeight& w,
                 // dequantized once.  Previously it was reset and spilled through SLM
                 // every KT=64 columns -- two flushes per group, each costing a
                 // joint_matrix_store plus two barriers per N block.
-                const int GRP = (F == Fmt::INT4) ? kInt4Group : KT;
+                const int GRP = (F == Fmt::INT4) ? (1 << wc.int4_gshift()) : KT;
                 for (int k_wg = 0; k_wg < K; k_wg += KT) {
                     const bool grp_start = (k_wg % GRP) == 0;
                     const bool grp_end   = ((k_wg + KT) % GRP) == 0 || (k_wg + KT) >= K;

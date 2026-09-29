@@ -248,7 +248,7 @@ template <int EPL> struct GemvStep<Fmt::INT4, EPL> {
     template <int OPT>
     static inline float run_xv(const QuantWeight& w, const uint8_t* row,
                                const float* xv, float ax, int n, int k0) {
-        const int64_t gi = int64_t(n) * w.row_scales + k0 / kInt4Group;
+        const int64_t gi = int64_t(n) * w.row_scales + (k0 >> w.int4_gshift());
         const float   s  = bf16_to_f32(static_cast<const bf16_t*>(w.scales)[gi]);
         const uint8_t zu = w.zeros[gi];
         const float   z  = float(zu);
@@ -280,7 +280,7 @@ template <int EPL> struct GemvStep<Fmt::INT4, EPL> {
     static inline float run(const QuantWeight& w, const uint8_t* row,
                             const float* x, const float* lut,
                             const float* slut, const float* nlut, int n, int k0) {
-        const int64_t gi = int64_t(n) * w.row_scales + k0 / kInt4Group;
+        const int64_t gi = int64_t(n) * w.row_scales + (k0 >> w.int4_gshift());
         const float   s  = bf16_to_f32(static_cast<const bf16_t*>(w.scales)[gi]);
         const uint8_t zu = w.zeros[gi];
         const float   z  = float(zu);

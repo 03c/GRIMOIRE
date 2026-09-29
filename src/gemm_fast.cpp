@@ -124,14 +124,14 @@ sycl::event dequant_vnni(sycl::queue& q, const QuantWeight& w, sycl_bf16* dst,
                     scale = static_cast<const float*>(wc.scales)[n];
                 } else if constexpr (F == Fmt::INT4) {
                     scale = bf16_to_f32(static_cast<const bf16_t*>(wc.scales)
-                        [int64_t(n) * wc.row_scales + k / kInt4Group]);
+                        [int64_t(n) * wc.row_scales + (k >> wc.int4_gshift())]);
                 } else if constexpr (F == Fmt::MXFP8 || F == Fmt::MXFP4) {
                     scale = e8m0_to_f32(static_cast<const uint8_t*>(wc.scales)
                         [int64_t(n) * wc.row_scales + k / kMXBlock]);
                 }
                 if constexpr (F == Fmt::INT4)
                     v[t] = decode_int4(row, k, scale, wc.zeros
-                        ? wc.zeros[int64_t(n) * wc.row_scales + k / kInt4Group] : 0);
+                        ? wc.zeros[int64_t(n) * wc.row_scales + (k >> wc.int4_gshift())] : 0);
                 else
                     v[t] = decode_elem<F>(row, k, scale);
             }
@@ -194,7 +194,7 @@ sycl::event dequant_vnni_tiled(sycl::queue& q, const QuantWeight& w, sycl_bf16* 
                         sc = static_cast<const float*>(wc.scales)[n];
                     } else if constexpr (F == Fmt::INT4) {
                         sc = bf16_to_f32(static_cast<const bf16_t*>(wc.scales)
-                            [int64_t(n) * wc.row_scales + kb / kInt4Group]);
+                            [int64_t(n) * wc.row_scales + (kb >> wc.int4_gshift())]);
                     } else if constexpr (F == Fmt::MXFP8) {
                         sc = e8m0_to_f32(static_cast<const uint8_t*>(wc.scales)
                             [int64_t(n) * wc.row_scales + kb / kMXBlock]);
@@ -203,7 +203,7 @@ sycl::event dequant_vnni_tiled(sycl::queue& q, const QuantWeight& w, sycl_bf16* 
                     for (int j = 0; j < 16; ++j) {
                         if constexpr (F == Fmt::INT4)
                             v[j] = decode_int4(row, kb + j, sc, wc.zeros
-                                ? wc.zeros[int64_t(n) * wc.row_scales + (kb + j) / kInt4Group] : 0);
+                                ? wc.zeros[int64_t(n) * wc.row_scales + ((kb + j) >> wc.int4_gshift())] : 0);
                         else
                             v[j] = decode_elem<F>(row, kb + j, sc);
                     }

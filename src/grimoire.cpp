@@ -1206,6 +1206,11 @@ bool repack_gptq_ref(const Qwen35Model& ck, const TensorRef& r,
     return true;
 }
 
+// The INT4 kernels index a scale by k >> QuantWeight::int4_gshift(), which
+// knows 64- and 128-wide groups.  A checkpoint with any other group size
+// is dequantized exactly and re-quantized instead of imported as stored.
+static bool int4_group_ok(int g) { return g == 64 || g == 128; }
+
 bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
                               PackedWeight& p, std::string& err) {
     if (!r.compressed_int4 || r.t.shape.size() != 2 || r.gptq_group <= 0)
@@ -1323,13 +1328,13 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
             *ok=false; return d;
         }
         p=copy_packed(w); // Saved precision is authoritative; no second quantization.
-    } else if (r.compressed_int4 && use == Fmt::INT4) {
+    } else if (r.compressed_int4 && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
         if (!read_compressed_int4_ref(ck, r, p, rerr)) {
             std::printf("\n  direct compressed INT4 read failed for %s: %s\n",
                         what, rerr.c_str());
             *ok = false; return d;
         }
-    } else if (r.gptq && use == Fmt::INT4) {
+    } else if (r.gptq && use == Fmt::INT4 && int4_group_ok(r.gptq_group)) {
         if (!repack_gptq_ref(ck, r, p, rerr)) {
             std::printf("\n  direct GPTQ read failed for %s: %s\n", what, rerr.c_str());
             *ok = false; return d;
@@ -1639,7 +1644,8 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.payload.insert(p.payload.end(),tail.payload.begin(),tail.payload.end());
         p.scales_raw.insert(p.scales_raw.end(),tail.scales_raw.begin(),tail.scales_raw.end());
         p.zeros.insert(p.zeros.end(),tail.zeros.begin(),tail.zeros.end());
-    } else if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4) {
+    } else if (ra.compressed_int4 && rb.compressed_int4 && use == Fmt::INT4 &&
+               int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
         PackedWeight a,b;
         if(!read_compressed_int4_ref(ck,ra,a,rerr)||
            !read_compressed_int4_ref(ck,rb,b,rerr)){
@@ -1655,7 +1661,8 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
         p.payload.insert(p.payload.end(),b.payload.begin(),b.payload.end());
         p.scales_raw.insert(p.scales_raw.end(),b.scales_raw.begin(),b.scales_raw.end());
         p.zeros.insert(p.zeros.end(),b.zeros.begin(),b.zeros.end());
-    } else if (ra.gptq && rb.gptq && use == Fmt::INT4) {
+    } else if (ra.gptq && rb.gptq && use == Fmt::INT4 &&
+               int4_group_ok(ra.gptq_group) && ra.gptq_group == rb.gptq_group) {
         PackedWeight a,b;
         if(!repack_gptq_ref(ck,ra,a,rerr)||!repack_gptq_ref(ck,rb,b,rerr)){
             std::printf("\n  direct GPTQ concatenate failed for %s: %s\n",what,rerr.c_str());

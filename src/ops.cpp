@@ -1932,7 +1932,7 @@ static sycl::event mova_value_packed_impl(
                             sc = static_cast<const float*>(wc.scales)[row];
                         } else if constexpr (F == Fmt::INT4) {
                             sc = bf16_to_f32(static_cast<const bf16_t*>(wc.scales)
-                                     [row * wc.row_scales + k / kInt4Group]);
+                                     [row * wc.row_scales + (k >> wc.int4_gshift())]);
                         } else {
                             sc = e8m0_to_f32(static_cast<const uint8_t*>(wc.scales)
                                      [row * wc.row_scales + k / kMXBlock]);
@@ -1940,7 +1940,7 @@ static sycl::event mova_value_packed_impl(
                         float wv;
                         if constexpr (F == Fmt::INT4) {
                             const uint8_t z = wc.zeros
-                                ? wc.zeros[row * wc.row_scales + k / kInt4Group]
+                                ? wc.zeros[row * wc.row_scales + (k >> wc.int4_gshift())]
                                 : uint8_t(0);
                             wv = decode_int4(rp, k, sc, z);
                         } else {

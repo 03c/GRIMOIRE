@@ -47,7 +47,7 @@ struct QuantWeight {
                 return static_cast<const float*>(scales)[n];
             case Fmt::INT4:
                 return bf16_to_f32(static_cast<const bf16_t*>(scales)
-                                   [int64_t(n) * row_scales + k / kInt4Group]);
+                                   [int64_t(n) * row_scales + (k >> int4_gshift())]);
             case Fmt::MXFP8:
             case Fmt::MXFP4:
                 return e8m0_to_f32(static_cast<const uint8_t*>(scales)
@@ -57,7 +57,18 @@ struct QuantWeight {
     }
 
     inline uint8_t zero_for(int n, int k) const {
-        return zeros ? zeros[int64_t(n) * row_scales + k / kInt4Group] : 0;
+        return zeros ? zeros[int64_t(n) * row_scales + (k >> int4_gshift())] : 0;
+    }
+
+    // INT4 group size as a shift: 128 (GRIMOIRE's own quantizer and most
+    // checkpoints) or 64 (GPTQ / AutoRound exports with group_size 64, e.g.
+    // Qwen3.8-27B-W4A16).  Derived from the shape, so no field has to be
+    // threaded through every kernel.  Every INT4 scale/zero index used to
+    // divide by kInt4Group = 128 unconditionally, which applied each group-64
+    // scale to the wrong half-group: fluent-looking garbage.  The loader
+    // refuses any other group size.
+    inline int int4_gshift() const {
+        return (int64_t(row_scales) * 64 == int64_t(K)) ? 6 : 7;
     }
 
     // Reference dequantized value. Used by the tests and by the CPU
