@@ -948,9 +948,39 @@ static bool read_row_scales(const Qwen35Model& ck, const TensorRef& r, int N,
     return true;
 }
 
+// compressed-tensors MXFP4 (mxfp4-pack-quantized): .weight_packed U8
+// [N][K/2] E2M1 nibbles (even k in the low nibble) + .weight_scale U8
+// [N][K/32] E8M0.  The loader's packed() rewrites the LOGICAL shape to
+// [N][K] without a format flag, so this recognizes it from the source.
+static bool packed_mxfp4_src(const TensorRef& r) {
+    return r.t.name.find("weight_packed") != std::string::npos && !r.native &&
+           !r.nvfp4 && !r.compressed_int4 && r.t.dtype == STDtype::U8 &&
+           r.scales_t.dtype == STDtype::U8 && r.t.shape.size() == 2;
+}
+
 bool read_matrix_f32(const Qwen35Model& ck, const TensorRef& r,
                      float* dst, std::string& err) {
     if (r.native) return ck.read_native_f32(r,dst,err);
+    // Packed MXFP4 must be DECODED, for compressed INT4's reason below: the
+    // plain read asked for N*K U8 values from a K/2-bytes-per-row payload --
+    // a host SIGSEGV in st_to_f32 loading Muse-Glimmer-30B-MXFP4 with a
+    // non-MXFP4 target format (Muse's PF is INT4) -- and ignored the scales.
+    if (packed_mxfp4_src(r)) {
+        const int N = int(r.t.shape[0]), K = int(r.t.shape[1]);
+        if (K % kMXBlock) { err = "packed MXFP4: K not a multiple of 32"; return false; }
+        std::vector<uint8_t> pk(size_t(N) * K / 2), sc(size_t(N) * (K / kMXBlock));
+        TensorRef scr; scr.shard = r.scales_shard; scr.t = r.scales_t;
+        if (!ck.read_raw(r, pk.data(), err) || !ck.read_raw(scr, sc.data(), err))
+            return false;
+        for (int n = 0; n < N; ++n)
+            for (int k = 0; k < K; ++k) {
+                const uint8_t b = pk[size_t(n) * (K / 2) + k / 2];
+                const uint8_t nib = (k & 1) ? uint8_t(b >> 4) : uint8_t(b & 0x0F);
+                dst[int64_t(n) * K + k] = e2m1_to_f32(nib) *
+                    e8m0_to_f32(sc[size_t(n) * (K / kMXBlock) + k / kMXBlock]);
+            }
+        return true;
+    }
     // compressed-tensors INT4 must be decoded, not read.  The loader
     // rewrites this tensor's LOGICAL shape to [N][K] while the payload
     // still holds K/8 int32 words per row, so falling through to the
@@ -1237,6 +1267,22 @@ bool read_compressed_int4_ref(const Qwen35Model& ck, const TensorRef& r,
     TensorRef sr; sr.shard = r.scales_shard; sr.t = r.scales_t;
     if (!ck.read_raw(r,p.payload.data(),err) ||
         !ck.read_raw(sr,p.scales_raw.data(),err)) return false;
+    // Asymmetric: weight_zero_point, 8 rows' 4-bit zeros per int32 word,
+    // [N/8][groups], row n in nibble n%8 -- the same +8 offset as the
+    // packed weights, so dequant is (q - zp) * s with both as stored.
+    if (r.qzeros_t.end > r.qzeros_t.begin) {
+        const size_t zbytes = size_t(r.qzeros_t.end - r.qzeros_t.begin);
+        if (N % 8 || zbytes != size_t(N / 8) * groups * sizeof(int32_t)) {
+            err = "compressed INT4 zero-point size mismatch"; return false;
+        }
+        std::vector<uint32_t> zw(size_t(N / 8) * groups);
+        TensorRef zr; zr.shard = r.qzeros_shard; zr.t = r.qzeros_t;
+        if (!ck.read_raw(zr, zw.data(), err)) return false;
+        for (int n = 0; n < N; ++n)
+            for (int g = 0; g < groups; ++g)
+                p.zeros[size_t(n) * groups + g] = uint8_t(
+                    (zw[size_t(n / 8) * groups + g] >> (4 * (n % 8))) & 0xFu);
+    }
     return true;
 }
 
@@ -1287,8 +1333,13 @@ DevQuant quantize_upload_t(sycl::queue& q, const Qwen35Model& ck,
     // VRAM would hand the kernel E4M3 per-16 scales to read as E8M0
     // per-32, and under-read the scale buffer by half on top.  The
     // result is a model that loads, runs and is wrong.  b70/nvfp4.hpp.
+    // Any QUANTIZED target keeps a packed MXFP4 source as stored (saved
+    // precision is authoritative): Muse asks for INT4, and re-quantizing
+    // already-4-bit weights to INT4 would only lose precision.  BF16 still
+    // decodes through read_matrix_f32.
     if (r.t.name.find("weight_packed") != std::string::npos && !r.native &&
-        !r.nvfp4 && (fmt == Fmt::MXFP4)) {
+        !r.nvfp4 && (fmt == Fmt::MXFP4 ||
+                     (fmt != Fmt::BF16 && packed_mxfp4_src(r)))) {
         DevQuant d;
         const size_t pb = size_t(N) * K / 2;
         const size_t sb = size_t(N) * (K / kMXBlock);
@@ -1609,7 +1660,9 @@ DevQuant concat_upload_t(sycl::queue& q, const Qwen35Model& ck,
     const bool hf_packed = !ra.native && !rb.native &&
         !ra.nvfp4 && !rb.nvfp4 &&
         ra.t.name.find("weight_packed") != std::string::npos &&
-        rb.t.name.find("weight_packed") != std::string::npos && fmt == Fmt::MXFP4;
+        rb.t.name.find("weight_packed") != std::string::npos &&
+        (fmt == Fmt::MXFP4 ||
+         (fmt != Fmt::BF16 && packed_mxfp4_src(ra) && packed_mxfp4_src(rb)));
     if (hf_packed) {
         const size_t pba=size_t(Na)*K/2, pbb=size_t(Nb)*K/2;
         const size_t sba=size_t(Na)*(K/kMXBlock), sbb=size_t(Nb)*(K/kMXBlock);

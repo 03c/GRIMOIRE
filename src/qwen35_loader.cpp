@@ -872,6 +872,12 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
                 cp.scales_t = cs.t;
                 cp.gptq_group = in / groups;
                 cp.t.shape = {out, in};
+                // Asymmetric exports (symmetric: false) ship per-group zero
+                // points, packed 8 rows per int32: [N/8][groups].  Without
+                // them every weight was decoded around 8 -- the fluent-free
+                // garbage of Muse-Glimmer-30B-GPTQ-INT4.
+                TensorRef zp = get(base + ".weight_zero_point");
+                if (zp.ok()) { cp.qzeros_shard = zp.shard; cp.qzeros_t = zp.t; }
                 return cp;
             }
         }
@@ -910,6 +916,8 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
             if (groups <= 0 || K % groups) return TensorRef{};
             p.compressed_int4 = true;
             p.gptq_group = K / groups;
+            TensorRef zp = get(base + ".weight_zero_point");   // asymmetric exports
+            if (zp.ok()) { p.qzeros_shard = zp.shard; p.qzeros_t = zp.t; }
         }
         p.t.shape = {N, K};
         return p;

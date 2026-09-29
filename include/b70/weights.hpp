@@ -68,7 +68,8 @@ struct QuantWeight {
     // scale to the wrong half-group: fluent-looking garbage.  The loader
     // refuses any other group size.
     inline int int4_gshift() const {
-        return (int64_t(row_scales) * 64 == int64_t(K)) ? 6 : 7;
+        const int64_t rs = row_scales, k = K;
+        return rs * 32 == k ? 5 : rs * 64 == k ? 6 : rs * 256 == k ? 8 : 7;
     }
 
     // Reference dequantized value. Used by the tests and by the CPU

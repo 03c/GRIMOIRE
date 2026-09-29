@@ -82,6 +82,10 @@ echo "== Agnes-3.0-Flash (baseline long 4.691 s)"
 run a-s Agnes-3.0-Flash mxfp4 64 "$SHORT"; show a-s
 run a-l Agnes-3.0-Flash mxfp4 24 "$LONG"; show a-l
 
+echo "== INT4 W4A16 checkpoints (group 64 AutoRound GPTQ; fixed f8b7198)"
+run w-s Qwen3.8-27B-W4A16 int4 64 "$SHORT"; show w-s
+run w-l Qwen3.8-27B-W4A16 int4 24 "$LONG"; show w-l
+
 echo "== NVFP4 / FP8 checkpoints (short)"
 run n-orn Ornith-1.5-35B-A3B-NVFP4 mxfp4 64 "$SHORT"; show n-orn
 run n-q Qwen3.8-27B-NVFP4 mxfp4 64 "$SHORT"; show n-q
