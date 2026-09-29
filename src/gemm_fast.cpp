@@ -1432,7 +1432,8 @@ template <int EPI>
 sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const sycl_bf16* A,
                             void* out, const int32_t* tile_e, const int32_t* tile_mb,
                             const int32_t* off, const int32_t* cnt, int T,
-                            const std::vector<sycl::event>& deps) {
+                            const std::vector<sycl::event>& deps,
+                            const float* rowscale = nullptr) {
     constexpr int MT = 32, TMT = MC2 / MT, TNT = 2, TPW = TMT * TNT;
     constexpr int CG = 2 * TNT;                   // 16-column groups per work-group
     constexpr int STEP = 4 * CG * 2 * 512;        // bytes of dequantized B per 128 K
@@ -1557,6 +1558,25 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
             if constexpr (EPI == 0) {
                 float* Oe = static_cast<float*>(out) + size_t(off[e]) * Ne;
                 const unsigned OW = unsigned(Ne) * 4 - 1;
+                if (rowscale) {                       // out row r *= rowscale[off + r]
+                    const float* rs = rowscale + size_t(off[e]);
+                    #pragma unroll
+                    for (int rb = 0; rb < 4; ++rb) {
+                        const es::simd<uint32_t, 8> ri(0, 1);
+                        es::simd<uint32_t, 8> rows = ri + unsigned(m0 + 8 * rb);
+                        es::simd_mask<8> ok = rows < unsigned(M);
+                        es::simd<float, 8> sv = es::gather<float, 8>(rs, rows * 4u, ok);
+                        #pragma unroll
+                        for (int hh = 0; hh < 2; ++hh)
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                const float sr = sv[r];
+                                const int o = (rb * 2 + hh) * 128 + 16 * r;
+                                es::simd<float, 16> v = acc.template select<16, 1>(o);
+                                acc.template select<16, 1>(o) = v * sr;
+                            }
+                    }
+                }
                 #pragma unroll
                 for (int rb = 0; rb < 4; ++rb)
                     #pragma unroll
@@ -1620,10 +1640,14 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
                                      bool swiglu, const sycl_bf16* A, void* out,
                                      const int32_t* tile_e, const int32_t* tile_mb,
                                      const int32_t* off, const int32_t* cnt, int T,
-                                     const std::vector<sycl::event>& deps) {
+                                     const std::vector<sycl::event>& deps,
+                                     const float* rowscale) {
     if (moe_esimd_ok(w, Ne, swiglu))
         return swiglu ? moe_mxfp4_esimd<1>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
-                      : moe_mxfp4_esimd<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);
+                      : moe_mxfp4_esimd<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps,
+                                           rowscale);
+    if (rowscale)
+        throw std::runtime_error("launch_moe_mxfp4_grouped: rowscale needs the ESIMD kernel");
     return swiglu
         ? gemm_mxfp4_fused_grouped<1>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
         : gemm_mxfp4_fused_grouped<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);

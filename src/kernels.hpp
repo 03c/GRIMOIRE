@@ -406,16 +406,23 @@ bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne);
 // True when launch_moe_mxfp4_grouped takes the ESIMD kernel, which also skips
 // tile-table entries with expert -1 (the padding of a device-built table).
 bool moe_mxfp4_grouped_esimd(const QuantWeight& w, int Ne, bool swiglu);
+// rowscale (ESIMD path, !swiglu only): output row r is multiplied by
+// rowscale[off[e] + r] before it is stored.
 sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
     bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
     const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
-    const std::vector<sycl::event>& deps = {});
+    const std::vector<sycl::event>& deps = {}, const float* rowscale = nullptr);
+// prefill.cpp: s[t] = 1 / (1 + exp(-dot(x[t], w))), x bf16 [rows][K], w bf16 [K]
+// (a one-output-row gate such as Ornith's shared_expert_gate).
+sycl::event launch_rowdot_sigmoid(sycl::queue& q, const sycl_bf16* x, const sycl_bf16* w,
+    float* s, int rows, int K, const std::vector<sycl::event>& deps = {});
 // prefill.cpp: device-side routing for the grouped MoE GEMM (top_k 8,
 // <= 1024 experts): per-expert counts and offsets, inverse[r] = permuted row
 // of route r, the bf16 permuted rows, and the (expert, mc-row m-tile) table
-// padded to tmax entries with expert -1.  No host round trip.
+// padded to tmax entries with expert -1.  No host round trip.  xrow
+// (optional) also receives the unpermuted bf16 rows.
 void launch_moe_route_grouped(sycl::queue& q, const float* hidden, const int32_t* topk_ids,
-    sycl_bf16* xperm, int32_t* counts, int32_t* offsets, int32_t* inverse,
+    sycl_bf16* xperm, sycl_bf16* xrow, int32_t* counts, int32_t* offsets, int32_t* inverse,
     int32_t* tile_e, int32_t* tile_mb, int tmax, int tokens, int hidden_size,
     int num_experts, int mc);
 // gemm_fast.cpp: the XMX flash prefill, causal, with an optional sliding

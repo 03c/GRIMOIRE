@@ -12751,6 +12751,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     int32_t* moe_tab=sycl::malloc_device<int32_t>(
         size_t(2 * moe_tab_tiles + 2 * std::max(1,cfg.n_experts)), q);
     int32_t* pinv=sycl::malloc_device<int32_t>(R,q);
+    // Shared expert through the grouped ESIMD GEMM as ONE expert of M rows:
+    // its tile table never changes during a prompt, so it is built once here.
+    const int sh_tiles=(M+moe_grouped_rows()-1)/moe_grouped_rows();
+    int32_t* sh_tab=sycl::malloc_device<int32_t>(size_t(2*sh_tiles+2),q);
+    if(sh_tab){
+        std::vector<int32_t> h(size_t(2*sh_tiles+2));
+        for(int t=0;t<sh_tiles;++t){h[size_t(t)]=0;h[size_t(sh_tiles+t)]=t;}
+        h[size_t(2*sh_tiles)]=0; h[size_t(2*sh_tiles+1)]=M;
+        q.memcpy(sh_tab,h.data(),h.size()*sizeof(int32_t)).wait();   // h dies here
+    }
     int32_t* grouped_rows=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_shared<int32_t>(E,q) : nullptr;
     int32_t* grouped_atomic=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_device<int32_t>(1,q) : nullptr;
     float* aux0=need_aux?df(size_t(M)*W):nullptr;
@@ -12765,6 +12775,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if(defer_moe_gather)mem.push_back(moe_res);
     if(need_aux){mem.push_back(aux0);mem.push_back(aux1);mem.push_back(aux_xb);mem.push_back(aux_out);}
     if(xe2_grouped||xe2_grouped_mxfp4){mem.push_back(grouped_rows);mem.push_back(grouped_atomic);}
+    mem.push_back(sh_tab);
     const size_t gdn_pitch=gdn_tokens;
     sycl_bf16* gdn_a=xe2_gdn_raw?sycl::malloc_device<sycl_bf16>(size_t(Hv)*gdn_pitch*64,q):nullptr;
     sycl_bf16* gdn_w=xe2_gdn_raw?sycl::malloc_device<sycl_bf16>(size_t(Hv)*gdn_pitch*Dk,q):nullptr;
@@ -12778,9 +12789,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // named the PREVIOUS buffer -- a null `alpha` was reported as
         // "beta", which sends you looking at the wrong allocation.
         static const char* const base_names[]={"bh","bn","r0","r1","t0","t1","t2","t3","t4",
-            "la_fused","xb","bn_bf","dtok","rex","rwt","rlog","mh","alpha","beta","xperm",
-            "yperm","ptoken","pinv"};
-        static_assert(sizeof(base_names)/sizeof(base_names[0]) == 23,
+            "la_fused","xb","bn_bf","dtok","rex","rwt","rlog","mh","alpha","beta","moe_tab",
+            "xperm","yperm","ptoken","pinv"};
+        static_assert(sizeof(base_names)/sizeof(base_names[0]) == 24,
                       "base_names must name every entry of the mem vector");
         const char* name=mi<sizeof(base_names)/sizeof(base_names[0])?base_names[mi]:"optional";
         std::fprintf(stderr,"    prefill allocation failed: %s (M=%d H=%d W=%d R=%d I=%d)\n",
@@ -14052,6 +14063,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // an out-of-bounds weight read, a DEVICE_LOST on the card.
             // Unreachable today (TP only batches decode rows, M <= 16); this
             // keeps it unreachable when TP prompt prefill arrives.
+            bool bn_bf_from_route=false, sh_gate_done=false;
             if(d.tiered){
                 if(M>=32 && device_can_matrix(q)){
                     if(!tiered_moe_prefill(d,bn,rex,rwt,r0,M))
@@ -14155,8 +14167,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     const int E=cfg.n_experts;
                     int32_t* d_te=moe_tab; int32_t* d_tm=moe_tab+moe_tab_tiles;
                     int32_t* d_off=moe_tab+2*moe_tab_tiles; int32_t* d_cnt=d_off+E;
-                    launch_moe_route_grouped(q,bn,rex,xperm,d_cnt,d_off,pinv,d_te,d_tm,
+                    launch_moe_route_grouped(q,bn,rex,xperm,bn_bf,d_cnt,d_off,pinv,d_te,d_tm,
                                              moe_tab_tiles,M,H,E,moe_grouped_rows());
+                    bn_bf_from_route=true;   // bf16(bn), for the shared expert below
                     sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
                     launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
                                              d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
@@ -14253,9 +14266,36 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             else {
                 if(!mlp_bf16(d.sh_gu,d.sh_down,r1,li)){
                     const int SI=d.sh_gu.output_rows()/2;
-                    mm(d.sh_gu,bn,t0);launch_swiglu_batched(q,t0,t1,M,SI);mm(d.sh_down,t1,r1);
+                    // One expert of M rows through the grouped ESIMD GEMM (SwiGLU
+                    // fused, bf16 h), when the routing kernel left bf16(bn) in
+                    // bn_bf: 38 ms of generic dequant + GEMM + SwiGLU on Ornith.
+                    if(bn_bf_from_route && sh_tab && !std::getenv("GRIMOIRE_SHARED_ESIMD_OFF") &&
+                       moe_mxfp4_grouped_esimd(d.sh_gu.w,2*SI,true) &&
+                       moe_mxfp4_grouped_esimd(d.sh_down.w,H,false)){
+                        sycl_bf16* shh=reinterpret_cast<sycl_bf16*>(mh);
+                        const int32_t *s_te=sh_tab, *s_tm=sh_tab+sh_tiles,
+                                      *s_off=sh_tab+2*sh_tiles, *s_cnt=sh_tab+2*sh_tiles+1;
+                        launch_moe_mxfp4_grouped(q,d.sh_gu.w,2*SI,true,bn_bf,shh,
+                                                 s_te,s_tm,s_off,s_cnt,sh_tiles);
+                        // The shared_expert_gate is one bf16 row: its sigmoid goes
+                        // into the down GEMM's store (the generic GEMM with N=1 plus
+                        // a separate scaling pass took 20 ms of Ornith's prompt).
+                        const bool gate_fused = d.has_sh_gate && d.sh_gate_q.w.fmt==Fmt::BF16 &&
+                            d.sh_gate_q.w.payload && d.sh_gate_q.w.N==1 && d.sh_gate_q.w.K==H &&
+                            !std::getenv("GRIMOIRE_SHARED_GATE_UNFUSED");
+                        if(gate_fused)
+                            launch_rowdot_sigmoid(q,bn_bf,
+                                reinterpret_cast<const sycl_bf16*>(d.sh_gate_q.w.payload),t2,M,H);
+                        launch_moe_mxfp4_grouped(q,d.sh_down.w,H,false,shh,r1,
+                                                 s_te,s_tm,s_off,s_cnt,sh_tiles,{},
+                                                 gate_fused?t2:nullptr);
+                        sh_gate_done=gate_fused;
+                    }else{
+                        mm(d.sh_gu,bn,t0);launch_swiglu_batched(q,t0,t1,M,SI);mm(d.sh_down,t1,r1);
+                    }
                 }
-                if(d.has_sh_gate){mm(d.sh_gate_q,bn,t2);launch_scale_by_sigmoid_batched(q,r1,t2,M,H);}
+                pp_mark("shared expert FFN");
+                if(d.has_sh_gate && !sh_gate_done){mm(d.sh_gate_q,bn,t2);launch_scale_by_sigmoid_batched(q,r1,t2,M,H);}
             }
             pp_mark("shared expert");
         }else{

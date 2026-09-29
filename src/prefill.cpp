@@ -2078,6 +2078,31 @@ sycl::event launch_swiglu_bf16_quant(sycl::queue& q,const sycl_bf16*gu,
    });});
 }
 
+sycl::event launch_rowdot_sigmoid(sycl::queue& q, const sycl_bf16* x, const sycl_bf16* w,
+    float* s, int rows, int K, const std::vector<sycl::event>& deps) {
+    constexpr int SG = 16, WG = 256, RPW = WG / SG;       // one sub-group per row
+    const size_t groups = (size_t(rows) + RPW - 1) / RPW;
+    return q.submit([&](sycl::handler& h) { h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(groups * WG, WG),
+          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]);
+            const int t = int(it.get_group(0)) * RPW + int(sg.get_group_id()[0]);
+            if (t >= rows) return;
+            const sycl_bf16* xr = x + int64_t(t) * K;
+            float acc = 0.0f;
+            for (int k = lane * 8; k < K; k += SG * 8) {
+                const sycl::vec<sycl_bf16, 8> xv = *reinterpret_cast<const sycl::vec<sycl_bf16, 8>*>(xr + k);
+                const sycl::vec<sycl_bf16, 8> wv = *reinterpret_cast<const sycl::vec<sycl_bf16, 8>*>(w + k);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) acc = sycl::fma(float(xv[j]), float(wv[j]), acc);
+            }
+            const float g = sycl::reduce_over_group(sg, acc, sycl::plus<float>());
+            if (lane == 0) s[t] = 1.0f / (1.0f + sycl::exp(-g));   // as launch_scale_by_sigmoid_batched
+        });
+    });
+}
+
 sycl::event launch_scale_by_sigmoid_batched(sycl::queue& q, float* x,
     const float* gate, int tokens, int hidden,
     const std::vector<sycl::event>& deps) {
@@ -2174,7 +2199,7 @@ sycl::event launch_moe_unpermute_bf16(sycl::queue& q, const sycl_bf16* src,
 // depends only on that row, and the unpermute sums the top-k contributions
 // in slot order, so the layer output does not change.
 void launch_moe_route_grouped(sycl::queue& q, const float* hidden, const int32_t* topk_ids,
-    sycl_bf16* xperm, int32_t* counts, int32_t* offsets, int32_t* inverse,
+    sycl_bf16* xperm, sycl_bf16* xrow, int32_t* counts, int32_t* offsets, int32_t* inverse,
     int32_t* tile_e, int32_t* tile_mb, int tmax, int tokens, int hidden_size,
     int num_experts, int mc) {
     constexpr int TOPK = 8, WG = 256, SW = 1024;
@@ -2245,6 +2270,9 @@ void launch_moe_route_grouped(sycl::queue& q, const float* hidden, const int32_t
                 for (int s = 0; s < TOPK; ++s)
                     *reinterpret_cast<sycl::vec<sycl_bf16, 8>*>(
                         xperm + int64_t(dst[s]) * hidden_size + d) = v;
+                if (xrow)                                  // unpermuted copy (shared expert)
+                    *reinterpret_cast<sycl::vec<sycl_bf16, 8>*>(
+                        xrow + int64_t(token) * hidden_size + d) = v;
             }
             sycl::group_barrier(it.get_group());      // every lane has read inverse
             #pragma unroll
