@@ -198,6 +198,37 @@ sycl::event gemv_impl(sycl::queue& q, const QuantWeight& w,
                             }
                         }
                     }
+                } else if constexpr (OPT != 0 && F == Fmt::INT4) {
+                    // INT4 twin of the hoisted-x path below: x loaded once
+                    // per K step for all R rows, and the zero-point's
+                    // sum(x) computed once per chunk instead of per row.
+                    // Same per-row sequence as run() -- bit-identical.
+                    for (; base + span <= K; base += span) {
+                        const int k0 = base + lane * EPL_F;
+                        #pragma unroll
+                        for (int m = 0; m < MB; ++m) {
+                        if (m >= mc) break;
+                        const float* xm = x + int64_t(m) * K;
+                        float xv[UNROLL][EPL_F], ax[UNROLL];
+                        #pragma unroll
+                        for (int u = 0; u < UNROLL; ++u) {
+                            #pragma unroll
+                            for (int i = 0; i < EPL_F; ++i)
+                                xv[u][i] = xm[k0 + u * STEP_F + i];
+                            ax[u] = GemvStep<F, EPL_F>::xsum(&xv[u][0]);
+                        }
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            const int n = n_base + r;
+                            if (n >= N) continue;
+                            const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes;
+                            #pragma unroll
+                            for (int u = 0; u < UNROLL; ++u)
+                                part[m][r][u] += GemvStep<F, EPL_F>::template run_xv<OPT>(
+                                    wc, row, &xv[u][0], ax[u], n, k0 + u * STEP_F);
+                        }
+                        }
+                    }
                 } else if constexpr (OPT != 0 && F == Fmt::MXFP4) {
                     // OPT bit 0: load this lane's activations ONCE per K step
                     // and reuse them across all R rows.  Without it
@@ -768,6 +799,32 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
             if (un == 4) return gemv_impl<F, 16, 4, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
             if (un == 8) return gemv_impl<F, 16, 8, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
             return gemv_impl<F, 16, 2, 3, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+        }
+    }
+    // INT4 decode rows: the hoisted-x kernel (B70_GEMV_OPT=0 = the plain
+    // one).  Same UNROLL and rows per sub-group as the plain path, so each
+    // row's accumulation -- and the output -- is bit-identical.
+    if constexpr (F == Fmt::INT4 && MB == 1) {
+        if (epl == 16 && gemv_opt_override() > 0) {
+            // Rows per sub-group: B70_RPS (1|2|4|8) sweeps it; rows owned
+            // never change a row's accumulation, so any value is exact.
+            // Default 2: MEASURED on Muse-Glimmer-30B INT4 (one decode token,
+            // q/o_gate N=4096 K=6656, o N=6656, FFN I=24576): RPS 4 62.1 ms,
+            // 2 52.0, 1 54.1, 8 90.5 -- at 4 the N=4096-6656 shapes got only
+            // 128-208 work-groups.
+            static const int irps = [] { const char* e = std::getenv("B70_RPS");
+                const int v = (e && *e) ? std::atoi(e) : 0;
+                return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 2; }();
+            if (un == 4) {
+                if (irps == 1) return gemv_impl<F, 16, 4, 1, 1, MB>(q, w, x, y, deps, mc);
+                if (irps == 2) return gemv_impl<F, 16, 4, 1, 2, MB>(q, w, x, y, deps, mc);
+                if (irps == 8) return gemv_impl<F, 16, 4, 1, 8, MB>(q, w, x, y, deps, mc);
+                return gemv_impl<F, 16, 4, 1, 4, MB>(q, w, x, y, deps, mc);
+            }
+            if (un == 1) return gemv_impl<F, 16, 1, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+            if (un == 2) return gemv_impl<F, 16, 2, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+            if (un == 8) return gemv_impl<F, 16, 8, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
+            return gemv_impl<F, 16, 4, 1, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
         }
     }
     if (epl == 16) {

@@ -8477,6 +8477,10 @@ const float* Grimoire::forward_muse(int token) {
         if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
         else gemv_any(d.v_proj, s.h2, s.bbuf, none);
         MK("  k+v gemv");
+        if (i == probe_layer) {                  // GRIMOIRE_DEBUG=1 only
+            probe("muse k proj", s.zbuf, KVH * HD);
+            probe("muse v proj", s.bbuf, KVH * HD);
+        }
         // scaleless QK-norm over head_dim (zero weight -> (1+0)), BEFORE RoPE.
         launch_rmsnorm_heads(q, s.qkv,  muse_zero, QH,  HD, eps, true, none);
         launch_rmsnorm_heads(q, s.zbuf, muse_zero, KVH, HD, eps, true, none);

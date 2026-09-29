@@ -238,6 +238,45 @@ template <int EPL> struct GemvStep<Fmt::MXFP4, EPL> {
 };
 
 template <int EPL> struct GemvStep<Fmt::INT4, EPL> {
+    // Hoisted-x entry point, for the reason MXFP4's run_xv exists: run()
+    // takes x and row as unqualified pointers, so every x[k] is reloaded for
+    // each of the sub-group's rows.  `xv` = this lane's EPL activations in
+    // registers; `ax` = their pairwise sum in run()'s exact order (xsum) --
+    // it depends on x only, so the caller computes it once for all rows.
+    // The fma sequence and the final (aq - z*ax)*s are run()'s, so the
+    // result is bit-identical.
+    template <int OPT>
+    static inline float run_xv(const QuantWeight& w, const uint8_t* row,
+                               const float* xv, float ax, int n, int k0) {
+        const int64_t gi = int64_t(n) * w.row_scales + k0 / kInt4Group;
+        const float   s  = bf16_to_f32(static_cast<const bf16_t*>(w.scales)[gi]);
+        const uint8_t zu = w.zeros[gi];
+        const float   z  = float(zu);
+        const uint8_t* p = row + (k0 >> 1);
+        float aq = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < EPL / 2; ++i) {
+            uint8_t byte;
+            if constexpr (EPL == 16) {
+                // one 8-byte transaction (k0 % 16 == 0, row_bytes % 8 == 0)
+                byte = uint8_t((*reinterpret_cast<const uint64_t*>(p)) >> (8 * i));
+            } else {
+                byte = p[i];
+            }
+            const uint8_t q0=byte&0x0F, q1=(byte>>4)&0x0F;
+            const float v0=zu==0xff ? float(q0&8 ? int(q0)-16 : int(q0)) : float(q0);
+            const float v1=zu==0xff ? float(q1&8 ? int(q1)-16 : int(q1)) : float(q1);
+            aq = sycl::fma(v0, xv[2 * i], aq);
+            aq = sycl::fma(v1, xv[2 * i + 1], aq);
+        }
+        return (zu==0xff ? aq : aq-z*ax) * s;
+    }
+    static inline float xsum(const float* xv) {       // run()'s ax, same order
+        float ax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < EPL / 2; ++i) ax += xv[2 * i] + xv[2 * i + 1];
+        return ax;
+    }
     static inline float run(const QuantWeight& w, const uint8_t* row,
                             const float* x, const float* lut,
                             const float* slut, const float* nlut, int n, int k0) {
