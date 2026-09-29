@@ -8415,6 +8415,15 @@ const float* Grimoire::forward_muse(int token) {
     const bool pp_first = !pp_enabled() || pp_rank == 0;
     const bool pp_last  = !pp_enabled() || pp_rank == pp_world - 1;
 
+    // GRIMOIRE_TIMELINE=1: one token's device time -- every layer's total,
+    // and the steps of layer GRIMOIRE_TIMELINE_LAYER (default 0) in detail.
+    int tl_one = -1;
+    if (timeline) {
+        static const int pick = [] { const char* e = std::getenv("GRIMOIRE_TIMELINE_LAYER");
+                                     return e ? std::atoi(e) : 0; }();
+        tl_one = (pick >= 0 && pick < cfg.n_layers) ? pick : 0;
+        mark("start");
+    }
     if (pp_first) {
         // embed, then SCALELESS RMSNorm on the token embedding (Muse: no sqrt(H)).
         if(!embed_one(token,s.h2))return nullptr;
@@ -8436,10 +8445,12 @@ const float* Grimoire::forward_muse(int token) {
         }
     }
 
+    if (timeline) mark("embed");
     const int layer_begin = pp_enabled() ? pp_begin : 0;
     const int layer_end   = pp_enabled() ? pp_end   : cfg.n_layers;
     for (int i = layer_begin; i < layer_end; ++i) {
         LayerDev& d = L[i];
+        auto MK = [&](const char* t) { if (timeline && i == tl_one) mark(t); };
         // target_aux, not dflash2.ok.  Under PP an earlier stage owns the
         // tap buffer and the tap set but hosts no drafter, and it is
         // exactly that stage's taps the last stage cannot compute for
@@ -8459,10 +8470,13 @@ const float* Grimoire::forward_muse(int token) {
         }
         // --- attention block (residual added AFTER post_attention_layernorm)
         launch_rmsnorm_residual(q, s.h, nullptr, d.in_norm, s.h2, H, eps, none);
+        MK("  in_norm");
         gemv_any(d.q_proj, s.h2, s.qkv, none);
+        MK("  q gemv");
         gemv_any(d.k_proj, s.h2, s.zbuf, none);
         if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
         else gemv_any(d.v_proj, s.h2, s.bbuf, none);
+        MK("  k+v gemv");
         // scaleless QK-norm over head_dim (zero weight -> (1+0)), BEFORE RoPE.
         launch_rmsnorm_heads(q, s.qkv,  muse_zero, QH,  HD, eps, true, none);
         launch_rmsnorm_heads(q, s.zbuf, muse_zero, KVH, HD, eps, true, none);
@@ -8476,6 +8490,7 @@ const float* Grimoire::forward_muse(int token) {
         }
         launch_kv_append_dev(q, s.zbuf, s.bbuf, d.k_cache, d.v_cache,
                              s.d_pos, KVH, HD, max_seq, none);
+        MK("  qk norm + rope + kv");
         AttnParams ap{};
         ap.q = s.qkv; ap.k_cache = d.k_cache; ap.v_cache = d.v_cache;
         ap.out = s.attn_out; ap.seq_len = pos + 1; ap.seq_cap = max_seq;
@@ -8496,7 +8511,9 @@ const float* Grimoire::forward_muse(int token) {
         // prompt cannot show it, which is why nothing caught it.
         ap.window_left = d.muse_sliding ? cfg.sliding_window : 0;
         launch_flash_decode(q, ap, none);
+        MK("  flash_decode");
         launch_flash_merge(q, ap, none);
+        MK("  flash_merge");
         // per-head attention output gate (separate projection).  K2 uses
         // softplus(beta=log 2) here where Qwen/Muse use sigmoid; applying
         // the wrong one is silent, it just reshapes every attention output.
@@ -8506,19 +8523,31 @@ const float* Grimoire::forward_muse(int token) {
                                  QW, kK2GateBeta, none);
         else
             launch_gate_sigmoid_mul(q, s.attn_out, s.gsplit, QW, none);
+        MK("  o_gate gemv + gate");
         gemv_any(d.o_proj, s.attn_out, s.moe_y, none);
+        MK("  o gemv");
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, s.h, s.sh_out, H, none);
+        MK("  post norm + add");
         // --- feed-forward block (sandwich: pre_ff -> mlp -> post_ff -> +res)
         launch_rmsnorm_residual(q, s.h, nullptr, d.pre_ff_norm, s.h2, H, eps, none);
         const int I=d.sh_gu.output_rows()/2;
+        MK("  pre_ff norm");
         gemv_any(d.sh_gu, s.h2, s.sh_g, none);
+        MK("  ffn gate_up gemv");
         launch_swiglu(q, s.sh_g, s.sh_g + I, s.sh_g, I, none);
+        MK("  swiglu");
         gemv_any(d.sh_down, s.sh_g, s.moe_y, none);
+        MK("  ffn down gemv");
         launch_rmsnorm_residual_batched(q, s.moe_y, nullptr, nullptr,
             d.post_ff_norm, s.sh_out, 1, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, s.h, s.sh_out, H, none);
+        if (timeline) {
+            char t[24];
+            std::snprintf(t, sizeof t, "L%02d %s", i, d.muse_sliding ? "slide" : "full ");
+            mark(t);
+        }
     }
     if (!pp_last) {
         // hand the residual stream to the next stage; fnorm and lm_head
@@ -8539,9 +8568,17 @@ const float* Grimoire::forward_muse(int token) {
     // final norm + lm_head
     launch_rmsnorm_residual_batched(q, s.h, nullptr, nullptr, fnorm, s.h2,
                                     1, H, eps, nullptr, none, 0.0f);
+    if (timeline) mark("final_norm");
     gemv_any(lm_head, s.h2, s.logits, none);
+    if (timeline) mark("lm_head gemv");
     launch_incr_pos(q, s.d_pos, none);
     launch_incr_pos(q, s.d_seq_len, none);
+    if (timeline) {
+        mark("incr_pos");
+        q.wait();
+        if (!tl_done && tl_tok == kTlToken) { dump_timeline(); tl_done = true; tl.clear(); }
+        ++tl_tok;
+    }
     ++pos;
     return s.logits;
 }

@@ -559,11 +559,25 @@ sycl::event gemv_wide(sycl::queue& q, const QuantWeight& w,
 
                 // Every slice is a whole number of scale blocks AND of
                 // lane-steps; the dispatch below refuses the shape
-                // otherwise, so no tail handling is needed here.
+                // otherwise, so no tail handling is needed here.  With
+                // scale blocks the split is block-granular: sub-group s
+                // takes blocks [s*nb/8, (s+1)*nb/8).  That is exactly K/8
+                // per sub-group whenever K/8 is whole blocks, and it also
+                // covers K = 6656 (Muse: 52 INT4 groups), where the even
+                // split was refused and k/v (N=256) fell to the row kernel
+                // -- 8 work-groups, 158 us for 1.8 MB.
                 const int n      = int(it.get_group(0));
-                const int per_sg = K / WG_SUBGROUPS;
-                const int k_beg  = sgid * per_sg;
-                const int k_end  = k_beg + per_sg;
+                constexpr int BLK = Traits<F>::block > 0 ? Traits<F>::block : 1;
+                int k_beg, k_end;
+                if constexpr (BLK > 1) {
+                    const int nb = K / BLK;
+                    k_beg = (sgid * nb / WG_SUBGROUPS) * BLK;
+                    k_end = ((sgid + 1) * nb / WG_SUBGROUPS) * BLK;
+                } else {
+                    const int per_sg = K / WG_SUBGROUPS;
+                    k_beg = sgid * per_sg;
+                    k_end = k_beg + per_sg;
+                }
 
                 const uint8_t* row = wc.payload + int64_t(n) * wc.row_bytes;
                 float acc = 0.0f;
@@ -705,6 +719,25 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
                   sycl::event e; for (int m = 0; m < mc; ++m)
                       e = gemv_wide<F, 16>(q, w, x + int64_t(m) * w.K, y + int64_t(m) * w.N, m ? std::vector<sycl::event>{e} : deps);
                   return e; }
+        }
+        // K/8 is not whole scale blocks (Muse K=6656 = 52 INT4 groups):
+        // gemv_wide splits by blocks instead, 6 or 7 per sub-group.  A lane
+        // step never straddles a block when EPL divides the block.
+        if (want && blk >= 16 && w.K % blk == 0 && w.K / blk >= WG_SUBGROUPS &&
+            !(slice > 0 && slice % blk == 0)) {
+            constexpr int MX = GemvGeom<F>::EPL_MAX;
+            auto run_w = [&](auto tag) -> sycl::event {
+                constexpr int E = decltype(tag)::value;
+                if constexpr (MB == 1) return gemv_wide<F, E>(q, w, x, y, deps);
+                sycl::event e;
+                for (int m = 0; m < mc; ++m)
+                    e = gemv_wide<F, E>(q, w, x + int64_t(m) * w.K, y + int64_t(m) * w.N,
+                                        m ? std::vector<sycl::event>{e} : deps);
+                return e;
+            };
+            if constexpr (MX >= 64) if (blk % 64 == 0) return run_w(std::integral_constant<int, 64>{});
+            if constexpr (MX >= 32) if (blk % 32 == 0) return run_w(std::integral_constant<int, 32>{});
+            if (blk % 16 == 0) return run_w(std::integral_constant<int, 16>{});
         }
     }
     int un = gemv_unroll_override();
