@@ -397,6 +397,16 @@ sycl::event launch_ple_embed_gather(sycl::queue& q, const void* table,
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
 sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int rows,
     int topk, uint32_t* bits, int words, const std::vector<sycl::event>& deps = {});
+// gemm_fast.cpp: grouped MoE MXFP4 GEMM -- every expert of a layer in one
+// launch.  w = [E*Ne][K]; A/out rows grouped by expert at off[e], cnt[e];
+// the host lists the (expert, m-tile) pairs, moe_grouped_rows() rows each.
+// swiglu: w holds [gate; up] per expert and out is bf16 h [rows][Ne/2].
+int moe_grouped_rows();
+bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne);
+sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+    bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
+    const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
+    const std::vector<sycl::event>& deps = {});
 // gemm_fast.cpp: the XMX flash prefill, causal, with an optional sliding
 // window (keys in (qpos - window, qpos]; window <= 0 = full causal).
 sycl::event launch_flash_prefill_window(sycl::queue& q, const float* qv, const uint8_t* k_cache,

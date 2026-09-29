@@ -1213,6 +1213,168 @@ sycl::event gemm_mxfp4_fused(sycl::queue& q, const QuantWeight& w, const sycl_bf
     });
 }
 
+// ---------------------------------------------------------------------
+// GROUPED MoE MXFP4 GEMM: gemm_mxfp4_fused over every expert of a layer in
+// ONE launch.  The pure-mode MoE prefill ran one dequant + one GEMM per
+// expert: ~190 rows each on a 5987-token Ornith prompt, so a gate_up GEMM
+// (N = 1024) was 1 M-block x 4 N-blocks = FOUR work-groups on a 32-core
+// card, 512 serialized launches per layer, and every expert's weights went
+// through a bf16 scratch copy -- 1.39 s of a 1.90 s prefill.  Here work-group
+// L is (m-tile tile_e/tile_mb[L / nNB], n-block L % nNB); a tile reads its
+// expert's rows [off[e] + mb*MC2, off[e] + cnt[e]) of A (bounds-checked, as
+// the dense kernel does for rows >= M), its expert's weight rows
+// e*Ne + ..., and writes the same rows of the output.  The per-tile math
+// is gemm_mxfp4_fused's, unchanged.
+// ---------------------------------------------------------------------
+template <int EPI>
+sycl::event gemm_mxfp4_fused_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+                                     const sycl_bf16* A, void* out,
+                                     const int32_t* tile_e, const int32_t* tile_mb,
+                                     const int32_t* off, const int32_t* cnt, int T,
+                                     const std::vector<sycl::event>& deps) {
+    constexpr int SGM = MC2 / MC1, SGN = NC2 / NC1, WG = SGM * SGN * SG_SIZE;
+    constexpr int KP = KC1 / 2;
+    constexpr int BT = KP * NC2;
+    const int N = Ne, K = w.K, FI = N / 2;
+    const int nNB = N / NC2;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const QuantWeight wc = w;
+        sycl::local_accessor<uint32_t, 1> Bs(2 * BT, h);
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * nNB * WG, WG),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            namespace ix = sycl::ext::intel::experimental::matrix;
+            auto sg = it.get_sub_group();
+            const int lid = int(it.get_local_id(0));
+            const int L = int(it.get_group(0));
+            const int t = L / nNB, nb = L % nNB;
+            const int e = tile_e[t], mb = tile_mb[t];
+            const int M = cnt[e];
+            const int64_t rbase = off[e];
+            const int s = lid / SG_SIZE, sm = s / SGN, sn = s % SGN;
+            const int m0 = mb * MC2 + sm * MC1;
+            const bool active = m0 < M, full = m0 + MC1 <= M;
+            const sycl_bf16* Ae = A + rbase * K;
+
+            const int dn = lid % NC2, dh = lid / NC2;
+            const int wrow = EPI == 1
+                ? (dn < NC2 / 2 ? nb * (NC2 / 2) + dn : FI + nb * (NC2 / 2) + dn - NC2 / 2)
+                : nb * NC2 + dn;
+            const int64_t grow = int64_t(e) * Ne + wrow;
+            const uint8_t* prow = wc.payload + grow * wc.row_bytes;
+            const uint8_t* srow = static_cast<const uint8_t*>(wc.scales) + grow * wc.row_scales;
+            uint32_t* bs = Bs.template get_multi_ptr<sycl::access::decorated::no>().get();
+            uint64_t pk = 0; uint8_t sb = 0;
+            auto fetch = [&](int k) {
+                const int kb = k + dh * 16;
+                pk = *reinterpret_cast<const uint64_t*>(prow + (kb >> 1));
+                sb = srow[kb / kMXBlock];
+            };
+            auto decode = [&](int buf) {
+                const float sc = e8m0_to_f32(sb);
+                uint32_t* d = bs + buf * BT + dh * (KP / 2) * NC2 + dn;
+                #pragma unroll
+                for (int p = 0; p < 8; ++p)
+                    d[p * NC2] = mxfp4_pair_bf16(uint32_t(pk >> (8 * p)) & 0xFFu, sc);
+            };
+            auto bcol = [&](int n) {
+                return EPI == 1 ? (n < 2 ? sn * (NC1 / 2) + n * TN
+                                         : NC2 / 2 + sn * (NC1 / 2) + (n - 2) * TN)
+                                : sn * NC1 + n * TN;
+            };
+            auto pA = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                               sycl::access::decorated::no>(Ae);
+            auto pBs = sycl::address_space_cast<sycl::access::address_space::local_space,
+                                                sycl::access::decorated::no>(
+                reinterpret_cast<sycl_bf16*>(bs));
+            matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN>
+                acc[MC1 / TM][NC1 / TN];
+            #pragma unroll
+            for (int m = 0; m < MC1 / TM; ++m)
+                #pragma unroll
+                for (int n = 0; n < NC1 / TN; ++n)
+                    matrix::joint_matrix_fill(sg, acc[m][n], 0.0f);
+            fetch(0);
+            decode(0);
+            sycl::group_barrier(it.get_group());
+            for (int k = 0, step = 0; k < K; k += KC1, ++step) {
+                const int cur = step & 1;
+                const bool more = k + KC1 < K;
+                if (more) fetch(k + KC1);
+                if (active) {
+                    matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::a, TM, TK_BF16,
+                                         matrix::layout::row_major> a[MC1 / TM][KC1 / TK_BF16];
+                    matrix::joint_matrix<sycl::sub_group, sycl_bf16, matrix::use::b, TK_BF16, TN,
+                                         matrix::layout::ext_intel_packed> b[NC1 / TN][KC1 / TK_BF16];
+                    #pragma unroll
+                    for (int kk = 0; kk < KC1 / TK_BF16; ++kk) {
+                        #pragma unroll
+                        for (int m = 0; m < MC1 / TM; ++m) {
+                            if (full)
+                                matrix::joint_matrix_load(sg, a[m][kk],
+                                    pA + size_t(m0 + m * TM) * K + k + kk * TK_BF16, K);
+                            else
+                                ix::joint_matrix_load_checked(sg, a[m][kk], pA, size_t(K),
+                                    size_t(M), size_t(K), size_t(m0 + m * TM),
+                                    size_t(k + kk * TK_BF16));
+                        }
+                        #pragma unroll
+                        for (int n = 0; n < NC1 / TN; ++n)
+                            matrix::joint_matrix_load(sg, b[n][kk],
+                                pBs + size_t(cur * BT + kk * (TK_BF16 / 2) * NC2 + bcol(n)) * 2,
+                                size_t(NC2) * 2);
+                    }
+                    #pragma unroll
+                    for (int kk = 0; kk < KC1 / TK_BF16; ++kk)
+                        #pragma unroll
+                        for (int m = 0; m < MC1 / TM; ++m)
+                            #pragma unroll
+                            for (int n = 0; n < NC1 / TN; ++n)
+                                matrix::joint_matrix_mad(sg, acc[m][n], a[m][kk], b[n][kk],
+                                                         acc[m][n]);
+                }
+                if (more) decode(cur ^ 1);
+                sycl::group_barrier(it.get_group());
+            }
+            if (!active) return;
+            if constexpr (EPI == 0) {
+                auto pC = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                   sycl::access::decorated::no>(
+                    static_cast<float*>(out) + rbase * N);
+                #pragma unroll
+                for (int m = 0; m < MC1 / TM; ++m)
+                    #pragma unroll
+                    for (int n = 0; n < NC1 / TN; ++n) {
+                        const int col = nb * NC2 + sn * NC1 + n * TN;
+                        if (full)
+                            matrix::joint_matrix_store(sg, acc[m][n],
+                                pC + size_t(m0 + m * TM) * N + col, N, matrix::layout::row_major);
+                        else
+                            ix::joint_matrix_store_checked(sg, acc[m][n], pC, size_t(N),
+                                matrix::layout::row_major, size_t(M), size_t(N),
+                                size_t(m0 + m * TM), size_t(col));
+                    }
+            } else {
+                sycl_bf16* H = static_cast<sycl_bf16*>(out) + rbase * FI;
+                #pragma unroll
+                for (int m = 0; m < MC1 / TM; ++m)
+                    #pragma unroll
+                    for (int n = 0; n < 2; ++n) {
+                        matrix::joint_matrix_apply(sg, acc[m][n], acc[m][n + 2],
+                            [](float& g, float& u) {
+                                g = sycl::native::divide(g, 1.0f + sycl::native::exp(-g)) * u; });
+                        const int r0 = m0 + m * TM;
+                        const int col = nb * (NC2 / 2) + sn * (NC1 / 2) + n * TN;
+                        ix::joint_matrix_apply(sg, acc[m][n], [=](float& x, size_t r, size_t c) {
+                            if (r0 + int(r) < M)
+                                H[size_t(r0 + int(r)) * FI + col + c] = bf16_rne(x);
+                        });
+                    }
+            }
+        });
+    });
+}
+
 // Opt-in (GRIMOIRE_FAST_GEMM_FUSED=1).  MEASURED 2026-09-25, Qwen3.8-27B,
 // 4088 tokens: correct (identical text) but 1.65x SLOWER than dequantize +
 // gemm_bf16_vnni (prefill 4.49 s vs 3.14 s): B fragments from SLM plus a
@@ -1225,6 +1387,23 @@ bool fused_mxfp4_ok(const QuantWeight& w) {
 }
 
 } // namespace
+
+// Grouped MoE entry points (see gemm_mxfp4_fused_grouped).  The host builds
+// the m-tile table in units of moe_grouped_rows() rows per tile.
+int moe_grouped_rows() { return MC2; }
+bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne) {
+    return w.fmt == Fmt::MXFP4 && w.payload && w.scales && Ne > 0 &&
+           Ne % NC2 == 0 && w.K % KC1 == 0 && (w.N % Ne) == 0;
+}
+sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
+                                     bool swiglu, const sycl_bf16* A, void* out,
+                                     const int32_t* tile_e, const int32_t* tile_mb,
+                                     const int32_t* off, const int32_t* cnt, int T,
+                                     const std::vector<sycl::event>& deps) {
+    return swiglu
+        ? gemm_mxfp4_fused_grouped<1>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
+        : gemm_mxfp4_fused_grouped<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);
+}
 
 // ---------------------------------------------------------------------
 // DeltaNet prefill recurrence, 4 lanes per state row.

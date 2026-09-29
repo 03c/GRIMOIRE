@@ -12745,6 +12745,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     sycl_bf16* moe_res=defer_moe_gather?sycl::malloc_device<sycl_bf16>(Rpad*H,q):nullptr;
     float* yperm=df(Rpad*H);
     int32_t* ptoken=sycl::malloc_device<int32_t>(R,q);
+    // Grouped MoE tile table: (expert, m-tile) pairs + per-expert offset and
+    // row count.  At most E + R/rows tiles.
+    const int moe_tab_tiles = std::max(1,cfg.n_experts) + R / std::max(1,moe_grouped_rows()) + 1;
+    int32_t* moe_tab=sycl::malloc_device<int32_t>(
+        size_t(2 * moe_tab_tiles + 2 * std::max(1,cfg.n_experts)), q);
     int32_t* pinv=sycl::malloc_device<int32_t>(R,q);
     int32_t* grouped_rows=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_shared<int32_t>(E,q) : nullptr;
     int32_t* grouped_atomic=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_device<int32_t>(1,q) : nullptr;
@@ -12752,7 +12757,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     float* aux1=need_aux?df(size_t(M)*W):nullptr;
     sycl_bf16* aux_xb=need_aux?sycl::malloc_device<sycl_bf16>(size_t(M)*W,q):nullptr;
     sycl_bf16* aux_out=need_aux?sycl::malloc_device<sycl_bf16>(size_t(M)*W,q):nullptr;
-    std::vector<void*> mem={bh,bn,r0,r1,t0,t1,t2,t3,t4,la_fused,xb,bn_bf,dtok,rex,rwt,rlog,mh,alpha,beta,
+    std::vector<void*> mem={bh,bn,r0,r1,t0,t1,t2,t3,t4,la_fused,xb,bn_bf,dtok,rex,rwt,rlog,mh,alpha,beta,moe_tab,
         xperm,yperm,ptoken,pinv};
     if (next_tokens) mem.push_back(batch_logits);
     if(a8){mem.push_back(a8);mem.push_back(a8s);}
@@ -14155,6 +14160,38 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                                 kInt4Group,grouped_atomic);
                     launch_moe_unpermute_bf16(q,grouped_out,pinv,rwt,r0,
                                               M,cfg.top_k,H);
+                    }else if(!std::getenv("GRIMOIRE_MOE_GROUPED_OFF") &&
+                             moe_mxfp4_grouped_supported(d.moe.gate_up,2*I) &&
+                             moe_mxfp4_grouped_supported(d.moe.down,H)){
+                    // ONE launch per projection for all experts (see
+                    // gemm_mxfp4_fused_grouped): the per-expert loop below
+                    // gave a ~190-row expert 4 work-groups and ran 512
+                    // launches per layer, 1.39 s of Ornith's 1.90 s prompt.
+                    // gate_up writes silu(gate)*up as bf16 h [R][I] into mh
+                    // (f32 [R][I] storage, so bf16 fits), down reads it.
+                    const int E=cfg.n_experts, MC=moe_grouped_rows();
+                    std::vector<int32_t> tab;
+                    tab.reserve(size_t(2*moe_tab_tiles+2*E));
+                    std::vector<int32_t> te, tmb;
+                    for(int e=0;e<E;++e)
+                        for(int mb=0;mb*MC<count[e];++mb){te.push_back(e);tmb.push_back(mb);}
+                    const int T=int(te.size());
+                    tab.insert(tab.end(),te.begin(),te.end());
+                    tab.insert(tab.end(),tmb.begin(),tmb.end());
+                    tab.insert(tab.end(),off.begin(),off.begin()+E);
+                    tab.insert(tab.end(),count.begin(),count.end());
+                    // tab is a host vector that dies with this block
+                    q.memcpy(moe_tab,tab.data(),tab.size()*sizeof(int32_t)).wait();
+                    const int32_t *d_te=moe_tab, *d_tm=moe_tab+T,
+                                  *d_off=moe_tab+2*T, *d_cnt=moe_tab+2*T+E;
+                    sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                    if(T>0){
+                        launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
+                                                 d_te,d_tm,d_off,d_cnt,T);
+                        launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,yperm,
+                                                 d_te,d_tm,d_off,d_cnt,T);
+                    }
+                    launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
                     }else{
                     auto sub=[&](const QuantWeight& w,int row0,int n){
                         return slice_quant_rows(w,row0,n);
