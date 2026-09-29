@@ -397,6 +397,12 @@ sycl::event launch_ple_embed_gather(sycl::queue& q, const void* table,
 // ---- Qwen4-Exp QSA (host reference: b70/qwen4_exp.hpp) ---------------
 sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int rows,
     int topk, uint32_t* bits, int words, const std::vector<sycl::event>& deps = {});
+// gemm_fast.cpp: the XMX flash prefill, causal, with an optional sliding
+// window (keys in (qpos - window, qpos]; window <= 0 = full causal).
+sycl::event launch_flash_prefill_window(sycl::queue& q, const float* qv, const uint8_t* k_cache,
+    const uint8_t* v_cache, float* out, int tokens, int start_pos, int num_heads,
+    int num_kv_heads, int head_dim, int seq_cap, float softmax_scale, int window,
+    const std::vector<sycl::event>& deps = {});
 // gemm_fast.cpp: the XMX flash prefill with a per-row QSA block bitmap.
 sycl::event launch_flash_prefill_qsa(sycl::queue& q, const float* qv, const uint8_t* k_cache,
     const uint8_t* v_cache, float* out, int tokens, int start_pos, int num_heads,

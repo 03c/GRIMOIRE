@@ -3,7 +3,7 @@
 # (DFlash2 selector), and the Muse pure-mode prefill fallback.  gpu0 only.
 set -u
 cd /mnt/storage/isos/grimoire-fuse
-OUT=/root/verify2-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
+OUT=/mnt/storage/isos/grimoire-runs/verify2-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
 SHORT="Explain in two sentences why the sky is blue."
 STORY="Write a detailed story about a lighthouse keeper."
 LONG="$(cat real4k_ascii.txt)"

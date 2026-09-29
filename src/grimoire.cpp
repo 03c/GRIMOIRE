@@ -11100,6 +11100,20 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     };
 
     q.memcpy(dtok, tokens.data(), size_t(M) * sizeof(int32_t));
+    // GRIMOIRE_SANDWICH_TIME=1: fenced host time per region, summed over all
+    // layers (diagnosis only -- every mark drains the queue).
+    static const bool sw_time = std::getenv("GRIMOIRE_SANDWICH_TIME") != nullptr;
+    std::map<std::string, double> sw_ms;
+    std::vector<std::string> sw_order;
+    auto sw_t = std::chrono::steady_clock::now();
+    auto smark = [&](const char* r) {
+        if (!sw_time) return;
+        q.wait();
+        const auto t = std::chrono::steady_clock::now();
+        if (!sw_ms.count(r)) sw_order.push_back(r);
+        sw_ms[r] += std::chrono::duration<double, std::milli>(t - sw_t).count();
+        sw_t = t;
+    };
     const bool first = !pp_enabled() || pp_rank==0;
     const bool last = !pp_enabled() || pp_rank==pp_world-1;
     if (first) {
@@ -11117,6 +11131,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     // every later RMSNorm sees.
     if (first && cfg.embed_scale != 1.0f)
         launch_scale(q, h, cfg.embed_scale, int(size_t(M) * H), none);
+    smark("embed");
 
     for (int i = pp_enabled()?pp_begin:0; i < (pp_enabled()?pp_end:cfg.n_layers) && ok; ++i) {
         LayerDev& d = L[i];
@@ -11135,9 +11150,11 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
         // ---- attention (sandwich: in_norm -> attn -> post_norm -> add) --
         launch_rmsnorm_residual_batched(q, h, nullptr, nullptr, d.in_norm,
                                         h2, M, H, eps, nullptr, none);
+        smark("input norm");
         mmg(d.q_proj, h2, qv);
         mmg(d.k_proj, h2, kv);
         if (!ok) break;
+        smark("q k proj");
 
         // attention_k_eq_v: a full-attention layer ships NO v_proj and V is
         // the k_proj output BEFORE k_norm and BEFORE RoPE.  This copy must
@@ -11150,6 +11167,7 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
         else
             mmg(d.v_proj, h2, vv);
         if (!ok) break;
+        smark("v proj");
 
         // q_norm and k_norm, then RoPE -- fused, and in that order, which
         // is forward_gemma4()'s order.
@@ -11195,19 +11213,33 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
         }
         if (!cfg.is_muse && gemma_vnorm)
             launch_rmsnorm_heads(q,vv,gemma_vnorm,M*KVH,HD,eps,false,none);
+        smark("qk norm + rope");
         const int window=cfg.is_muse ? (d.muse_sliding?cfg.sliding_window:0)
                                     : (cfg.layer_global(i)?0:cfg.sliding_window);
         const float scale=cfg.is_muse ? cfg.query_prescale/std::sqrt(float(HD))
                                      : cfg.attn_softmax_scale(HD);
+        // A prompt (one sequence, M rows) takes the XMX flash prefill; the
+        // block-attention kernel below is a SIMT loop built for 16-row draft
+        // blocks, and on a Muse prompt it was 84.6% of the prefill (18.1 of
+        // 21.4 s for 5947 tokens).  GRIMOIRE_SANDWICH_BLOCK_ATTN=1 keeps it.
+        static const bool block_attn =
+            std::getenv("GRIMOIRE_SANDWICH_BLOCK_ATTN") != nullptr;
+        const bool use_flash = !seqb && !block_attn && M >= 16 &&
+            flash_fast_supported(HD, QH, KVH);
         for (int r=0; r<(seqb?M:1); ++r) {
             const int count=seqb?1:M, position=seqb?seqb->pos[r]:start_pos;
             auto* kc=seqb?d.k_base+size_t(seqb->slot[r])*d.kv_slot:d.k_cache;
             auto* vc=seqb?d.v_base+size_t(seqb->slot[r])*d.kv_slot:d.v_cache;
             launch_kv_append_batched(q,kv+int64_t(r)*KVW,vv+int64_t(r)*KVW,
                                     kc,vc,count,position,KVH,HD,max_seq,none);
-            launch_dflash2_block_attention(q,qv+int64_t(r)*QW,kc,vc,
-                attn+int64_t(r)*QW,count,position,QH,KVH,HD,max_seq,window,true,scale,none);
+            if (use_flash)
+                launch_flash_prefill_window(q,qv,kc,vc,attn,M,position,QH,KVH,HD,
+                                            max_seq,scale,window,none);
+            else
+                launch_dflash2_block_attention(q,qv+int64_t(r)*QW,kc,vc,
+                    attn+int64_t(r)*QW,count,position,QH,KVH,HD,max_seq,window,true,scale,none);
         }
+        smark("kv append + attention");
         if (cfg.is_muse) {
             mmg(d.o_gate,h2,gate);
             if (cfg.attn_gate==2)
@@ -11215,8 +11247,10 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
             else launch_gate_sigmoid_mul(q,attn,gate,M*QW,none);
         }
 
+        smark("o gate");
         mmg(d.o_proj, attn, proj);
         if (!ok) break;
+        smark("o proj");
         launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
             d.post_norm, sh, M, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, h, sh, int(size_t(M) * H), none);
@@ -11225,14 +11259,18 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
         launch_rmsnorm_residual_batched(q, h, nullptr, nullptr, d.pre_ff_norm,
                                         h2, M, H, eps, nullptr, none);
         const int I = d.sh_gu.output_rows() / 2;
+        smark("post norm + pre-ff norm");
         mmg(d.sh_gu, h2, ff);
         if (!ok) break;
+        smark("ffn gate_up");
         // gelu_pytorch_tanh, not silu.  The two differ by up to 0.77 on the
         // same input and nothing downstream would notice the substitution.
         if (cfg.is_muse) launch_swiglu_batched(q,ff,ffo,M,I,none);
         else launch_geglu_batched(q, ff, ffo, M, I, none);
+        smark("swiglu/geglu");
         mmg(d.sh_down, ffo, proj);
         if (!ok) break;
+        smark("ffn down");
         launch_rmsnorm_residual_batched(q, proj, nullptr, nullptr,
             d.post_ff_norm, sh, M, H, cfg.post_norm_eps, nullptr, none);
         launch_add(q, h, sh, int(size_t(M) * H), none);
@@ -11243,6 +11281,16 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     }
 
     if (!ok) { q.wait(); cleanup(); return false; }
+    if (sw_time) {
+        smark("post-ff norm + tail");
+        double tot = 0.0;
+        for (const auto& r : sw_order) tot += sw_ms[r];
+        std::fprintf(stderr, "    sandwich prefill regions (%d tokens, all layers):\n", M);
+        for (const auto& r : sw_order)
+            std::fprintf(stderr, "      %-26s %10.3f ms %5.1f%%\n", r.c_str(), sw_ms[r],
+                         tot > 0 ? 100.0 * sw_ms[r] / tot : 0.0);
+        std::fprintf(stderr, "      %-26s %10.3f ms\n", "TOTAL", tot);
+    }
 
     if (seqb) {
         next_tokens->resize(size_t(M));

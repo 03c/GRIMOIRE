@@ -3,7 +3,7 @@
 # bit-identity (R never changes a row's accumulation).  gpu0 only.
 set -u
 cd /mnt/storage/isos/grimoire-fuse
-OUT=/root/verify3-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
+OUT=/mnt/storage/isos/grimoire-runs/verify3-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
 STORY="Write a detailed story about a lighthouse keeper."
 run() { local nm=$1 m=$2 pr=$3 n=$4 p=$5 ex=${6:-} r
   r=$(EXTRA_ENV="$ex" LIM=900 bash tools/g0run.sh v3-$nm -m /models/$m --proj $pr --ctx 8192 -p "$p" -n $n) \

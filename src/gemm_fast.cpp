@@ -755,7 +755,8 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                             const uint8_t* vc, float* out, int tokens, int start, int H,
                             int KVH, int seq_cap, float scale,
                             const std::vector<sycl::event>& deps,
-                            const uint32_t* qbits = nullptr, int qwords = 0, int qrat = 4) {
+                            const uint32_t* qbits = nullptr, int qwords = 0, int qrat = 4,
+                            int window = 0) {
     constexpr int NF = D / TN, WG = FA_NSG * SG_SIZE;
     FlashScratch& fs = flash_scratch_for(q);
     const int kend = start + tokens, Sp = (kend + FA_BK - 1) / FA_BK * FA_BK;
@@ -800,7 +801,7 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                 bf16_rne(t < tokens ? qv[(size_t(t) * H + hh) * D + d] * qscale : 0.0f);
         });
     });
-    if (flash_use_esimd() && !qbits)
+    if (flash_use_esimd() && !qbits && window <= 0)
         return flash_esimd<D>(q, e, Qb, Tp, Kp, Vp, Sp, out, tokens, start, H, KVH);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(e);
@@ -836,7 +837,12 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
             for (int r = 0; r < RB; ++r) { m[r] = -std::numeric_limits<float>::infinity(); l[r] = 0.0f; }
             const int last_row = sycl::min(tokens - 1, r0 + RB - 1);
             const int kmax = start + last_row + 1;
-            for (int s0 = 0; s0 < kmax; s0 += BK) {
+            // Sliding window: row t attends keys (qpos - window, qpos].  The
+            // tile's FIRST row has the earliest window start, so no key block
+            // before it can be live for any row of the tile -- skip them.
+            const int s_first = window > 0
+                ? sycl::max(0, start + r0 - window + 1) / BK * BK : 0;
+            for (int s0 = s_first; s0 < kmax; s0 += BK) {
                 matrix::joint_matrix<sycl::sub_group, float, matrix::use::accumulator, TM, TN>
                     sa[BK / TN];
                 #pragma unroll
@@ -874,6 +880,10 @@ sycl::event flash_fast_impl(sycl::queue& q, const float* qv, const uint8_t* kc,
                     const float sv0 = ss[r * BK + lane], sv1 = ss[r * BK + lane + SG_SIZE];
                     bool a0 = t < tokens && s0 + lane <= qpos;
                     bool a1 = t < tokens && s0 + lane + SG_SIZE <= qpos;
+                    if (window > 0) {
+                        a0 = a0 && s0 + lane > qpos - window;
+                        a1 = a1 && s0 + lane + SG_SIZE > qpos - window;
+                    }
                     if (qbits && t < tokens) {
                         const int tail = (qpos + 1) / qrat * qrat;
                         const uint32_t* rb = qbits + size_t(t) * qwords;
@@ -966,6 +976,20 @@ sycl::event launch_flash_prefill_qsa(sycl::queue& q, const float* qv, const uint
                                num_kv_heads, seq_cap, softmax_scale, deps, qbits, qwords, qrat)
         : flash_fast_impl<256>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
                                num_kv_heads, seq_cap, softmax_scale, deps, qbits, qwords, qrat);
+}
+
+// Causal flash prefill with an optional sliding window (keys in
+// (qpos - window, qpos]; window <= 0 = full causal).  Muse's sliding layers.
+sycl::event launch_flash_prefill_window(sycl::queue& q, const float* qv, const uint8_t* k_cache,
+                                        const uint8_t* v_cache, float* out, int tokens,
+                                        int start_pos, int num_heads, int num_kv_heads,
+                                        int head_dim, int seq_cap, float softmax_scale,
+                                        int window, const std::vector<sycl::event>& deps) {
+    return head_dim == 128
+        ? flash_fast_impl<128>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+                               num_kv_heads, seq_cap, softmax_scale, deps, nullptr, 0, 4, window)
+        : flash_fast_impl<256>(q, qv, k_cache, v_cache, out, tokens, start_pos, num_heads,
+                               num_kv_heads, seq_cap, softmax_scale, deps, nullptr, 0, 4, window);
 }
 
 bool flash_fast_supported(int head_dim, int num_heads, int num_kv_heads) {

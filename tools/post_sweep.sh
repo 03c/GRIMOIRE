@@ -3,7 +3,7 @@
 # drafter routing and the spec phase timer.  gpu0 only, via g0run.sh.
 set -u
 cd /mnt/storage/isos/grimoire-fuse
-OUT=/root/post-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
+OUT=/mnt/storage/isos/grimoire-runs/post-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
 SHORT="Explain in two sentences why the sky is blue."
 STORY="Write a detailed story about a lighthouse keeper."
 LONG="$(cat real4k_ascii.txt)"

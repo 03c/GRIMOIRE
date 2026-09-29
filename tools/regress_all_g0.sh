@@ -5,7 +5,7 @@
 # Prints one summary block per model; full logs land in $OUT.
 set -u
 cd /mnt/storage/isos/grimoire-fuse
-OUT=/root/regress-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
+OUT=/mnt/storage/isos/grimoire-runs/regress-$(date +%m%d-%H%M); mkdir -p "$OUT"; echo "results: $OUT"
 SHORT="Explain in two sentences why the sky is blue."
 STORY="Write a detailed story about a lighthouse keeper."
 LONG="$(cat real4k_ascii.txt)"
