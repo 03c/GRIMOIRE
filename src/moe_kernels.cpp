@@ -59,21 +59,30 @@ static int moe_slots_per_sg() {
     return v;
 }
 
-template <Fmt F, int R>
+template <Fmt F, int R, bool SH = false>
 sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                              const int32_t* d_expert,   // [k]
                              const float* x,            // [H]
                              float* h,                  // [M][k][I] out
                              int M,
-                             const std::vector<sycl::event>& deps) {
+                             const std::vector<sycl::event>& deps,
+                             const QuantWeight* wsh = nullptr,   // shared expert [2I][H]
+                             const uint16_t* gate_w = nullptr,   // shared_expert_gate bf16 [H]
+                             float* gate_out = nullptr) {        // sigmoid(gate) per token
     const int H = L.cfg.hidden, I = L.cfg.inter, K = L.cfg.top_k;
+    // With a shared expert it is slot K: h gets (K+1)*I values per token,
+    // and one more work-group per token computes the shared gate.
+    const bool has_sh = SH && wsh != nullptr;
+    const int KS = K + (has_sh ? 1 : 0);
     const int rows_per_wg = WG_SUBGROUPS * R;
-    const int groups_per_token = (K * I + rows_per_wg - 1) / rows_per_wg;
+    const int row_groups = (KS * I + rows_per_wg - 1) / rows_per_wg;
+    const int groups_per_token = row_groups + (gate_w ? 1 : 0);
     const int n_groups = M * groups_per_token;
 
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
         const QuantWeight w = L.gate_up;
+        const QuantWeight ws = has_sh ? *wsh : L.gate_up;
         const int64_t stride2I = int64_t(2) * I;
 
         sycl::local_accessor<float, 1> slmx(size_t(H), hc);
@@ -118,10 +127,25 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                 for (int c = lid; c < H; c += WG_SUBGROUPS * SG_SIZE) slmx[c] = xt[c];
                 sycl::group_barrier(it.get_group());
 
-                const int slot_row_base = local_group * rows_per_wg
-                                        + int(sg.get_group_id()[0]) * R;
                 float* xs = slmx.template
                     get_multi_ptr<sycl::access::decorated::no>().get();
+                if (gate_w && local_group == row_groups) {
+                    // shared_expert_gate: sigmoid(x . gate_w), the formula of
+                    // launch_scale_by_sigmoid
+                    if (int(sg.get_group_id()[0]) == 0) {
+                        float a = 0.0f;
+                        for (int c = lane; c < H; c += SG_SIZE)
+                            a = sycl::fma(sycl::bit_cast<float>(uint32_t(gate_w[c]) << 16), xs[c], a);
+                        const float g = sycl::reduce_over_group(sg, a, sycl::plus<float>());
+                        if (lane == 0) gate_out[token] = 1.0f / (1.0f + sycl::exp(-g));
+                    }
+                    return;
+                }
+                const int slot_row_base = local_group * rows_per_wg
+                                        + int(sg.get_group_id()[0]) * R;
+                // the R rows of a sub-group share one slot (I % R == 0)
+                // (SH is a template flag: the unfused kernel compiles as before)
+                const bool shr = SH && has_sh && slot_row_base / I >= K;
 
                 // All R slots share the staged activation, and their weight
                 // loads are independent, so the memory system sees R x 2
@@ -132,41 +156,53 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
                 for (int r = 0; r < R; ++r) {
                     ga[r] = 0.0f; ua[r] = 0.0f;
                     const int sr = slot_row_base + r;
-                    if (sr >= K * I) { grow[r] = -1; urow[r] = -1; continue; }
+                    if (sr >= KS * I) { grow[r] = -1; urow[r] = -1; continue; }
                     const int slot = sr / I;
                     const int i    = sr % I;
-                    const int e = d_expert[int64_t(token) * K + slot];
-                    grow[r] = int64_t(e) * stride2I + i;
+                    if (slot < K) {
+                        const int e = d_expert[int64_t(token) * K + slot];
+                        grow[r] = int64_t(e) * stride2I + i;
+                    } else {
+                        grow[r] = i;                 // shared expert: its own [2I][H]
+                    }
                     urow[r] = grow[r] + I;
                 }
-                for (int base = 0; base + GEMV_STEP <= H; base += GEMV_STEP) {
-                    const int k0 = base + lane * GEMV_EPL;
+                // The dot loops take the weight as a parameter and are
+                // inlined once per weight: a runtime pick between two
+                // captured QuantWeights put the descriptor in private memory
+                // and slowed every load (1.57 -> 1.81 s per 160 tokens).
+                auto dots = [&](const QuantWeight& wr) {
+                    for (int base = 0; base + GEMV_STEP <= H; base += GEMV_STEP) {
+                        const int k0 = base + lane * GEMV_EPL;
+                        #pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            if (grow[r] < 0) continue;
+                            const uint8_t* gp = wr.payload + grow[r] * wr.row_bytes;
+                            const uint8_t* up = wr.payload + urow[r] * wr.row_bytes;
+                            ga[r] += GemvStep<F, GEMV_EPL>::run(
+                                wr, gp, xs, lut, slut, nlut, int(grow[r]), k0);
+                            ua[r] += GemvStep<F, GEMV_EPL>::run(
+                                wr, up, xs, lut, slut, nlut, int(urow[r]), k0);
+                        }
+                    }
                     #pragma unroll
                     for (int r = 0; r < R; ++r) {
                         if (grow[r] < 0) continue;
-                        const uint8_t* gp = w.payload + grow[r] * w.row_bytes;
-                        const uint8_t* up = w.payload + urow[r] * w.row_bytes;
-                        ga[r] += GemvStep<F, GEMV_EPL>::run(
-                            w, gp, xs, lut, slut, nlut, int(grow[r]), k0);
-                        ua[r] += GemvStep<F, GEMV_EPL>::run(
-                            w, up, xs, lut, slut, nlut, int(urow[r]), k0);
+                        for (int c = (H / GEMV_STEP) * GEMV_STEP + lane; c < H; c += SG_SIZE) {
+                            ga[r] = sycl::fma(wr.at(int(grow[r]), c), xs[c], ga[r]);
+                            ua[r] = sycl::fma(wr.at(int(urow[r]), c), xs[c], ua[r]);
+                        }
                     }
-                }
-                #pragma unroll
-                for (int r = 0; r < R; ++r) {
-                    if (grow[r] < 0) continue;
-                    for (int c = (H / GEMV_STEP) * GEMV_STEP + lane; c < H; c += SG_SIZE) {
-                        ga[r] = sycl::fma(w.at(int(grow[r]), c), xs[c], ga[r]);
-                        ua[r] = sycl::fma(w.at(int(urow[r]), c), xs[c], ua[r]);
-                    }
-                }
+                };
+                if constexpr (SH) { if (shr) dots(ws); else dots(w); }
+                else dots(w);
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
                     const int sr = slot_row_base + r;
                     const float g = sycl::reduce_over_group(sg, ga[r], sycl::plus<float>());
                     const float u = sycl::reduce_over_group(sg, ua[r], sycl::plus<float>());
-                    if (lane == 0 && sr < K * I)
-                        h[(int64_t(token) * K * I) + sr] = silu(g) * u;
+                    if (lane == 0 && sr < KS * I)
+                        h[(int64_t(token) * KS * I) + sr] = silu(g) * u;
                 }
             });
     });
@@ -186,15 +222,19 @@ sycl::event moe_gate_up_impl_r(sycl::queue& q, const MoeLayer& L,
 // R output rows per sub-group.  At R=1 a work-group staged slmh (K*I floats =
 // 16 KB) from global memory to consume 16 KB of expert weights -- 100%
 // overhead, and measured 156 GB/s against 602.  Widening amortizes the stage.
-template <Fmt F, int R>
+template <Fmt F, int R, bool SH = false>
 sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                           const int32_t* d_expert,   // [k]
                           const float* d_weight,     // [k]
                           const float* h,            // [k][I]
                           float* y,                  // [M][H] out
                           int M,
-                          const std::vector<sycl::event>& deps) {
+                          const std::vector<sycl::event>& deps,
+                          const QuantWeight* wdsh = nullptr,  // shared expert [H][I]
+                          const float* gate_in = nullptr) {   // its weight per token
     const int H = L.cfg.hidden, I = L.cfg.inter, K = L.cfg.top_k;
+    const bool has_sh = SH && wdsh != nullptr;   // shared expert = slot K of h
+    const int KS = K + (has_sh ? 1 : 0);
     const int rows_per_wg = WG_SUBGROUPS * R;
     const int groups_per_token = (H + rows_per_wg - 1) / rows_per_wg;
     const int n_groups = M * groups_per_token;
@@ -202,10 +242,11 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
     return q.submit([&](sycl::handler& hc) {
         hc.depends_on(deps);
         const QuantWeight w = L.down;
+        const QuantWeight wd = has_sh ? *wdsh : L.down;
 
         // h is k*I floats: 8*512 = 4096, 16 KB. Fits SLM comfortably and
         // every output row reads all of it.
-        sycl::local_accessor<float, 1> slmh(size_t(K) * size_t(I), hc);
+        sycl::local_accessor<float, 1> slmh(size_t(KS) * size_t(I), hc);
         // Decode tables, shared by the whole work-group. Identical to the
         // dense GEMV path -- FP8 bit-assembly and E8M0/E2M1 branches cost
         // more than the loads they decorate.
@@ -245,8 +286,8 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
 
                 const int token = int(it.get_group(0)) / groups_per_token;
                 const int local_group = int(it.get_group(0)) % groups_per_token;
-                const float* ht = h + int64_t(token) * K * I;
-                for (int c = lid; c < K * I; c += WG_SUBGROUPS * SG_SIZE) slmh[c] = ht[c];
+                const float* ht = h + int64_t(token) * KS * I;
+                for (int c = lid; c < KS * I; c += WG_SUBGROUPS * SG_SIZE) slmh[c] = ht[c];
                 sycl::group_barrier(it.get_group());
 
                 const int o_base = local_group * rows_per_wg
@@ -256,12 +297,9 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                 #pragma unroll
                 for (int r = 0; r < R; ++r) total[r] = 0.0f;
 
-                for (int slot = 0; slot < K; ++slot) {
-                    const int64_t route = int64_t(token) * K + slot;
-                    const int   e  = d_expert[route];
-                    const float rw = d_weight[route];
-                    if (e < 0 || rw == 0.0f) continue;
-
+                // One inlined copy per weight (see moe_gate_up_impl_r: a
+                // runtime pick between two QuantWeights slows every load).
+                auto slot_dot = [&](const QuantWeight& wr, int64_t ebase, int slot, float rw) {
                     float acc[R];
                     #pragma unroll
                     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
@@ -271,9 +309,9 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                         for (int r = 0; r < R; ++r) {
                             const int o = o_base + r;
                             if (o >= H) continue;
-                            const int64_t d_row = int64_t(e) * H + o;
-                            const uint8_t* dp = w.payload + d_row * w.row_bytes;
-                            acc[r] += GemvStep<F, GEMV_EPL>::run(w, dp, &slmh[slot * I] - 0,
+                            const int64_t d_row = ebase + o;
+                            const uint8_t* dp = wr.payload + d_row * wr.row_bytes;
+                            acc[r] += GemvStep<F, GEMV_EPL>::run(wr, dp, &slmh[slot * I] - 0,
                                                     lut, slut, nlut, int(d_row), k0);
                         }
                     }
@@ -281,9 +319,9 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                     for (int r = 0; r < R; ++r) {
                         const int o = o_base + r;
                         if (o >= H) continue;
-                        const int64_t d_row = int64_t(e) * H + o;
+                        const int64_t d_row = ebase + o;
                         for (int c = (I / GEMV_STEP) * GEMV_STEP + lane; c < I; c += SG_SIZE)
-                            acc[r] = sycl::fma(w.at(int(d_row), c), slmh[slot * I + c], acc[r]);
+                            acc[r] = sycl::fma(wr.at(int(d_row), c), slmh[slot * I + c], acc[r]);
                         // Keep the routed sum in per-lane registers. The
                         // sub-group reduction is linear, so scaling each
                         // expert partial by its router weight and reducing
@@ -293,6 +331,17 @@ sycl::event moe_down_impl_r(sycl::queue& q, const MoeLayer& L,
                         // more than the MACs between them.
                         total[r] = sycl::fma(rw, acc[r], total[r]);
                     }
+                };
+                for (int slot = 0; slot < K; ++slot) {
+                    const int64_t route = int64_t(token) * K + slot;
+                    const int   e  = d_expert[route];
+                    const float rw = d_weight[route];
+                    if (e < 0 || rw == 0.0f) continue;
+                    slot_dot(w, int64_t(e) * H, slot, rw);
+                }
+                if constexpr (SH) {
+                    if (has_sh)                       // shared expert: slot K, its own [H][I]
+                        slot_dot(wd, 0, K, gate_in ? gate_in[token] : 1.0f);
                 }
                 #pragma unroll
                 for (int r = 0; r < R; ++r) {
@@ -464,6 +513,39 @@ sycl::event moe_down_impl(sycl::queue& q, const MoeLayer& L,
     }
 }
 
+// Decode with the shared expert as slot top_k (see moe_gate_up_impl_r /
+// moe_down_impl_r): same slot-count choice as the unfused kernels.
+template <Fmt F>
+sycl::event moe_gate_up_sh(sycl::queue& q, const MoeLayer& L, const QuantWeight& ws,
+                           const uint16_t* gate_w, const int32_t* d_expert,
+                           const float* x, float* h, float* gate_out,
+                           const std::vector<sycl::event>& deps) {
+    static const int slots = []{ const char* e = std::getenv("B70_MOE_SLOTS");
+        int x = (e && *e) ? std::atoi(e) : 4;
+        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4; }();
+    switch (slots) {
+        case 1: return moe_gate_up_impl_r<F, 1, true>(q, L, d_expert, x, h, 1, deps, &ws, gate_w, gate_out);
+        case 2: return moe_gate_up_impl_r<F, 2, true>(q, L, d_expert, x, h, 1, deps, &ws, gate_w, gate_out);
+        case 8: return moe_gate_up_impl_r<F, 8, true>(q, L, d_expert, x, h, 1, deps, &ws, gate_w, gate_out);
+        default: return moe_gate_up_impl_r<F, 4, true>(q, L, d_expert, x, h, 1, deps, &ws, gate_w, gate_out);
+    }
+}
+template <Fmt F>
+sycl::event moe_down_sh(sycl::queue& q, const MoeLayer& L, const QuantWeight& wd,
+                        const int32_t* d_expert, const float* d_weight,
+                        const float* gate_in, const float* h, float* y,
+                        const std::vector<sycl::event>& deps) {
+    static const int slots = []{ const char* e = std::getenv("B70_MOE_DN_SLOTS");
+        int x = (e && *e) ? std::atoi(e) : 1;
+        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4; }();
+    switch (slots) {
+        case 1: return moe_down_impl_r<F, 1, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);
+        case 2: return moe_down_impl_r<F, 2, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);
+        case 8: return moe_down_impl_r<F, 8, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);
+        default: return moe_down_impl_r<F, 4, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);
+    }
+}
+
 template <Fmt F>
 sycl::event moe_gate_up_impl(sycl::queue& q, const MoeLayer& L,
                              const int32_t* d_expert, const float* x, float* h,
@@ -493,6 +575,38 @@ sycl::event launch_moe_gate_up(sycl::queue& q, const MoeLayer& L,
         case Fmt::FP8_E4M3: return moe_gate_up_impl<Fmt::FP8_E4M3>(q, L, d_expert, x, h, 1, deps);
         case Fmt::FP8_E5M2: return moe_gate_up_impl<Fmt::FP8_E5M2>(q, L, d_expert, x, h, 1, deps);
         case Fmt::BF16:     return moe_gate_up_impl<Fmt::BF16>(q, L, d_expert, x, h, 1, deps);
+    }
+    return {};
+}
+
+sycl::event launch_moe_gate_up_shared(sycl::queue& q, const MoeLayer& L, const QuantWeight& ws,
+                                      const uint16_t* gate_w, const int32_t* d_expert,
+                                      const float* x, float* h, float* gate_out,
+                                      const std::vector<sycl::event>& deps) {
+    switch (L.gate_up.fmt) {
+        case Fmt::MXFP4:    return moe_gate_up_sh<Fmt::MXFP4>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::INT4:     return moe_gate_up_sh<Fmt::INT4>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::MXFP8:    return moe_gate_up_sh<Fmt::MXFP8>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::INT8:     return moe_gate_up_sh<Fmt::INT8>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::FP8_E4M3: return moe_gate_up_sh<Fmt::FP8_E4M3>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::FP8_E5M2: return moe_gate_up_sh<Fmt::FP8_E5M2>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+        case Fmt::BF16:     return moe_gate_up_sh<Fmt::BF16>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
+    }
+    return {};
+}
+
+sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const QuantWeight& wd,
+                                   const int32_t* d_expert, const float* d_weight,
+                                   const float* gate_in, const float* h, float* y,
+                                   const std::vector<sycl::event>& deps) {
+    switch (L.down.fmt) {
+        case Fmt::MXFP4:    return moe_down_sh<Fmt::MXFP4>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::INT4:     return moe_down_sh<Fmt::INT4>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::MXFP8:    return moe_down_sh<Fmt::MXFP8>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::INT8:     return moe_down_sh<Fmt::INT8>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::FP8_E4M3: return moe_down_sh<Fmt::FP8_E4M3>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::FP8_E5M2: return moe_down_sh<Fmt::FP8_E5M2>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
+        case Fmt::BF16:     return moe_down_sh<Fmt::BF16>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
     }
     return {};
 }

@@ -402,6 +402,7 @@ sycl::event launch_qsa_block_bits(sycl::queue& q, const int32_t* blocks, int row
 // the host lists the (expert, m-tile) pairs, moe_grouped_rows() rows each.
 // swiglu: w holds [gate; up] per expert and out is bf16 h [rows][Ne/2].
 int moe_grouped_rows();
+void moe_esimd_warmup(sycl::queue& q);
 bool moe_mxfp4_grouped_supported(const QuantWeight& w, int Ne);
 // True when launch_moe_mxfp4_grouped takes the ESIMD kernel, which also skips
 // tile-table entries with expert -1 (the padding of a device-built table).
@@ -412,6 +413,12 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
     bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
     const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
     const std::vector<sycl::event>& deps = {}, const float* rowscale = nullptr);
+// Same contract, but every tile holds <= 32 rows (verify / draft batches):
+// a per-thread-dequant ESIMD kernel without the SLM staging and barriers.
+sycl::event launch_moe_mxfp4_grouped_small(sycl::queue& q, const QuantWeight& w, int Ne,
+    bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
+    const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
+    const std::vector<sycl::event>& deps = {});
 // prefill.cpp: s[t] = 1 / (1 + exp(-dot(x[t], w))), x bf16 [rows][K], w bf16 [K]
 // (a one-output-row gate such as Ornith's shared_expert_gate).
 sycl::event launch_rowdot_sigmoid(sycl::queue& q, const sycl_bf16* x, const sycl_bf16* w,

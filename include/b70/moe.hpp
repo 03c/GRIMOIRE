@@ -116,6 +116,22 @@ sycl::event launch_moe_down(sycl::queue& q, const MoeLayer& L,
                             const int32_t* d_expert, const float* d_weight,
                             const float* h, float* y,
                             const std::vector<sycl::event>& deps = {});
+// Decode (one token) with the SHARED expert fused in as slot top_k, the way
+// Intel's llm-scaler MoE does it: gate_up also computes the shared expert's
+// SwiGLU rows (ws = [2I][H], same format as the routed experts, shared
+// intermediate == I) into h[top_k*I ..], and -- when gate_w (bf16 [H]) is
+// given -- sigmoid(x . gate_w) into gate_out[0]; down adds the shared
+// expert's rows (wd = [H][I]) weighted by gate_in[0] (1 when null) into the
+// same sum.  Replaces the separate shared GEMV, SwiGLU, GEMV, gate GEMV,
+// sigmoid scale and add.  h must hold (top_k+1)*I floats.
+sycl::event launch_moe_gate_up_shared(sycl::queue& q, const MoeLayer& L, const QuantWeight& ws,
+                                      const uint16_t* gate_w, const int32_t* d_expert,
+                                      const float* x, float* h, float* gate_out,
+                                      const std::vector<sycl::event>& deps = {});
+sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const QuantWeight& wd,
+                                   const int32_t* d_expert, const float* d_weight,
+                                   const float* gate_in, const float* h, float* y,
+                                   const std::vector<sycl::event>& deps = {});
 sycl::event launch_moe_gate_up_batched(
     sycl::queue& q, const MoeLayer& L, const int32_t* d_expert,
     const float* x, float* h, int tokens,

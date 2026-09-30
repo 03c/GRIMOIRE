@@ -8417,6 +8417,33 @@ const float* Grimoire::forward_dag(int token) {
             sycl::event e_router = gemv_any(d.router, s.h2, s.rlogits, deps({e_h}));
             sycl::event e_top = launch_router_topk(q, s.rlogits, cfg.n_experts,
                 cfg.top_k, s.d_expert, s.d_weight, true, deps({e_router}));
+            // The shared expert as slot top_k of the routed kernels (Intel
+            // llm-scaler's MoE layout): two launches instead of eight -- the
+            // separate shared GEMV, SwiGLU, GEMV, gate GEMV, sigmoid scale and
+            // add were 27 us of Ornith's 176 us per layer, a chain of kernels
+            // each shorter than its own dispatch.  GRIMOIRE_SHARED_UNFUSED=1 =
+            // the separate chain.  Needs the shared expert in the routed
+            // format with the routed intermediate size (s.moe_h holds
+            // (top_k+1)*I).
+            const int SI0 = d.sh_gu.output_rows() / 2;
+            static const bool sh_unfused = std::getenv("GRIMOIRE_SHARED_UNFUSED") != nullptr;
+            const bool fuse_sh = !sh_unfused && d.sh_gu.w.payload && d.sh_down.w.payload &&
+                !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                d.sh_gu.w.fmt == d.moe.gate_up.fmt && d.sh_down.w.fmt == d.moe.down.fmt &&
+                SI0 == d.moe.cfg.inter && (d.moe.cfg.inter % 8) == 0 &&
+                d.sh_gu.w.K == H && d.sh_down.w.N == H && d.sh_down.w.K == SI0 &&
+                (!d.has_sh_gate || (d.sh_gate_q.w.fmt == Fmt::BF16 && d.sh_gate_q.w.payload &&
+                                    d.sh_gate_q.w.N == 1 && d.sh_gate_q.w.K == H));
+            if (fuse_sh) {
+                const uint16_t* gw = d.has_sh_gate
+                    ? reinterpret_cast<const uint16_t*>(d.sh_gate_q.w.payload) : nullptr;
+                sycl::event e_gu = launch_moe_gate_up_shared(
+                    q, d.moe, d.sh_gu.w, gw, s.d_expert, s.h2, s.moe_h, s.sh_gate_val,
+                    deps({e_top}));
+                e_moe = launch_moe_down_shared(
+                    q, d.moe, d.sh_down.w, s.d_expert, s.d_weight, gw ? s.sh_gate_val : nullptr,
+                    s.moe_h, s.moe_y, deps({e_gu}));
+            } else {
             sycl::event e_gu = launch_moe_gate_up(
                 q, d.moe, s.d_expert, s.h2, s.moe_h, deps({e_top}));
             sycl::event e_routed = launch_moe_down(
@@ -8437,6 +8464,7 @@ const float* Grimoire::forward_dag(int token) {
                     q, s.sh_out, s.sh_gate_val, H, deps({e_shdown, e_gq}));
             }
             e_moe = launch_add(q, s.moe_y, s.sh_out, H, deps({e_routed, e_shared}));
+            }
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
             sycl::event e_gu = ffn_gemv(d, true, s.h2, s.sh_g, deps({e_h}));
@@ -9324,6 +9352,10 @@ const float* Grimoire::forward(int token) {
     // layer 0 has no previous block output to add
     q.memset(s.moe_y, 0, size_t(H) * sizeof(float));
     if (fusion_mask & 4) q.memset(s.sh_out, 0, size_t(H) * sizeof(float));
+    // A layer with the shared expert fused into moe_y leaves sh_out alone, so
+    // the MoE join (fusion_mask & 4) must see it zero -- stale only if an
+    // earlier unfused layer of this token wrote it.
+    bool sh_out_dirty = false;
     mark("embed");
     const int layer_begin = pp_enabled() ? pp_begin : 0;
     const int layer_end   = pp_enabled() ? pp_end   : cfg.n_layers;
@@ -9610,6 +9642,57 @@ const float* Grimoire::forward(int token) {
                 });
                 route_expert=tp_expert;route_weight=tp_weight;
             }
+            // The shared expert as slot top_k of the routed kernels (Intel
+            // llm-scaler's MoE layout): two launches instead of eight -- the
+            // separate shared GEMV, SwiGLU, GEMV, gate GEMV, sigmoid scale and
+            // add were 27 us of Ornith's 176 us per layer, a chain of kernels
+            // each shorter than its own dispatch.  GRIMOIRE_SHARED_UNFUSED=1 =
+            // the separate chain.  Needs the shared expert in the routed
+            // format with the routed intermediate size (s.moe_h holds
+            // (top_k+1)*I).
+            const int SI0 = d.sh_gu.output_rows() / 2;
+            static const bool sh_unfused = std::getenv("GRIMOIRE_SHARED_UNFUSED") != nullptr;
+            const bool fuse_sh = !sh_unfused && !d.tiered && !tp_enabled() &&
+                d.sh_gu.w.payload && d.sh_down.w.payload &&
+                !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                d.sh_gu.w.fmt == d.moe.gate_up.fmt && d.sh_down.w.fmt == d.moe.down.fmt &&
+                SI0 == d.moe.cfg.inter && (d.moe.cfg.inter % 8) == 0 &&
+                d.sh_gu.w.K == H && d.sh_down.w.N == H && d.sh_down.w.K == SI0 &&
+                (!d.has_sh_gate || (d.sh_gate_q.w.fmt == Fmt::BF16 && d.sh_gate_q.w.payload &&
+                                    d.sh_gate_q.w.N == 1 && d.sh_gate_q.w.K == H));
+            {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    std::fprintf(stderr, "    shared expert decode: %s\n",
+                        fuse_sh ? "fused into the routed MoE kernels" : "separate kernels");
+                    if (!fuse_sh)
+                        std::fprintf(stderr, "      (tiered %d tp %d fmask %d payload %d/%d i4 %d/%d fmt %d/%d vs %d/%d "
+                            "SI %d I %d gu.K %d dn.N %d dn.K %d H %d gate %d gfmt %d gN %d gK %d gpay %d)\n",
+                            int(d.tiered), int(tp_enabled()), int(fusion_mask),
+                            int(d.sh_gu.w.payload != nullptr), int(d.sh_down.w.payload != nullptr),
+                            int(d.sh_gu.has_i4()), int(d.sh_down.has_i4()),
+                            int(d.sh_gu.w.fmt), int(d.sh_down.w.fmt), int(d.moe.gate_up.fmt), int(d.moe.down.fmt),
+                            SI0, d.moe.cfg.inter, d.sh_gu.w.K, d.sh_down.w.N, d.sh_down.w.K, H,
+                            int(d.has_sh_gate), int(d.sh_gate_q.w.fmt), d.sh_gate_q.w.N, d.sh_gate_q.w.K,
+                            int(d.sh_gate_q.w.payload != nullptr));
+                }
+            }
+            if (fuse_sh) {
+                if ((fusion_mask & 4) && sh_out_dirty) {
+                    q.memset(s.sh_out, 0, size_t(H) * sizeof(float));
+                    sh_out_dirty = false;
+                }
+                const uint16_t* gw = d.has_sh_gate
+                    ? reinterpret_cast<const uint16_t*>(d.sh_gate_q.w.payload) : nullptr;
+                launch_moe_gate_up_shared(q, d.moe, d.sh_gu.w, gw, route_expert, s.h2, s.moe_h,
+                                          s.sh_gate_val, none);
+                MK("  moe_gate_up");
+                launch_moe_down_shared(q, d.moe, d.sh_down.w, route_expert, route_weight,
+                                       gw ? s.sh_gate_val : nullptr, s.moe_h, s.moe_y, none);
+                MK("  moe_down");
+                if (i == probe_layer) probe("L0 moe total", s.moe_y, H);
+            } else {
             if (d.tiered) launch_tmoe_gate_up(q,tm_view(d),route_expert,s.h2,s.moe_h,1,none);
             else launch_moe_gate_up(q,d.moe,route_expert,s.h2,s.moe_h,none);
             MK("  moe_gate_up");
@@ -9634,8 +9717,10 @@ const float* Grimoire::forward(int token) {
             MK("  shared expert");
             if (i == probe_layer) probe("L0 shared out", s.sh_out, H);
             if (!(fusion_mask & 4)) launch_add(q, s.moe_y, s.sh_out, H, none);
+            else sh_out_dirty = true;
             MK("  add shared");
             if (i == probe_layer) probe("L0 moe total", s.moe_y, H);
+            }
         } else {
             const int FI = d.sh_gu.output_rows() / 2;
             ffn_gemv(d, true, s.h2, s.sh_g, none);
@@ -9983,7 +10068,15 @@ int Grimoire::dflash_block_rows() const {
     constexpr int MMAX=16;
     static const int m_env=[]{const char* v=std::getenv("GRIMOIRE_DFLASH_M");
         return v&&*v?std::atoi(v):0;}();
-    const int wide=dflash2.draft_head_rows?8:MMAX;
+    // 8 rows by default, not the drafter's full 16-token block.  MEASURED
+    // 2026-09-30, Ornith + DFlash2, 160 tokens (math / story prompt):
+    //   M=16 1.504 / 2.879 s   M=12 1.279 / 2.601   M=8 1.265 / 2.066
+    //   M=6  1.324 / 2.015     M=4  1.411 / 2.338
+    // A 16-row verify touches ~100 experts per layer, an 8-row one ~57, and
+    // acceptance (4.5 of 15 drafted on math, 1.4-1.8 on prose) rarely
+    // reaches past the eighth row.  GRIMOIRE_DFLASH_M=2..16 overrides.
+    const int wide=8;
+    (void)MMAX;
     return (m_env>=2&&m_env<=MMAX)?m_env:wide;
 }
 
@@ -13018,8 +13111,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(smallm_bf){
                 launch_f32_to_bf16(q,x,smallm_bf,need);
                 // sh_tab with one tile: te[0]=0, tmb[0]=0, off[0]=0, cnt[0]=M
-                launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,smallm_bf,y,
-                                         sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
+                static const bool dense_small = std::getenv("GRIMOIRE_DENSE_SMALL_KERNEL") != nullptr;
+                if(dense_small)
+                    launch_moe_mxfp4_grouped_small(q,w.w,w.w.N,false,smallm_bf,y,
+                                                   sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
+                else
+                    launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,smallm_bf,y,
+                                             sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
                 return;
             }
         }
@@ -13390,6 +13488,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     };
     std::unique_ptr<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>> pg;
     if(prefill_graph){
+        moe_esimd_warmup(q);                       // its one-time upload waits
         q.wait();
         pg=std::make_unique<sycl_ext::command_graph<sycl_ext::graph_state::modifiable>>(
             q.get_context(),q.get_device());
@@ -14143,10 +14242,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_moe_route_grouped(q,bn,rex,xperm,nullptr,d_cnt,d_off,pinv,d_te,d_tm,
                                          moe_tab_tiles,M,H,E,moe_grouped_rows());
                 sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
-                launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
-                                         d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
-                launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,yperm,
-                                         d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                // M < 32, so every expert has <= 31 rows: the small-batch kernel
+                launch_moe_mxfp4_grouped_small(q,d.moe.gate_up,2*I,true,xperm,hb,
+                                               d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                launch_moe_mxfp4_grouped_small(q,d.moe.down,H,false,hb,yperm,
+                                               d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
                 launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
