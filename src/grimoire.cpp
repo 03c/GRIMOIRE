@@ -10201,6 +10201,28 @@ bool Grimoire::dflash_draft(int bonus_token, int position,
         // kernel used to hide this.  Same routing as prefill's mm() for
         // verify batches: the batched GEMV reads each weight once per 4
         // rows and is bit-identical per row to decode's GEMV.
+        // Draft blocks (2..16 rows) of MXFP4 weights: the grouped ESIMD GEMM as
+        // one expert of `rows` rows -- weights read once, dot products on DPAS
+        // (the batched GEMV below re-reads them per 4 rows; 20 ms of a 68 ms
+        // Ornith DFlash2 step).  GRIMOIRE_SMALLM_GEMV=1 = the batched GEMV.
+        static const bool smallm_gemv_d = std::getenv("GRIMOIRE_SMALLM_GEMV") != nullptr;
+        if(!dense && rows>=2 && rows<=16 && w.w.payload && !w.has_i4() && !smallm_gemv_d &&
+           moe_mxfp4_grouped_esimd(w.w,w.w.N,false)){
+            static int32_t* dtab = nullptr;           // te=0, tmb=0, off=0, cnt=rows
+            static int dtab_rows = -1;
+            if(!dtab) dtab = sycl::malloc_device<int32_t>(4,q);
+            if(dtab && dtab_rows!=rows){
+                const int32_t h[4]={0,0,0,rows};
+                q.memcpy(dtab,h,sizeof h).wait();    // h dies here
+                dtab_rows=rows;
+            }
+            if(dtab){
+                launch_f32_to_bf16(q,x,dflash2.bf,size_t(rows)*w.w.K);
+                launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,dflash2.bf,y,
+                                         dtab,dtab+1,dtab+2,dtab+3,1);
+                return;
+            }
+        }
         if(!dense && rows<=16 && w.w.payload && !w.has_i4() &&
            !std::getenv("GRIMOIRE_DFLASH_DRAFT_XMX")){
             launch_gemv_batch(q,w.w,x,y,rows,{});
@@ -12972,8 +12994,35 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // A/B switch for the batched verify GEMV: GRIMOIRE_NO_GEMV_BATCH=1 restores
     // one launch_gemv per row (and gemm_flt for large N).
     static const bool no_gemv_batch = std::getenv("GRIMOIRE_NO_GEMV_BATCH") != nullptr;
+    // Verify/draft-sized batches (2..16 rows) of MXFP4 weights go through the
+    // grouped ESIMD GEMM as ONE expert of M rows (sh_tab is that table): the
+    // weights are read once for all rows and the rows' dot products run on
+    // DPAS.  launch_gemv_batch re-reads the weights once per 4 rows and does
+    // every row's FMAs in SIMT -- MEASURED 2026-09-29, Ornith DFlash2 verify
+    // (M=16): the dense projections + lm_head took ~57 of a 93 ms pass.
+    // Not bit-identical to decode's GEMV (DPAS order); exact_verify keeps the
+    // GEMV.  GRIMOIRE_SMALLM_GEMV=1 = the batched GEMV.
+    static const bool smallm_gemv = std::getenv("GRIMOIRE_SMALLM_GEMV") != nullptr;
+    static sycl_bf16* smallm_bf = nullptr;
+    static size_t smallm_cap = 0;
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
+        if(M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
+           w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false)){
+            const size_t need=size_t(M)*size_t(w.w.K);
+            if(need>smallm_cap){
+                if(smallm_bf){ q.wait(); sycl::free(smallm_bf,q); }
+                smallm_bf=sycl::malloc_device<sycl_bf16>(need,q);
+                smallm_cap=smallm_bf?need:0;
+            }
+            if(smallm_bf){
+                launch_f32_to_bf16(q,x,smallm_bf,need);
+                // sh_tab with one tile: te[0]=0, tmb[0]=0, off[0]=0, cnt[0]=M
+                launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,smallm_bf,y,
+                                         sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
+                return;
+            }
+        }
         if(exact_verify && M<=4 && !verify_a16){
             if(std::getenv("GRIMOIRE_VERIFY_MAP")){
                 static std::set<std::pair<int,int>> seen;
@@ -14072,6 +14121,33 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     launch_tmoe_gate_up(q,tm_view(d),rex,bn,mh,M,{});
                     launch_tmoe_down(q,tm_view(d),rex,rwt,mh,r0,M,{});
                 }
+            }else if(M>1 && M<32 && device_can_matrix(q) && !tp_enabled() && !exact_verify &&
+                     cfg.top_k==8 && cfg.n_experts<=1024 && (H%8)==0 &&
+                     !std::getenv("GRIMOIRE_MOE_SMALLM_PLAIN") &&
+                     moe_mxfp4_grouped_supported(d.moe.gate_up,2*I) &&
+                     moe_mxfp4_grouped_supported(d.moe.down,H) &&
+                     moe_mxfp4_grouped_esimd(d.moe.gate_up,2*I,true) &&
+                     moe_mxfp4_grouped_esimd(d.moe.down,H,false)){
+                // Verify-sized batches (DFlash: 16 rows).  The plain per-row pair
+                // at the bottom re-reads a touched expert's weights for every row
+                // that routes to it: ~3 ms per extra verified token on Ornith, most
+                // of an 88 ms DFlash2 verify.  Device routing + the grouped ESIMD
+                // GEMM read each touched expert's weights once.  Not bit-identical
+                // to decode's GEMV (DPAS order), so exact_verify keeps the pair.
+                // GRIMOIRE_MOE_SMALLM_PLAIN=1 = the plain pair.  MEASURED
+                // 2026-09-30 with the dense projections on the ESIMD small-M
+                // route too: verify 46-47 -> 40-45 ms per DFlash2 step.
+                const int E=cfg.n_experts;
+                int32_t* d_te=moe_tab; int32_t* d_tm=moe_tab+moe_tab_tiles;
+                int32_t* d_off=moe_tab+2*moe_tab_tiles; int32_t* d_cnt=d_off+E;
+                launch_moe_route_grouped(q,bn,rex,xperm,nullptr,d_cnt,d_off,pinv,d_te,d_tm,
+                                         moe_tab_tiles,M,H,E,moe_grouped_rows());
+                sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
+                                         d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,yperm,
+                                         d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
                     launch_moe_remap_bf16_top8(q,bn_bf,rex,xperm,grouped_rows,
