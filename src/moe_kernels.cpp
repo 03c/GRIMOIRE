@@ -502,9 +502,11 @@ sycl::event moe_down_impl(sycl::queue& q, const MoeLayer& L,
     // R=1 is best here: the slot loop over K experts already gives 8
     // independent streams, so widening only spills registers.  Measured
     // R=4 -> 113.4 TG against R=1 125.6.
+    // 2 rows per sub-group.  MEASURED 2026-09-30 on Ornith with the shared
+    // expert fused in: moe_down 30.0 -> 23.4 us (1 -> 2), 34.1 us at 4.
     static const int slots = []{ const char* e = std::getenv("B70_MOE_DN_SLOTS");
-        int x = (e && *e) ? std::atoi(e) : 1;
-        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4; }();
+        int x = (e && *e) ? std::atoi(e) : 2;
+        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 2; }();
     switch (slots) {
         case 1: return moe_down_impl_r<F, 1>(q, L, d_expert, d_weight, h, y, M, deps);
         case 2: return moe_down_impl_r<F, 2>(q, L, d_expert, d_weight, h, y, M, deps);
@@ -535,9 +537,11 @@ sycl::event moe_down_sh(sycl::queue& q, const MoeLayer& L, const QuantWeight& wd
                         const int32_t* d_expert, const float* d_weight,
                         const float* gate_in, const float* h, float* y,
                         const std::vector<sycl::event>& deps) {
+    // 2 rows per sub-group.  MEASURED 2026-09-30 on Ornith with the shared
+    // expert fused in: moe_down 30.0 -> 23.4 us (1 -> 2), 34.1 us at 4.
     static const int slots = []{ const char* e = std::getenv("B70_MOE_DN_SLOTS");
-        int x = (e && *e) ? std::atoi(e) : 1;
-        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 4; }();
+        int x = (e && *e) ? std::atoi(e) : 2;
+        return (x == 1 || x == 2 || x == 4 || x == 8) ? x : 2; }();
     switch (slots) {
         case 1: return moe_down_impl_r<F, 1, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);
         case 2: return moe_down_impl_r<F, 2, true>(q, L, d_expert, d_weight, h, y, 1, deps, &wd, gate_in);

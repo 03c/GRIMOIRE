@@ -686,7 +686,10 @@ int rps_for(int N) {
     // z 35.8 -> 42.6, lm_head 1149 -> 1288, because halving the rows per
     // sub-group doubles how often the hoisted x is re-read.  A blanket
     // N>=16384 rule measured 34.36 ms/token against 31.77.
-    return (N >= 8192 && N < 16384) ? 2 : 4;
+    // N == 8192 (Ornith la_qkv / q+gate) is faster at 4: MEASURED 2026-09-30,
+    // la_qkv 27.5 -> 24.8 us, q 24.8 -> 22.2 us; the 2 rule was tuned on
+    // Qwen3.8-27B's 10240 / 12288.
+    return (N > 8192 && N < 16384) ? 2 : 4;
 }
 
 bool wide_relaxed() {
