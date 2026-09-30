@@ -14892,8 +14892,11 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.
     o.mtp=e.spec_active() && o.draft_depth>0 && e.spec_verify_available();
+    // Graph replay by default (GRIMOIRE_DECODE_GRAPH=0 = direct submission).
+    // MEASURED 2026-09-30, Ornith plain decode: 119.7 -> 122.0 tok/s, the
+    // same 256 tokens.
     const char* graph=std::getenv("GRIMOIRE_DECODE_GRAPH");
-    o.graph=graph && std::atoi(graph)!=0;
+    o.graph=!graph || std::atoi(graph)!=0;
     // GRIMOIRE_SPEC_STATS=1 prints accepted-per-step per request.  This is
     // the measurement an A/B needs and tok/s cannot give: a change that
     // makes the draft cheaper and a change that makes it more accurate both

@@ -273,6 +273,13 @@ struct AttnParams {
     // identical until the context passes the window, then quietly wrong.
     int window_left = 0;
 
+    // Length gates for a recorded decode graph (0 = off): the kernel returns
+    // at once unless the device-side length satisfies them, so two kernels
+    // with complementary gates can both sit in the graph and exactly one
+    // does the work (see launch_flash_decode).
+    int gate_le = 0;       // run only when seq_len <= gate_le
+    int gate_gt = 0;       // run only when seq_len >  gate_gt
+
     // Qwen4-Exp QSA (decode, one query row): a bitmap over key blocks of
     // qrat tokens -- a key is attended iff its block's bit is set or it lies
     // in the incomplete tail block [seq/qrat*qrat, seq).  nullptr = dense.

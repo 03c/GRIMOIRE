@@ -107,6 +107,8 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                 // This chunk's slice. seq_len comes from device memory
                 // when the kernel is running inside a recorded graph.
                 const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+                if ((pp.gate_le > 0 && seq > pp.gate_le) || (pp.gate_gt > 0 && seq <= pp.gate_gt))
+                    return;                          // the other gated kernel owns this length
                 // Sliding attention: everything before the window is
                 // masked to -inf, which contributes nothing, so drop it
                 // from the scan instead of scoring and discarding it.
@@ -264,6 +266,8 @@ static sycl::event flash_decode_gqa(sycl::queue& q, const AttnParams& p,
 
                 // The same slice launch_flash_decode_impl gives this split.
                 const int seq   = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+                if ((pp.gate_le > 0 && seq > pp.gate_le) || (pp.gate_gt > 0 && seq <= pp.gate_gt))
+                    return;                          // the other gated kernel owns this length
                 const int lo    = pp.window_left > 0
                                 ? sycl::max(0, seq - pp.window_left) : 0;
                 const int span  = seq - lo;
@@ -408,6 +412,25 @@ sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
     static const bool old = std::getenv("GRIMOIRE_FLASH_DECODE_OLD") != nullptr;
     // GC (heads per sub-group) is the largest divisor of the GQA group that
     // keeps GC * head_dim/16 accumulators at 48 or fewer per lane.
+    // Inside a recorded decode graph the context length is only known on the
+    // device, and neither kernel wins everywhere.  MEASURED 2026-09-30, Ornith
+    // hd256 (G=8), per full-attention layer: ~50 keys -> per-head kernel 61 us,
+    // GQA kernel 110 us; 5.7K keys -> 420 vs 128 us.  So both go into the graph
+    // with complementary length gates and exactly one runs.
+    // GRIMOIRE_FLASH_DECODE_SPLIT_T=<keys> moves the crossover (0 = GQA only).
+    static const int split_t = [] {
+        const char* e = std::getenv("GRIMOIRE_FLASH_DECODE_SPLIT_T");
+        return e ? std::atoi(e) : 768; }();
+    if (!old && split_t > 0 && p.d_seq_len && p.gate_le == 0 && p.gate_gt == 0 &&
+        p.num_kv_heads > 0 && p.num_heads % p.num_kv_heads == 0 && (p.seq_cap % 4) == 0 &&
+        (p.head_dim == 128 || p.head_dim == 256)) {
+        AttnParams a = p; a.gate_le = split_t;
+        sycl::event e0 = p.head_dim > MAX_HEAD_DIM
+            ? launch_flash_decode_impl<MAX_DPL_WIDE>(q, a, deps)
+            : launch_flash_decode_impl<MAX_DPL>(q, a, deps);
+        AttnParams b = p; b.gate_gt = split_t;
+        return launch_flash_decode(q, b, {e0});
+    }
     if (!old && p.num_kv_heads > 0 && p.num_heads % p.num_kv_heads == 0 &&
         (p.seq_cap % 4) == 0) {
         const int G = p.num_heads / p.num_kv_heads;
