@@ -24,6 +24,7 @@
 #include "kernels.hpp"
 #include "gemv_step.hpp"
 #include "b70/moe.hpp"
+#include <sycl/ext/intel/esimd.hpp>
 
 namespace b70 {
 namespace {
@@ -565,6 +566,222 @@ sycl::event moe_gate_up_impl(sycl::queue& q, const MoeLayer& L,
     }
 }
 
+
+// ---------------------------------------------------------------------
+// ESIMD decode MoE (MXFP4, one token), the llm-scaler shape.
+//
+// The SIMT kernels above stage the activation and three decode tables in SLM
+// per work-group and walk 2-8 rows per sub-group: MEASURED 2026-10-01 with
+// cold weights (tools/decode_probe.cpp, 8 random experts of 256 + shared),
+// gate_up 37.7 us = 266 GB/s and down 20.2 us = 248 GB/s.  Here a thread
+// streams whole rows with contiguous 64-byte block loads, keeps its slice of
+// the activation in registers split into even / odd K (the low / high nibble
+// of each payload byte), and decodes E2M1 in the ALU: the nibble's three
+// magnitude bits at fp16 bits 9..11 plus the sign at bit 15 ARE the fp16
+// value times 2^-14 (fp16 subnormals hold the E2M1 subnormal); the 2^14 folds
+// into the E8M0 block scale.  No tables, no barrier before the K-split sum.
+// Same probe: gate_up 21.0 us (477 GB/s), down 10.4 us (484 GB/s), max
+// relative error 2e-7 against the SIMT kernels (fp32 summation order).
+// GRIMOIRE_MOE_ESIMD_DECODE=0 = the SIMT kernels.
+// ---------------------------------------------------------------------
+namespace es = sycl::ext::intel::esimd;
+
+template <int N>
+SYCL_ESIMD_FUNCTION inline void e2m1_split(es::simd<uint8_t, N> b, es::simd<float, N>& lo,
+                                           es::simd<float, N>& hi) {
+    es::simd<uint16_t, N> u = b;
+    es::simd<uint16_t, N> l = ((u & 0x7) << 9) | ((u & 0x8) << 12);
+    es::simd<uint16_t, N> hb = ((u & 0x70) << 5) | ((u & 0x80) << 8);
+    es::simd<sycl::half, N> lh = l.template bit_cast_view<sycl::half>();
+    es::simd<sycl::half, N> hh = hb.template bit_cast_view<sycl::half>();
+    lo = lh;
+    hi = hh;
+}
+SYCL_ESIMD_FUNCTION inline float e8m0_x2p14(uint32_t e) {   // 2^(e-127) * 2^14
+    return sycl::bit_cast<float>((e + 14u) << 23);
+}
+// One 128-element step of one row: acc += sum_b scale_b * (lo.xe + hi.xo).
+template <int KP>
+SYCL_ESIMD_FUNCTION inline void mx4_row_step(const uint8_t* prow, const uint8_t* srow, int st,
+                                             es::simd<float, KP / 2>& xe,
+                                             es::simd<float, KP / 2>& xo,
+                                             es::simd<float, 16>& acc) {
+    es::simd<uint8_t, 64> pb = es::block_load<uint8_t, 64>(prow + st * 64);
+    es::simd<uint8_t, 4> sb = es::block_load<uint8_t, 4>(srow + st * 4);
+    es::simd<float, 64> wl, wh;
+    e2m1_split<64>(pb, wl, wh);
+    #pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        es::simd<float, 16> part =
+            wl.template select<16, 1>(16 * b) * xe.template select<16, 1>(st * 64 + 16 * b) +
+            wh.template select<16, 1>(16 * b) * xo.template select<16, 1>(st * 64 + 16 * b);
+        acc += part * e8m0_x2p14(uint32_t(sb[b]));
+    }
+}
+
+// gate_up + SiLU*up for TK routed experts plus the shared expert (slot TK),
+// and the shared-expert gate in one extra work-group.  Work-group = KS
+// threads splitting H; a thread owns R (gate, up) row pairs of one slot.
+template <int R, int KS, int H>
+sycl::event moe_gu_esimd(sycl::queue& q, const QuantWeight& w, const QuantWeight& ws,
+                         const uint16_t* gate_w, const int32_t* d_expert, const float* x,
+                         float* h, float* gate_out, int I, int TK,
+                         const std::vector<sycl::event>& deps) {
+    constexpr int KP = H / KS;
+    static_assert(KP % 128 == 0, "K slice must be whole 128-element steps");
+    const int rg = I / R;
+    const int n_wg = (TK + 1) * rg + (gate_w ? 1 : 0);
+    const uint8_t* wp = w.payload; const uint8_t* wsc = static_cast<const uint8_t*>(w.scales);
+    const uint8_t* sp = ws.payload; const uint8_t* ssc = static_cast<const uint8_t*>(ws.scales);
+    const int64_t wrb = w.row_bytes, wrs = w.row_scales, srb = ws.row_bytes, srs = ws.row_scales;
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(deps);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<(KS * R * 2 * 4 > KS * 16 ? KS * R * 2 * 4 : KS * 16)>();
+            const int t = int(it.get_local_id(0));
+            const int g = int(it.get_group(0));
+            const int kb = t * KP;
+            if (g == (TK + 1) * rg) {                           // shared-expert gate
+                es::simd<float, 16> a = 0.0f;
+                for (int k = kb; k < kb + KP; k += 16) {
+                    es::simd<uint16_t, 16> gb = es::block_load<uint16_t, 16>(gate_w + k);
+                    es::simd<uint32_t, 16> gu = es::convert<uint32_t>(gb) << 16;
+                    es::simd<float, 16> gf = gu.template bit_cast_view<float>();
+                    a += gf * es::block_load<float, 16>(x + k);
+                }
+                es::simd<float, 4> av = 0.0f;
+                av[0] = es::reduce<float>(a, std::plus<>());
+                es::slm_block_store<float, 4>(t * 16, av);
+                es::barrier();
+                if (t == 0) {
+                    float sum = 0.0f;
+                    es::simd<float, 4 * KS> pv = es::slm_block_load<float, 4 * KS>(0);
+                    #pragma unroll
+                    for (int j = 0; j < KS; ++j) sum += pv[4 * j];
+                    gate_out[0] = 1.0f / (1.0f + sycl::exp(-sum));
+                }
+                return;
+            }
+            const int slot = g / rg, i0 = (g % rg) * R;
+            const bool sh = slot == TK;
+            const uint8_t* pay = sh ? sp : wp;
+            const uint8_t* scl = sh ? ssc : wsc;
+            const int64_t rb = sh ? srb : wrb, rs = sh ? srs : wrs;
+            int e = sh ? 0 : d_expert[slot];
+            if (e < 0) e = 0;              // unrouted slot: down weights it 0
+            const int64_t row0 = sh ? int64_t(i0) : int64_t(e) * 2 * I + i0;
+            es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+            es::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+            es::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+            es::simd<float, 16> ga[R], ua[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) { ga[r] = 0.0f; ua[r] = 0.0f; }
+            #pragma unroll 1
+            for (int st = 0; st < KP / 128; ++st) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int64_t gr = row0 + r, ur = row0 + I + r;
+                    mx4_row_step<KP>(pay + gr * rb + kb / 2, scl + gr * rs + kb / 32, st, xe, xo, ga[r]);
+                    mx4_row_step<KP>(pay + ur * rb + kb / 2, scl + ur * rs + kb / 32, st, xe, xo, ua[r]);
+                }
+            }
+            es::simd<float, 2 * R> red;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                red[2 * r] = es::reduce<float>(ga[r], std::plus<>());
+                red[2 * r + 1] = es::reduce<float>(ua[r], std::plus<>());
+            }
+            if constexpr (KS > 1) {
+                es::slm_block_store<float, 2 * R>(t * 2 * R * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, 2 * R>(j * 2 * R * 4);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float gv = red[2 * r], uv = red[2 * r + 1];
+                h[int64_t(slot) * I + i0 + r] = gv / (1.0f + sycl::exp(-gv)) * uv;
+            }
+        });
+    });
+}
+
+// down + routed-weight reduction over the TK experts and the shared expert.
+// Work-group = TK+1 threads, thread s = slot s; a work-group owns R output
+// rows; slot partials meet in SLM and thread 0 sums them in slot order.
+template <int R, int I>
+sycl::event moe_dn_esimd(sycl::queue& q, const QuantWeight& w, const QuantWeight& wd,
+                         const int32_t* d_expert, const float* d_weight, const float* gate_in,
+                         const float* h, float* y, int H, int TK,
+                         const std::vector<sycl::event>& deps) {
+    static_assert(I % 128 == 0, "");
+    constexpr int RP = R < 4 ? 4 : R;
+    const uint8_t* wp = w.payload; const uint8_t* wsc = static_cast<const uint8_t*>(w.scales);
+    const uint8_t* sp = wd.payload; const uint8_t* ssc = static_cast<const uint8_t*>(wd.scales);
+    const int64_t wrb = w.row_bytes, wrs = w.row_scales, srb = wd.row_bytes, srs = wd.row_scales;
+    const int S = TK + 1;
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(deps);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(H / R) * S, S), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<16 * RP * 4>();
+            const int s = int(it.get_local_id(0));
+            const int o0 = int(it.get_group(0)) * R;
+            const bool sh = s == TK;
+            const uint8_t* pay = sh ? sp : wp;
+            const uint8_t* scl = sh ? ssc : wsc;
+            const int64_t rb = sh ? srb : wrb, rs = sh ? srs : wrs;
+            int e = sh ? 0 : d_expert[s];
+            float wt = sh ? (gate_in ? gate_in[0] : 1.0f) : d_weight[s];
+            if (e < 0) { e = 0; wt = 0.0f; }
+            const int64_t row0 = sh ? int64_t(o0) : int64_t(e) * H + o0;
+            es::simd<float, I> hs = es::block_load<float, I>(h + int64_t(s) * I);
+            es::simd<float, I / 2> he = hs.template select<I / 2, 2>(0);
+            es::simd<float, I / 2> ho = hs.template select<I / 2, 2>(1);
+            es::simd<float, 16> acc[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+            #pragma unroll
+            for (int st = 0; st < I / 128; ++st) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    mx4_row_step<I>(pay + (row0 + r) * rb, scl + (row0 + r) * rs, st, he, ho, acc[r]);
+            }
+            es::simd<float, RP> part = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) part[r] = es::reduce<float>(acc[r], std::plus<>()) * wt;
+            es::slm_block_store<float, RP>(s * RP * 4, part);
+            es::barrier();
+            if (s != 0) return;
+            es::simd<float, RP> tot = 0.0f;
+            for (int j = 0; j < S; ++j) tot += es::slm_block_load<float, RP>(j * RP * 4);
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[o0 + r] = tot[r];
+        });
+    });
+}
+
+bool moe_esimd_decode_on() {
+    static const bool v = [] { const char* e = std::getenv("GRIMOIRE_MOE_ESIMD_DECODE");
+        return !(e && *e == '0'); }();
+    return v;
+}
+bool mx4_rows_ok(const QuantWeight& w) {
+    return w.fmt == Fmt::MXFP4 && w.payload && w.scales && w.row_bytes % 64 == 0 &&
+           w.row_scales % 4 == 0 && w.row_bytes >= w.K / 2 && w.row_scales >= w.K / 32;
+}
+// Ornith / Qwen3.5-MoE geometry: H 2048, I 512 (shared expert the same).
+bool moe_esimd_gu_ok(const MoeLayer& L, const QuantWeight& ws) {
+    return moe_esimd_decode_on() && L.cfg.hidden == 2048 && L.cfg.inter == 512 &&
+           L.cfg.top_k >= 1 && L.cfg.top_k <= 15 && L.gate_up.K == 2048 && mx4_rows_ok(L.gate_up) &&
+           mx4_rows_ok(ws) && ws.N == 2 * 512 && ws.K == 2048;
+}
+bool moe_esimd_dn_ok(const MoeLayer& L, const QuantWeight& wd) {
+    return moe_esimd_decode_on() && L.cfg.hidden == 2048 && L.cfg.inter == 512 &&
+           L.cfg.top_k >= 1 && L.cfg.top_k <= 15 && L.down.K == 512 && mx4_rows_ok(L.down) &&
+           mx4_rows_ok(wd) && wd.N == 2048 && wd.K == 512;
+}
 } // namespace
 
 // ---------------------------------------------------------------------
@@ -587,6 +804,9 @@ sycl::event launch_moe_gate_up_shared(sycl::queue& q, const MoeLayer& L, const Q
                                       const uint16_t* gate_w, const int32_t* d_expert,
                                       const float* x, float* h, float* gate_out,
                                       const std::vector<sycl::event>& deps) {
+    if (moe_esimd_gu_ok(L, ws))
+        return moe_gu_esimd<2, 8, 2048>(q, L.gate_up, ws, gate_w, d_expert, x, h, gate_out,
+                                        L.cfg.inter, L.cfg.top_k, deps);
     switch (L.gate_up.fmt) {
         case Fmt::MXFP4:    return moe_gate_up_sh<Fmt::MXFP4>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
         case Fmt::INT4:     return moe_gate_up_sh<Fmt::INT4>(q, L, ws, gate_w, d_expert, x, h, gate_out, deps);
@@ -603,6 +823,9 @@ sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const Quan
                                    const int32_t* d_expert, const float* d_weight,
                                    const float* gate_in, const float* h, float* y,
                                    const std::vector<sycl::event>& deps) {
+    if (moe_esimd_dn_ok(L, wd))
+        return moe_dn_esimd<2, 512>(q, L.down, wd, d_expert, d_weight, gate_in, h, y,
+                                    L.cfg.hidden, L.cfg.top_k, deps);
     switch (L.down.fmt) {
         case Fmt::MXFP4:    return moe_down_sh<Fmt::MXFP4>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
         case Fmt::INT4:     return moe_down_sh<Fmt::INT4>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);

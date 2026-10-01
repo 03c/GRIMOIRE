@@ -196,9 +196,17 @@ sycl::event moe_gu_es(sycl::queue& q, QuantWeight w, QuantWeight ws, const uint1
             #pragma unroll
             for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, 2 * R>(j * 2 * R * 4);
         }
-        es::simd<float, R> gg = red.template select<R, 2>(0), uu = red.template select<R, 2>(1);
-        es::simd<float, R> o = gg / (1.0f + es::exp(-gg)) * uu;
-        es::block_store<float, R>(h + int64_t(slot) * I + i0, o);
+        if constexpr (R >= 4) {
+            es::simd<float, R> gg = red.template select<R, 2>(0), uu = red.template select<R, 2>(1);
+            es::simd<float, R> o = gg / (1.0f + es::exp(-gg)) * uu;
+            es::block_store<float, R>(h + int64_t(slot) * I + i0, o);
+        } else {
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float g = red[2 * r], u = red[2 * r + 1];
+                h[int64_t(slot) * I + i0 + r] = g / (1.0f + sycl::exp(-g)) * u;
+            }
+        }
     });
 }
 
@@ -215,7 +223,7 @@ sycl::event moe_dn_es(sycl::queue& q, QuantWeight w, QuantWeight wd, const int32
     const int64_t wrb = w.row_bytes, wrs = w.row_scales, srb = wd.row_bytes, srs = wd.row_scales;
     const int S = TK + 1;
     return q.parallel_for(sycl::nd_range<1>(size_t(H / R) * S, S), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
-        es::slm_init<16 * R * 4>();
+        es::slm_init<16 * (R < 4 ? 4 : R) * 4>();
         const int s = int(it.get_local_id(0));
         const int o0 = int(it.get_group(0)) * R;
         const bool sh = s == TK;
@@ -236,15 +244,20 @@ sycl::event moe_dn_es(sycl::queue& q, QuantWeight w, QuantWeight wd, const int32
             for (int r = 0; r < R; ++r)
                 row_step<I>(pay + (row0 + r) * rb, scl + (row0 + r) * rs, st, he, ho, acc[r]);
         }
-        es::simd<float, R> part;
+        constexpr int RP = R < 4 ? 4 : R;
+        es::simd<float, RP> part = 0.0f;
         #pragma unroll
         for (int r = 0; r < R; ++r) part[r] = es::reduce<float>(acc[r], std::plus<>()) * wt;
-        es::slm_block_store<float, R>(s * R * 4, part);
+        es::slm_block_store<float, RP>(s * RP * 4, part);
         es::barrier();
         if (s != 0) return;
-        es::simd<float, R> tot = 0.0f;
-        for (int j = 0; j < S; ++j) tot += es::slm_block_load<float, R>(j * R * 4);
-        es::block_store<float, R>(y + o0, tot);
+        es::simd<float, RP> tot = 0.0f;
+        for (int j = 0; j < S; ++j) tot += es::slm_block_load<float, RP>(j * RP * 4);
+        if constexpr (R >= 4) es::block_store<float, R>(y + o0, tot.template select<R, 1>(0));
+        else {
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[o0 + r] = tot[r];
+        }
     });
 }
 
@@ -422,7 +435,7 @@ int main(int argc, char** argv) {
         };
 #define GU(RR, KK) gu_case("R" #RR " KS" #KK, [&](int i) { \
             return moe_gu_es<RR, KK, 2048>(q, L.gate_up, sgu, gw, de + size_t(i) * TK, x, h2, go2, I, TK); })
-        GU(2, 4); GU(4, 4); GU(8, 4); GU(4, 2); GU(8, 2); GU(4, 8); GU(2, 8);
+        GU(2, 4); GU(4, 4); GU(2, 8); GU(1, 8); GU(2, 16); GU(1, 16); GU(1, 4);
 #undef GU
         auto dn_case = [&](const char* nm, auto launch) {
             launch(t0).wait();
@@ -436,7 +449,7 @@ int main(int argc, char** argv) {
         // the engine's h / gate for routing t0 feed every down candidate
 #define DN(RR) dn_case("R" #RR, [&](int i) { \
             return moe_dn_es<RR, 512>(q, L.down, sdn, de + size_t(i) * TK, dw + size_t(i) * TK, go, h, y2, H, TK); })
-        DN(2); DN(4); DN(8);
+        DN(1); DN(2); DN(4);
 #undef DN
     }
     std::printf("DECODE PROBE DONE\n");
