@@ -1949,6 +1949,26 @@ struct Grimoire {
     int  pipe_split = 0;
     std::unique_ptr<sycl::queue> q1;      // device-1 queue when pipeline
     float* pipe_host = nullptr;           // pinned staging for the boundary
+    // Asynchronous boundary send (pp_send_hidden): two pinned buffers, at most
+    // one background write in flight, messages strictly in order.
+    float* pipe_send[2] = {nullptr, nullptr};
+    size_t pipe_send_elems[2] = {0, 0};
+    int    pipe_send_i = 0;
+    std::thread pipe_send_thr;
+    bool   pipe_send_ok = true;
+    void pp_send_wait() { if (pipe_send_thr.joinable()) pipe_send_thr.join(); }
+    // Receive prefetch for chunked PP prefill: after a boundary message is
+    // read, the NEXT one (pp_next_rows rows, set by the chunk loop) is read on
+    // a background thread into the other pinned buffer while this chunk runs.
+    float* pipe_recv[2] = {nullptr, nullptr};
+    size_t pipe_recv_elems[2] = {0, 0};
+    int    pipe_recv_i = 0;
+    std::thread pipe_recv_thr;
+    bool   pipe_recv_ok = false;
+    size_t pipe_recv_pending = 0;          // elems the in-flight prefetch reads
+    int    pp_next_rows = 0;
+    void pp_expect_next_rows(int rows) { pp_next_rows = rows; }
+    void pp_recv_wait() { if (pipe_recv_thr.joinable()) pipe_recv_thr.join(); }
     float* tp_scratch = nullptr;          // gemm_tp: this rank's [rows][N_r]
     size_t tp_scratch_elems = 0;
     sycl_bf16* tp_act = nullptr;          // gemm_tp: bf16 activations for XMX
@@ -3420,7 +3440,7 @@ bool Grimoire::pp_send_request(const PPRequest& r) {
     if(tp_enabled()) {
         if(tp_rank!=0) return true;
         for(int i=1;i<tp_world;++i) peers.push_back(tp_peer_fd[size_t(i)]);
-    } else if(pp_next_fd>=0) peers.push_back(pp_next_fd);
+    } else if(pp_next_fd>=0) { pp_send_wait(); peers.push_back(pp_next_fd); }
     if(r.kind==3 && (r.slots.size()!=r.prompt.size() || r.positions.size()!=r.prompt.size()))
         return false;
     const int32_t head[5]={r.shutdown?1:r.kind,int32_t(r.prompt.size()),
@@ -3474,25 +3494,120 @@ bool Grimoire::pp_recv_request(PPRequest& r) {
 }
 
 bool Grimoire::pp_send_hidden(const float* dev, size_t elems) {
+    // The socket write blocked until the next stage READ the message, and the
+    // next stage reads only when it starts its next chunk: MEASURED 2026-10-01
+    // (PP=2, Ornith 5987 tokens, chunk 2048) rank 0 sat 6 / 14 / 20 ms in
+    // write per chunk, its last chunk finished late, and rank 1 idled ~6 ms
+    // waiting for it.  The copy to pinned memory still waits (the data must
+    // be complete); the write runs on a background thread so the next chunk's
+    // kernels start at once.  GRIMOIRE_PP_ASYNC_SEND=0 = the blocking path.
+    static const bool async_send = [] { const char* e = std::getenv("GRIMOIRE_PP_ASYNC_SEND");
+        return !(e && *e == '0'); }();
+    if (async_send) {
+        static const bool pt = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        const int i = pipe_send_i;         // the in-flight write (if any) owns the other buffer
+        if (elems > pipe_send_elems[i]) {
+            if (pipe_send[i]) sycl::free(pipe_send[i], q);
+            pipe_send[i] = sycl::malloc_host<float>(elems, q);
+            pipe_send_elems[i] = pipe_send[i] ? elems : 0;
+        }
+        if (!pipe_send[i] || pp_next_fd < 0) return false;
+        q.memcpy(pipe_send[i], dev, elems * sizeof(float)).wait();
+        const auto t1 = std::chrono::steady_clock::now();
+        pp_send_wait();                    // previous message fully written first
+        if (!pipe_send_ok) return false;
+        pipe_send_i ^= 1;
+        const int fd = pp_next_fd;
+        float* buf = pipe_send[i];
+        const size_t bytes = elems * sizeof(float);
+        pipe_send_thr = std::thread([this, fd, buf, bytes] { pipe_send_ok = fd_write_all(fd, buf, bytes); });
+        if (pt) std::fprintf(stderr, "    PP send %zu B (async): d2h %.2f ms, wait prev %.2f ms\n", bytes,
+            std::chrono::duration<double, std::milli>(t1 - t0).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
+        return true;
+    }
     if (elems > pipe_host_elems) {
         if (pipe_host) sycl::free(pipe_host, q);
         pipe_host = sycl::malloc_host<float>(elems, q);
         pipe_host_elems = pipe_host ? elems : 0;
     }
     if (!pipe_host) return false;
+    static const bool pt = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     q.memcpy(pipe_host, dev, elems * sizeof(float)).wait();
-    return pp_next_fd>=0 && fd_write_all(pp_next_fd,pipe_host,elems*sizeof(float));
+    const auto t1 = std::chrono::steady_clock::now();
+    const bool ok = pp_next_fd>=0 && fd_write_all(pp_next_fd,pipe_host,elems*sizeof(float));
+    if (pt) std::fprintf(stderr, "    PP send %zu B: d2h %.2f ms, socket %.2f ms\n", elems * sizeof(float),
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
+    return ok;
 }
 
 bool Grimoire::pp_recv_hidden(float* dev, size_t elems) {
+    // GRIMOIRE_PP_RECV_PREFETCH=0 = always read synchronously.  Off when DFlash
+    // taps share the socket (their messages interleave with the hidden rows).
+    static const bool prefetch = [] { const char* e = std::getenv("GRIMOIRE_PP_RECV_PREFETCH");
+        return !(e && *e == '0'); }();
+    if (prefetch && !pp_taps && pp_prev_fd >= 0) {
+        static const bool pt = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto ensure = [&](int i, size_t n) {
+            if (n > pipe_recv_elems[i]) {
+                if (pipe_recv[i]) sycl::free(pipe_recv[i], q);
+                pipe_recv[i] = sycl::malloc_host<float>(n, q);
+                pipe_recv_elems[i] = pipe_recv[i] ? n : 0;
+            }
+            return pipe_recv[i] != nullptr;
+        };
+        float* src = nullptr;
+        bool prefetched = false;
+        if (pipe_recv_thr.joinable()) {
+            const size_t pend = pipe_recv_pending;
+            pp_recv_wait();
+            pipe_recv_pending = 0;
+            if (!pipe_recv_ok || pend != elems) return false;   // stream out of step
+            src = pipe_recv[pipe_recv_i];
+            prefetched = true;
+        } else {
+            if (!ensure(pipe_recv_i, elems)) return false;
+            if (!fd_read_all(pp_prev_fd, pipe_recv[pipe_recv_i], elems * sizeof(float))) return false;
+            src = pipe_recv[pipe_recv_i];
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        // start reading the next chunk's rows into the other buffer now
+        const int nxt = pipe_recv_i ^ 1;
+        const size_t next = size_t(pp_next_rows) * size_t(cfg.hidden);
+        pp_next_rows = 0;
+        if (next > 0 && ensure(nxt, next)) {
+            const int fd = pp_prev_fd;
+            float* buf = pipe_recv[nxt];
+            pipe_recv_pending = next;
+            pipe_recv_thr = std::thread([this, fd, buf, next] {
+                pipe_recv_ok = fd_read_all(fd, buf, next * sizeof(float)); });
+        }
+        q.memcpy(dev, src, elems * sizeof(float)).wait();
+        pipe_recv_i = nxt;
+        if (pt) std::fprintf(stderr, "    PP recv %zu B (%s): socket %.2f ms, h2d %.2f ms\n",
+            elems * sizeof(float), prefetched ? "prefetched" : "direct",
+            std::chrono::duration<double, std::milli>(t1 - t0).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
+        return true;
+    }
     if (elems > pipe_host_elems) {
         if (pipe_host) sycl::free(pipe_host, q);
         pipe_host = sycl::malloc_host<float>(elems, q);
         pipe_host_elems = pipe_host ? elems : 0;
     }
     if (!pipe_host) return false;
+    static const bool pt = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     if (pp_prev_fd<0 || !fd_read_all(pp_prev_fd,pipe_host,elems*sizeof(float))) return false;
+    const auto t1 = std::chrono::steady_clock::now();
     q.memcpy(dev, pipe_host, elems * sizeof(float)).wait();
+    if (pt) std::fprintf(stderr, "    PP recv %zu B: socket(wait+read) %.2f ms, h2d %.2f ms\n", elems * sizeof(float),
+        std::chrono::duration<double, std::milli>(t1 - t0).count(),
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
     return true;
 }
 
@@ -7334,6 +7449,9 @@ void Grimoire::release() {
     for (void** p : {(void**)&gemma_vnorm, (void**)&muse_zero,
                      (void**)&muse_zero_f16})
         if (*p) { sycl::free(*p, q); *p = nullptr; }
+    pp_send_wait();
+    if(pp_prev_fd>=0)::shutdown(pp_prev_fd,SHUT_RDWR);   // unblock a pending prefetch
+    pp_recv_wait();
     if(pp_prev_fd>=0){::close(pp_prev_fd);pp_prev_fd=-1;}
     if(pp_next_fd>=0){::close(pp_next_fd);pp_next_fd=-1;}
     for(int& fd:tp_peer_fd)if(fd>=0){::close(fd);fd=-1;}
@@ -7341,6 +7459,10 @@ void Grimoire::release() {
         ::unlink((pp_socket+"-"+std::to_string(pp_rank)).c_str());
     if(tp_enabled()&&tp_rank==0&&!pp_socket.empty())::unlink(pp_socket.c_str());
     if (pipe_host) { sycl::free(pipe_host, q); pipe_host = nullptr; }
+    for (int i = 0; i < 2; ++i) {
+        if (pipe_send[i]) { sycl::free(pipe_send[i], q); pipe_send[i] = nullptr; pipe_send_elems[i] = 0; }
+        if (pipe_recv[i]) { sycl::free(pipe_recv[i], q); pipe_recv[i] = nullptr; pipe_recv_elems[i] = 0; }
+    }
     if (tp_scratch) { sycl::free(tp_scratch, q); tp_scratch = nullptr; tp_scratch_elems = 0; }
     if (tp_act) { sycl::free(tp_act, q); tp_act = nullptr; tp_act_elems = 0; }
     if(tp_expert){sycl::free(tp_expert,q);tp_expert=nullptr;}

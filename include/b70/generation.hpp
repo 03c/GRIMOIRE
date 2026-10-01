@@ -173,10 +173,32 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             return e.prefill(tail);
         static const bool pp_timing = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
         const auto pt0 = std::chrono::steady_clock::now();
+        // Chunk list: the optional first chunk, then the rest split into
+        // EQUAL chunks of at most pp_chunk (GRIMOIRE_PP_EVEN=0 = fixed
+        // pp_chunk plus a remainder, as before).  Both stages build the same
+        // list from the same prompt.
+        static const bool pp_even = [] { const char* v = std::getenv("GRIMOIRE_PP_EVEN");
+            return v && *v == '1'; }();
+        std::vector<size_t> lens;
+        {
+            size_t rem = tail.size();
+            if (pp_first > 0 && size_t(pp_first) < rem) { lens.push_back(size_t(pp_first)); rem -= size_t(pp_first); }
+            if (pp_even) {
+                const size_t n = (rem + size_t(pp_chunk) - 1) / size_t(pp_chunk);
+                for (size_t i = 0; i < n; ++i) {
+                    const size_t l = (rem + (n - i) - 1) / (n - i);
+                    lens.push_back(l); rem -= l;
+                }
+            } else {
+                while (rem > 0) { const size_t l = std::min(rem, size_t(pp_chunk)); lens.push_back(l); rem -= l; }
+            }
+        }
         size_t off = 0;
-        while(off < tail.size()) {
-            const size_t want = (off == 0 && pp_first > 0) ? size_t(pp_first) : size_t(pp_chunk);
-            const size_t len = std::min(want, tail.size() - off);
+        for (size_t ci = 0; ci < lens.size(); ++ci) {
+            const size_t len = lens[ci];
+            // a downstream stage may read the NEXT chunk's boundary rows off
+            // the socket while this chunk computes (0 = nothing to expect)
+            e.pp_expect_next_rows(ci + 1 < lens.size() ? int(lens[ci + 1]) : 0);
             const auto c0 = std::chrono::steady_clock::now();
             if(!e.prefill(std::vector<int32_t>(tail.begin() + off, tail.begin() + off + len)))
                 return false;
