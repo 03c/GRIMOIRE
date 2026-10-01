@@ -817,6 +817,97 @@ sycl::event esgemv_mxfp4(sycl::queue& q, const QuantWeight& w, const float* x, f
 }
 
 // The measured winners only; everything else stays on the SIMT kernels.
+
+// ---------------------------------------------------------------------
+// ESIMD decode GEMV v2 for MXFP4 (M = 1): the MoE decode kernels' design
+// (moe_kernels.cpp) on a plain matrix.  A work-group of K/512 threads owns 2
+// output rows; each thread keeps its 512-element activation slice in
+// registers split even / odd K, streams its slice of both rows with 64-byte
+// block loads and decodes E2M1 in the ALU (nibble bits as an fp16 value times
+// 2^-14, the 2^14 folded into the E8M0 scale) -- no SLM tables, which is what
+// held v1 above at ~270 GB/s.  MEASURED 2026-10-01, tools/decode_probe.cpp,
+// cold weights (rotating copies), engine path -> v2:
+//   N=8192 K=2048 (la_qkv / q)  24.35 -> 17.35 us  (514 GB/s)
+//   N=4096 K=2048 (z)           12.80 ->  9.93 us
+//   N=2048 K=4096 (out / o)     16.41 -> 10.36 us  (v1 R4 KS4 before)
+//   N=1024 K=2048 (k+v)          6.21 ->  3.91 us
+// max relative error 1.5e-7 against the SIMT GEMV.  Not bit-identical to it
+// (summation order).  GRIMOIRE_ESGEMV2=0 = v1 / SIMT as before.
+// ---------------------------------------------------------------------
+namespace es = sycl::ext::intel::esimd;
+template <int N_>
+SYCL_ESIMD_FUNCTION inline void e2m1_split_v2(es::simd<uint8_t, N_> b, es::simd<float, N_>& lo,
+                                              es::simd<float, N_>& hi) {
+    es::simd<uint16_t, N_> u = b;
+    es::simd<uint16_t, N_> l = ((u & 0x7) << 9) | ((u & 0x8) << 12);
+    es::simd<uint16_t, N_> hb = ((u & 0x70) << 5) | ((u & 0x80) << 8);
+    es::simd<sycl::half, N_> lh = l.template bit_cast_view<sycl::half>();
+    es::simd<sycl::half, N_> hh = hb.template bit_cast_view<sycl::half>();
+    lo = lh;
+    hi = hh;
+}
+template <int KP>
+SYCL_ESIMD_FUNCTION inline void mx4_step_v2(const uint8_t* prow, const uint8_t* srow, int st,
+                                            es::simd<float, KP / 2>& xe, es::simd<float, KP / 2>& xo,
+                                            es::simd<float, 16>& acc) {
+    es::simd<uint8_t, 64> pb = es::block_load<uint8_t, 64>(prow + st * 64);
+    es::simd<uint8_t, 4> sb = es::block_load<uint8_t, 4>(srow + st * 4);
+    es::simd<float, 64> wl, wh;
+    e2m1_split_v2<64>(pb, wl, wh);
+    #pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        es::simd<float, 16> part =
+            wl.template select<16, 1>(16 * b) * xe.template select<16, 1>(st * 64 + 16 * b) +
+            wh.template select<16, 1>(16 * b) * xo.template select<16, 1>(st * 64 + 16 * b);
+        acc += part * sycl::bit_cast<float>((uint32_t(sb[b]) + 14u) << 23);
+    }
+}
+constexpr int kEs2KP = 512, kEs2MaxKS = 32;
+template <int R>
+sycl::event esgemv2_mxfp4(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                          const std::vector<sycl::event>& deps) {
+    constexpr int KP = kEs2KP;
+    constexpr int RP = R < 4 ? 4 : R;
+    const int KS = w.K / KP;
+    const uint8_t* pay = w.payload; const uint8_t* scl = static_cast<const uint8_t*>(w.scales);
+    const int64_t rb = w.row_bytes, rs = w.row_scales;
+    const int n_wg = w.N / R;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<kEs2MaxKS * RP * 4>();
+            const int t = int(it.get_local_id(0));
+            const int64_t row0 = int64_t(it.get_group(0)) * R;
+            const int kb = t * KP;
+            es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+            es::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+            es::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+            es::simd<float, 16> acc[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+            #pragma unroll 1
+            for (int st = 0; st < KP / 128; ++st) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    mx4_step_v2<KP>(pay + (row0 + r) * rb + kb / 2, scl + (row0 + r) * rs + kb / 32,
+                                    st, xe, xo, acc[r]);
+            }
+            es::simd<float, RP> red = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) red[r] = es::reduce<float>(acc[r], std::plus<>());
+            if (KS > 1) {
+                es::slm_block_store<float, RP>(t * RP * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[row0 + r] = red[r];
+        });
+    });
+}
+
 bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
                 const std::vector<sycl::event>& deps, sycl::event& out) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV");
@@ -825,6 +916,16 @@ bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
     if (!on || w.fmt != Fmt::MXFP4 || !w.payload || !w.scales || K % 128 != 0 ||
         w.row_bytes < size_t(K / 2) || w.row_scales < size_t(K / 32) || (w.row_bytes % 64) != 0)
         return false;
+    static const bool v2 = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV2");
+        return !(e && *e == '0'); }();
+    // v2 for every K that is whole 512-element slices, up to 32 of them, and
+    // N up to 64K rows (lm_head, 248K rows, stays on the SIMT kernel that
+    // already streams it at ~590 GB/s).
+    if (v2 && K % kEs2KP == 0 && K / kEs2KP <= kEs2MaxKS && N % 2 == 0 && N <= 65536 &&
+        w.row_scales % 4 == 0) {
+        out = esgemv2_mxfp4<2>(q, w, x, y, deps);
+        return true;
+    }
     if (N <= 2048 && K == 4096 && N % 4 == 0) { out = esgemv_mxfp4<4, 4>(q, w, x, y, deps); return true; }
     if (N <= 1024 && K == 2048 && N % 4 == 0) { out = esgemv_mxfp4<4, 4>(q, w, x, y, deps); return true; }
     return false;

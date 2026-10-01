@@ -261,6 +261,50 @@ sycl::event moe_dn_es(sycl::queue& q, QuantWeight w, QuantWeight wd, const int32
     });
 }
 
+
+// Dense MXFP4 GEMV, same design: work-group = KS threads splitting K, a thread
+// owns R rows, activation slice in registers, ALU E2M1 decode.
+template <int R, int KS, int K>
+sycl::event gemv_es(sycl::queue& q, const QuantWeight& w, const float* x, float* y) {
+    constexpr int KP = K / KS;
+    static_assert(KP % 128 == 0, "");
+    constexpr int RP = R < 4 ? 4 : R;
+    const uint8_t* pay = w.payload; const uint8_t* scl = static_cast<const uint8_t*>(w.scales);
+    const int64_t rb = w.row_bytes, rs = w.row_scales;
+    const int n_wg = w.N / R;
+    return q.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        es::slm_init<KS * RP * 4>();
+        const int t = int(it.get_local_id(0));
+        const int64_t row0 = int64_t(it.get_group(0)) * R;
+        const int kb = t * KP;
+        es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+        es::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+        es::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+        es::simd<float, 16> acc[R];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+        #pragma unroll 1
+        for (int st = 0; st < KP / 128; ++st) {
+            #pragma unroll
+            for (int r = 0; r < R; ++r)
+                row_step<KP>(pay + (row0 + r) * rb + kb / 2, scl + (row0 + r) * rs + kb / 32, st, xe, xo, acc[r]);
+        }
+        es::simd<float, RP> red = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < R; ++r) red[r] = es::reduce<float>(acc[r], std::plus<>());
+        if constexpr (KS > 1) {
+            es::slm_block_store<float, RP>(t * RP * 4, red);
+            es::barrier();
+            if (t != 0) return;
+            red = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) y[row0 + r] = red[r];
+    });
+}
+
 static void fill_mxfp4(uint8_t* pay, uint8_t* scl, size_t pb, size_t sb, uint32_t seed) {
     // device-side fill: random nibbles, E8M0 scales 118..129
     gq->parallel_for(sycl::range<1>(pb), [=](sycl::id<1> i) {
@@ -320,7 +364,12 @@ int main(int argc, char** argv) {
                                 {1024, 2048, "k+v"}, {12352, 2048, "la_all"}};
         float* x = sycl::malloc_device<float>(8192, q);
         float* y = sycl::malloc_device<float>(1 << 18, q);
-        q.fill(x, 0.01f, 8192).wait();
+        {
+            std::vector<float> hx(8192);
+            std::mt19937 r2(77); std::uniform_real_distribution<float> U(-1.0f, 1.0f);
+            for (auto& v : hx) v = U(r2);
+            q.memcpy(x, hx.data(), hx.size() * 4).wait();
+        }
         std::printf("== engine launch_gemv, MXFP4, cold (rotating copies, >= 512 MB)\n");
         for (const auto& s : shapes) {
             const size_t pb = size_t(s.N) * s.K / 2, sb = size_t(s.N) * s.K / 32;
@@ -338,6 +387,42 @@ int main(int argc, char** argv) {
             const Timing t = time_it(NIT, L);
             std::printf("  %-9s N=%6d K=%5d  %6.2f MB  dev %7.2f us (%5.0f GB/s)  wall %7.2f us\n",
                         s.name, s.N, s.K, (pb + sb) / 1e6, t.dev_us, (pb + sb) / (t.dev_us * 1e3), t.wall_us);
+            // reference output of copy 0, then the ESIMD candidates
+            std::vector<float> ref(s.N), got(s.N);
+            L(0).wait();
+            q.memcpy(ref.data(), y, s.N * 4).wait();
+            auto cand = [&](const char* nm, auto run) {
+                auto LL = [&](int i) -> sycl::event {
+                    const int c = (i * 7) % copies;
+                    QuantWeight w; w.fmt = Fmt::MXFP4; w.N = s.N; w.K = s.K;
+                    w.payload = pay + size_t(c) * pb; w.scales = scl + size_t(c) * sb;
+                    w.row_bytes = s.K / 2; w.row_scales = s.K / 32;
+                    return run(w);
+                };
+                LL(0).wait();
+                q.memcpy(got.data(), y, s.N * 4).wait();
+                double m = 0, sc = 0;
+                for (float v : ref) sc = std::max(sc, double(std::fabs(v)));
+                for (int i = 0; i < s.N; ++i) m = std::max(m, std::fabs(double(ref[i]) - got[i]) / (sc + 1e-20));
+                const Timing tt = time_it(NIT, LL);
+                std::printf("    %-10s dev %7.2f us (%5.0f GB/s)  wall %7.2f us  err %.1e %s\n", nm, tt.dev_us,
+                            (pb + sb) / (tt.dev_us * 1e3), tt.wall_us, m, m < 1e-4 ? "ok" : "FAIL");
+            };
+            if (s.K == 2048) {
+                cand("R2 KS8", [&](const QuantWeight& w) { return gemv_es<2, 8, 2048>(q, w, x, y); });
+                cand("R4 KS8", [&](const QuantWeight& w) { return gemv_es<4, 8, 2048>(q, w, x, y); });
+                cand("R4 KS4", [&](const QuantWeight& w) { return gemv_es<4, 4, 2048>(q, w, x, y); });
+                cand("R8 KS4", [&](const QuantWeight& w) { return gemv_es<8, 4, 2048>(q, w, x, y); });
+                cand("R2 KS4", [&](const QuantWeight& w) { return gemv_es<2, 4, 2048>(q, w, x, y); });
+                cand("R1 KS8", [&](const QuantWeight& w) { return gemv_es<1, 8, 2048>(q, w, x, y); });
+            } else if (s.K == 4096) {
+                cand("R2 KS8", [&](const QuantWeight& w) { return gemv_es<2, 8, 4096>(q, w, x, y); });
+                cand("R4 KS8", [&](const QuantWeight& w) { return gemv_es<4, 8, 4096>(q, w, x, y); });
+                cand("R2 KS16", [&](const QuantWeight& w) { return gemv_es<2, 16, 4096>(q, w, x, y); });
+                cand("R1 KS16", [&](const QuantWeight& w) { return gemv_es<1, 16, 4096>(q, w, x, y); });
+                cand("R4 KS4", [&](const QuantWeight& w) { return gemv_es<4, 4, 4096>(q, w, x, y); });
+                cand("R1 KS8", [&](const QuantWeight& w) { return gemv_es<1, 8, 4096>(q, w, x, y); });
+            }
             sycl::free(pay, q); sycl::free(scl, q);
         }
         sycl::free(x, q); sycl::free(y, q);
