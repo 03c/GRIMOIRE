@@ -14418,11 +14418,25 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_moe_route_grouped(q,bn,rex,xperm,nullptr,d_cnt,d_off,pinv,d_te,d_tm,
                                          moe_tab_tiles,M,H,E,moe_grouped_rows());
                 sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
+                // launch_moe_route_grouped packs real tiles at the FRONT (an
+                // exclusive scan) and pads [ttot, moe_tab_tiles) with -1.  Each
+                // tile is one non-empty expert at this M (moe_grouped_rows() is
+                // 256, always >= M*top_k here), so ttot <= distinct experts
+                // touched <= M*top_k -- a host-known upper bound, no device
+                // sync needed.  Capping the COMPUTE grid at it (the scan keeps
+                // the full moe_tab_tiles so its own padding is unaffected) skips
+                // idle tiles without risking a real one: MEASURED 2026-10-01,
+                // M=2 (MTP K=1 verify) the full table was 257 tiles for <=16
+                // used.  GRIMOIRE_MOE_TILE_CAP=0 restores the full table.
+                static const bool cap_tiles = !std::getenv("GRIMOIRE_MOE_TILE_CAP") ||
+                    std::atoi(std::getenv("GRIMOIRE_MOE_TILE_CAP")) != 0;
+                const int32_t tcap = cap_tiles
+                    ? std::min<int32_t>(moe_tab_tiles, M*cfg.top_k) : moe_tab_tiles;
                 // M < 32, so every expert has <= 31 rows: the small-batch kernel
                 launch_moe_mxfp4_grouped_small(q,d.moe.gate_up,2*I,true,xperm,hb,
-                                               d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                                               d_te,d_tm,d_off,d_cnt,tcap);
                 launch_moe_mxfp4_grouped_small(q,d.moe.down,H,false,hb,yperm,
-                                               d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                                               d_te,d_tm,d_off,d_cnt,tcap);
                 launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){

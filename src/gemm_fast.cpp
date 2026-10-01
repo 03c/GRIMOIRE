@@ -1836,6 +1836,165 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
         ? gemm_mxfp4_fused_grouped<1>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
         : gemm_mxfp4_fused_grouped<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);
 }
+
+// ---------------------------------------------------------------------
+// GEMV-style grouped MoE for verify-sized batches (M <= 16 tokens, so 1-2
+// rows per touched expert).  MEASURED 2026-10-01, Ornith DFlash2 verify
+// (M = 8): the routed MoE took 14.4 of 29.2 ms -- ~360 us per layer for ~50
+// touched experts, ~2x their weight-streaming time -- because the SLM-staged
+// DPAS kernel dequantizes a 64-row block into SLM for 1-2 rows of A.  Here a
+// work-group of K/512 threads owns R weight rows (EPI 1: R gate/up pairs) of
+// one expert; each thread decodes a 128-K step of its rows ONCE in the ALU
+// (E2M1 nibble -> fp16 = value * 2^-14, 2^14 folded into the E8M0 scale) and
+// applies it to each of the expert's rows (<= 8 per pass) read from the
+// permuted bf16 A.  Same tables, inputs and outputs as the grouped GEMM.
+// GRIMOIRE_MOE_GEMV_SMALL=0 = the SLM-staged kernel.
+// ---------------------------------------------------------------------
+template <int N_>
+SYCL_ESIMD_FUNCTION inline void gv_e2m1(sycl::ext::intel::esimd::simd<uint8_t, N_> b,
+                                        sycl::ext::intel::esimd::simd<float, N_>& lo,
+                                        sycl::ext::intel::esimd::simd<float, N_>& hi) {
+    namespace es = sycl::ext::intel::esimd;
+    es::simd<uint16_t, N_> u = b;
+    es::simd<uint16_t, N_> l = ((u & 0x7) << 9) | ((u & 0x8) << 12);
+    es::simd<uint16_t, N_> hb = ((u & 0x70) << 5) | ((u & 0x80) << 8);
+    es::simd<sycl::half, N_> lh = l.template bit_cast_view<sycl::half>();
+    es::simd<sycl::half, N_> hh = hb.template bit_cast_view<sycl::half>();
+    lo = lh;
+    hi = hh;
+}
+template <int EPI, int R>
+sycl::event moe_mxfp4_gemv_grouped(sycl::queue& q, const QuantWeight& w, int Ne, const sycl_bf16* A,
+                                   void* out, const int32_t* tile_e, const int32_t* off,
+                                   const int32_t* cnt, int T, const std::vector<sycl::event>& deps) {
+    constexpr int KP = 512, TB = 8, NW = (EPI == 1) ? 2 * R : R;   // weight rows per work-group
+    constexpr int RED = NW * TB;                                   // partials per thread
+    const int K = w.K, KS = K / KP;
+    const int FI = Ne / 2;
+    const int units = (EPI == 1) ? FI / R : Ne / R;               // row groups per expert
+    const uint8_t* pay = w.payload;
+    const uint8_t* scl = static_cast<const uint8_t*>(w.scales);
+    const int64_t rb = w.row_bytes, rs = w.row_scales;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * units * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            es::slm_init<16 * RED * 4>();
+            const int t = int(it.get_local_id(0));
+            const int g = int(it.get_group(0));
+            const int tile = g / units, u0 = (g % units) * R;
+            const int e = tile_e[tile];
+            if (e < 0) return;                        // padding of a device-built table
+            const int M = cnt[e];
+            if (M <= 0) return;
+            const int kb = t * KP;
+            // weight rows of this work-group
+            int64_t wr[NW];
+            #pragma unroll
+            for (int r = 0; r < NW; ++r) {
+                if constexpr (EPI == 1) wr[r] = int64_t(e) * Ne + (r < R ? u0 + r : FI + u0 + (r - R));
+                else                    wr[r] = int64_t(e) * Ne + u0 + r;
+            }
+            const sycl_bf16* Ae = A + size_t(off[e]) * K;
+            for (int m0 = 0; m0 < M; m0 += TB) {
+                const int mb = M - m0 < TB ? M - m0 : TB;
+                es::simd<float, 16> acc[NW][TB];
+                #pragma unroll
+                for (int r = 0; r < NW; ++r)
+                    #pragma unroll
+                    for (int j = 0; j < TB; ++j) acc[r][j] = 0.0f;
+                #pragma unroll 1
+                for (int st = 0; st < KP / 128; ++st) {
+                    const int k = kb + st * 128;
+                    es::simd<float, 64> wl[NW], wh[NW];
+                    es::simd<float, 4> sc[NW];
+                    #pragma unroll
+                    for (int r = 0; r < NW; ++r) {
+                        es::simd<uint8_t, 64> pb = es::block_load<uint8_t, 64>(pay + wr[r] * rb + k / 2);
+                        es::simd<uint8_t, 4> sb = es::block_load<uint8_t, 4>(scl + wr[r] * rs + k / 32);
+                        gv_e2m1<64>(pb, wl[r], wh[r]);
+                        es::simd<uint32_t, 4> sv = (es::convert<uint32_t>(sb) + 14u) << 23;
+                        sc[r] = sv.template bit_cast_view<float>();
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < TB; ++j) {
+                        if (j < mb) {
+                            es::simd<uint16_t, 128> ab = es::block_load<uint16_t, 128>(
+                                reinterpret_cast<const uint16_t*>(Ae + size_t(m0 + j) * K + k));
+                            es::simd<uint32_t, 128> au = es::convert<uint32_t>(ab) << 16;
+                            es::simd<float, 128> af = au.template bit_cast_view<float>();
+                            es::simd<float, 64> xe = af.template select<64, 2>(0);
+                            es::simd<float, 64> xo = af.template select<64, 2>(1);
+                            #pragma unroll
+                            for (int r = 0; r < NW; ++r) {
+                                #pragma unroll
+                                for (int b = 0; b < 4; ++b) {
+                                    es::simd<float, 16> part =
+                                        wl[r].template select<16, 1>(16 * b) * xe.template select<16, 1>(16 * b) +
+                                        wh[r].template select<16, 1>(16 * b) * xo.template select<16, 1>(16 * b);
+                                    acc[r][j] += part * float(sc[r][b]);
+                                }
+                            }
+                        }
+                    }
+                }
+                es::simd<float, RED> red = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < NW; ++r)
+                    #pragma unroll
+                    for (int j = 0; j < TB; ++j) red[r * TB + j] = es::reduce<float>(acc[r][j], std::plus<>());
+                if (KS > 1) {
+                    es::barrier();                    // previous pass's reads done
+                    es::slm_block_store<float, RED>(t * RED * 4, red);
+                    es::barrier();
+                    if (t == 0) {
+                        red = 0.0f;
+                        for (int i = 0; i < KS; ++i) red += es::slm_block_load<float, RED>(i * RED * 4);
+                    }
+                }
+                if (t == 0) {
+                    for (int j = 0; j < mb; ++j) {
+                        const size_t row = size_t(off[e]) + m0 + j;
+                        if constexpr (EPI == 1) {
+                            sycl_bf16* hrow = static_cast<sycl_bf16*>(out) + row * FI;
+                            #pragma unroll
+                            for (int r = 0; r < R; ++r) {
+                                const float gv = red[r * TB + j], uv = red[(R + r) * TB + j];
+                                const float v = gv / (1.0f + sycl::exp(-gv)) * uv;
+                                const uint32_t ub = sycl::bit_cast<uint32_t>(v);
+                                const uint32_t rr = (ub + 0x7FFFu + ((ub >> 16) & 1u)) >> 16;
+                                reinterpret_cast<uint16_t*>(hrow)[u0 + r] = uint16_t(rr);
+                            }
+                        } else {
+                            float* orow = static_cast<float*>(out) + row * Ne;
+                            #pragma unroll
+                            for (int r = 0; r < R; ++r) orow[u0 + r] = red[r * TB + j];
+                        }
+                    }
+                }
+            }
+        });
+    });
+}
+bool moe_gemv_small_on() {
+    // Default OFF.  MEASURED 2026-10-01, Ornith DFlash2 math prompt (M=8
+    // verify, both WITH the tile cap above): old SLM-staged kernel 190.3
+    // tok/s (5.56 accepted/step, 217/270 drafted); this GEMV kernel 169.8
+    // tok/s (4.45 accepted/step, 209/321 drafted) -- a net LOSS.  The two
+    // kernels are not bit-identical (different summation order, as noted
+    // where moe_mxfp4_gemv_grouped is defined), and DFlash2's compounding
+    // 7-deep verify is sensitive enough to that reordering that the lower
+    // acceptance rate costs more than the faster per-call MoE time saves.
+    // Native MTP K=1 moved the OTHER way in one run (76.1 -> 95.0 tok/s) --
+    // a single data point, not trusted as a trend.  GRIMOIRE_MOE_GEMV_SMALL=1
+    // opts back in for further tuning; the tile cap in grimoire.cpp is the
+    // part of this change that is a proven, bit-exact win (reproduces the
+    // old kernel's own accept pattern) and stays on unconditionally.
+    static const bool v = [] { const char* e = std::getenv("GRIMOIRE_MOE_GEMV_SMALL");
+        return e && *e == '1'; }();
+    return v;
+}
+
 // Every tile holds at most 32 rows (the caller guarantees it: verify/draft
 // batches).  moe_mxfp4_esimd_small when the shapes allow, else the general path.
 sycl::event launch_moe_mxfp4_grouped_small(sycl::queue& q, const QuantWeight& w, int Ne,
@@ -1844,6 +2003,11 @@ sycl::event launch_moe_mxfp4_grouped_small(sycl::queue& q, const QuantWeight& w,
                                            const int32_t* off, const int32_t* cnt, int T,
                                            const std::vector<sycl::event>& deps) {
     constexpr int TNT = 8;
+    if (moe_gemv_small_on() && w.fmt == Fmt::MXFP4 && w.payload && w.scales && w.K % 512 == 0 &&
+        w.K / 512 <= 16 && w.row_bytes % 64 == 0 && w.row_scales % 4 == 0 &&
+        (swiglu ? (Ne / 2) % 2 == 0 : Ne % 2 == 0))
+        return swiglu ? moe_mxfp4_gemv_grouped<1, 2>(q, w, Ne, A, out, tile_e, off, cnt, T, deps)
+                      : moe_mxfp4_gemv_grouped<0, 2>(q, w, Ne, A, out, tile_e, off, cnt, T, deps);
     // MEASURED 2026-09-30, Ornith DFlash2 verify: 47.8 ms vs 44.9 for the
     // SLM-staged kernel (per-thread dequant is a latency-bound chain, spills).
     static const bool on_env = std::getenv("GRIMOIRE_SMALL_KERNEL") != nullptr;
