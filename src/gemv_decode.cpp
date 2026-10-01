@@ -908,6 +908,70 @@ sycl::event esgemv2_mxfp4(sycl::queue& q, const QuantWeight& w, const float* x, 
     });
 }
 
+
+// BF16 decode GEMV for small matrices (the MoE router, the DeltaNet a/b
+// projection): the v2 geometry -- K/512 threads, 2 rows, activation from L1,
+// weights as 256-byte block loads widened to fp32 by a shift.  The SIMT path
+// ran the 256x2048 router in 5.3 us per layer in-model.
+// GRIMOIRE_ESGEMV2=0 also turns this off.
+template <int R>
+sycl::event esgemv2_bf16(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                         const std::vector<sycl::event>& deps) {
+    constexpr int KP = kEs2KP;
+    constexpr int RP = R < 4 ? 4 : R;
+    const int K = w.K, KS = w.K / KP;
+    const uint16_t* wp = reinterpret_cast<const uint16_t*>(w.payload);
+    const int64_t rstride = w.row_bytes / 2;
+    const int n_wg = w.N / R;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<kEs2MaxKS * RP * 4>();
+            const int t = int(it.get_local_id(0));
+            const int64_t row0 = int64_t(it.get_group(0)) * R;
+            const int kb = t * KP;
+            es::simd<float, 16> acc[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < KP; c += 128) {
+                es::simd<float, 128> xv = es::block_load<float, 128>(x + kb + c);
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    es::simd<uint16_t, 128> wb = es::block_load<uint16_t, 128>(wp + (row0 + r) * rstride + kb + c);
+                    es::simd<uint32_t, 128> wu = es::convert<uint32_t>(wb) << 16;
+                    es::simd<float, 128> wf = wu.template bit_cast_view<float>();
+                    es::simd<float, 128> pr = wf * xv;
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) acc[r] += pr.template select<16, 1>(16 * j);
+                }
+            }
+            es::simd<float, RP> red = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) red[r] = es::reduce<float>(acc[r], std::plus<>());
+            if (KS > 1) {
+                es::slm_block_store<float, RP>(t * RP * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[row0 + r] = red[r];
+        });
+    });
+}
+bool esgemv2_bf16_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                      const std::vector<sycl::event>& deps, sycl::event& out) {
+    static const bool v2 = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV2");
+        return !(e && *e == '0'); }();
+    if (!v2 || w.fmt != Fmt::BF16 || !w.payload || w.K % kEs2KP != 0 || w.K / kEs2KP > kEs2MaxKS ||
+        w.N % 2 != 0 || w.N > 4096 || w.row_bytes % 4 != 0 || w.row_bytes < int64_t(w.K) * 2)
+        return false;
+    out = esgemv2_bf16<2>(q, w, x, y, deps);
+    return true;
+}
+
 bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
                 const std::vector<sycl::event>& deps, sycl::event& out) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV");
@@ -938,6 +1002,10 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
     if constexpr (F == Fmt::MXFP4 && MB == 1) {
         sycl::event ev;
         if (esgemv_try(q, w, x, y, deps, ev)) return ev;
+    }
+    if constexpr (F == Fmt::BF16 && MB == 1) {
+        sycl::event ev;
+        if (esgemv2_bf16_try(q, w, x, y, deps, ev)) return ev;
     }
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;

@@ -24,10 +24,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
 
+namespace b70 {
+sycl::event launch_router_topk(sycl::queue&, const float*, int, int, int32_t*,
+                               float*, bool, const std::vector<sycl::event>&);
+}
 using namespace b70;
 namespace es = sycl::ext::intel::esimd;
 
@@ -305,6 +310,85 @@ sycl::event gemv_es(sycl::queue& q, const QuantWeight& w, const float* x, float*
     });
 }
 
+
+// BF16 GEMV (router): work-group = KS threads x KP elements, R rows.
+template <int R, int KP>
+sycl::event gemv_bf16_es(sycl::queue& q, const uint16_t* w, int N, int K, const float* x, float* y) {
+    constexpr int RP = R < 4 ? 4 : R;
+    const int KS = K / KP;
+    return q.parallel_for(sycl::nd_range<1>(size_t(N / R) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        es::slm_init<32 * RP * 4>();
+        const int t = int(it.get_local_id(0));
+        const int64_t row0 = int64_t(it.get_group(0)) * R;
+        const int kb = t * KP;
+        es::simd<float, 16> acc[R];
+        #pragma unroll
+        for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < KP; c += 128) {
+            es::simd<float, 128> xv = es::block_load<float, 128>(x + kb + c);
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                es::simd<uint16_t, 128> wb = es::block_load<uint16_t, 128>(w + (row0 + r) * K + kb + c);
+                es::simd<uint32_t, 128> wu = es::convert<uint32_t>(wb) << 16;
+                es::simd<float, 128> wf = wu.template bit_cast_view<float>();
+                es::simd<float, 128> pr = wf * xv;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) acc[r] += pr.template select<16, 1>(16 * j);
+            }
+        }
+        es::simd<float, RP> red = 0.0f;
+        #pragma unroll
+        for (int r = 0; r < R; ++r) red[r] = es::reduce<float>(acc[r], std::plus<>());
+        if (KS > 1) {
+            es::slm_block_store<float, RP>(t * RP * 4, red);
+            es::barrier();
+            if (t != 0) return;
+            red = 0.0f;
+            for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; ++r) y[row0 + r] = red[r];
+    });
+}
+// Top-k over E logits in ONE thread, all in registers: per round a vector
+// max, the lowest index holding it, then that lane is retired.  Softmax over
+// the picks in pick order (the engine kernel's order).
+template <int E>
+sycl::event topk_es(sycl::queue& q, const float* logits, int top_k, int32_t* oe, float* ow, bool normalize) {
+    return q.parallel_for(sycl::nd_range<1>(1, 1), [=](sycl::nd_item<1>) SYCL_ESIMD_KERNEL {
+        es::simd<float, E> v = es::block_load<float, E>(logits);
+        es::simd<int, E> idx(0, 1);
+        es::simd_mask<E> live = 1;
+        es::simd<float, 16> sv = 0.0f;
+        es::simd<int, 16> se = 0;
+        const float NEG = -std::numeric_limits<float>::infinity();
+        for (int s = 0; s < top_k; ++s) {
+            es::simd<float, E> vv = es::merge(v, es::simd<float, E>(NEG), live);
+            const float m = es::hmax<float>(vv);
+            es::simd<int, E> cand = es::merge(idx, es::simd<int, E>(0x7fffffff), live && (vv == m));
+            const int i = es::hmin<int>(cand);
+            sv.select<1, 1>(s) = m;
+            se.select<1, 1>(s) = i;
+            live.template select<1, 1>(i) = 0;
+        }
+        float mx = sv[0];
+        for (int s = 1; s < top_k; ++s) { const float c = sv.select<1, 1>(s)[0]; mx = c > mx ? c : mx; }
+        float sum = 0.0f;
+        es::simd<float, 16> ev = 0.0f;
+        for (int s = 0; s < top_k; ++s) {
+            const float e = sycl::exp(float(sv.select<1, 1>(s)[0]) - mx);
+            ev.select<1, 1>(s) = e;
+            sum += e;
+        }
+        if (normalize && sum > 0.0f) ev = ev / sum;
+        for (int s = 0; s < top_k; ++s) {
+            oe[s] = se.select<1, 1>(s)[0];
+            ow[s] = ev.select<1, 1>(s)[0];
+        }
+    });
+}
+
 static void fill_mxfp4(uint8_t* pay, uint8_t* scl, size_t pb, size_t sb, uint32_t seed) {
     // device-side fill: random nibbles, E8M0 scales 118..129
     gq->parallel_for(sycl::range<1>(pb), [=](sycl::id<1> i) {
@@ -536,6 +620,62 @@ int main(int argc, char** argv) {
             return moe_dn_es<RR, 512>(q, L.down, sdn, de + size_t(i) * TK, dw + size_t(i) * TK, go, h, y2, H, TK); })
         DN(1); DN(2); DN(4);
 #undef DN
+    }
+
+    if (what == "all" || what == "router") {
+        const int E = 256, H = 2048, NR = 64;          // 64 layers' worth of routers, rotated
+        uint16_t* rw = sycl::malloc_device<uint16_t>(size_t(NR) * E * H, q);
+        {
+            std::vector<uint16_t> hw(size_t(E) * H);
+            std::mt19937 r3(9); std::normal_distribution<float> G(0.0f, 0.02f);
+            for (auto& v : hw) v = uint16_t(sycl::bit_cast<uint32_t>(G(r3)) >> 16);
+            for (int c = 0; c < NR; ++c) q.memcpy(rw + size_t(c) * E * H, hw.data(), hw.size() * 2);
+            q.wait();
+        }
+        float* x = sycl::malloc_device<float>(H, q);
+        {
+            std::vector<float> hx(H); std::mt19937 r4(5); std::uniform_real_distribution<float> U(-1.0f, 1.0f);
+            for (auto& v : hx) v = U(r4);
+            q.memcpy(x, hx.data(), H * 4).wait();
+        }
+        float* lg = sycl::malloc_device<float>(E, q);
+        float* lg2 = sycl::malloc_device<float>(E, q);
+        int32_t* e1 = sycl::malloc_device<int32_t>(16, q); int32_t* e2 = sycl::malloc_device<int32_t>(16, q);
+        float* w1 = sycl::malloc_device<float>(16, q); float* w2 = sycl::malloc_device<float>(16, q);
+        auto wq = [&](int c) { QuantWeight w; w.fmt = Fmt::BF16; w.N = E; w.K = H;
+            w.payload = reinterpret_cast<const uint8_t*>(rw + size_t(c % NR) * E * H); w.row_bytes = H * 2; return w; };
+        std::printf("== router (bf16 256x2048, cold) + top-8\n");
+        Timing tg = time_it(NIT, [&](int i) { return launch_gemv(q, wq(i), x, lg, {}); });
+        std::printf("  engine gemv           dev %6.2f us  wall %6.2f us\n", tg.dev_us, tg.wall_us);
+        Timing tk = time_it(NIT, [&](int) { return launch_router_topk(q, lg, E, 8, e1, w1, true, {}); });
+        std::printf("  engine topk           dev %6.2f us  wall %6.2f us\n", tk.dev_us, tk.wall_us);
+        Timing tb = time_it(NIT, [&](int i) { launch_gemv(q, wq(i), x, lg, {});
+                                               return launch_router_topk(q, lg, E, 8, e1, w1, true, {}); });
+        std::printf("  engine gemv+topk      wall %6.2f us per pair\n", tb.wall_us);
+        launch_gemv(q, wq(0), x, lg, {}); launch_router_topk(q, lg, E, 8, e1, w1, true, {}).wait();
+        auto check = [&](const char* nm, auto run) {
+            run(0).wait();
+            std::vector<float> a(E), b(E); std::vector<int32_t> ea(8), eb(8); std::vector<float> wa(8), wb(8);
+            q.memcpy(a.data(), lg, E * 4); q.memcpy(b.data(), lg2, E * 4);
+            q.memcpy(ea.data(), e1, 32); q.memcpy(eb.data(), e2, 32); q.memcpy(wa.data(), w1, 32); q.memcpy(wb.data(), w2, 32);
+            q.wait();
+            double m = 0; for (int i = 0; i < E; ++i) m = std::max(m, double(std::fabs(a[i] - b[i])));
+            double mw = 0; bool same = true;
+            for (int i = 0; i < 8; ++i) { same = same && ea[i] == eb[i]; mw = std::max(mw, double(std::fabs(wa[i] - wb[i]))); }
+            const Timing t = time_it(NIT, run);
+            std::printf("  %-20s wall %6.2f us  logit err %.1e  experts %s  weight err %.1e\n", nm, t.wall_us, m,
+                        same ? "SAME" : "DIFFER", mw);
+        };
+        check("es gemv R1 KP512+topk", [&](int i) { gemv_bf16_es<1, 512>(q, reinterpret_cast<const uint16_t*>(wq(i).payload), E, H, x, lg2);
+                                                   return topk_es<256>(q, lg2, 8, e2, w2, true); });
+        check("es gemv R2 KP512+topk", [&](int i) { gemv_bf16_es<2, 512>(q, reinterpret_cast<const uint16_t*>(wq(i).payload), E, H, x, lg2);
+                                                   return topk_es<256>(q, lg2, 8, e2, w2, true); });
+        check("es gemv R1 KP256+topk", [&](int i) { gemv_bf16_es<1, 256>(q, reinterpret_cast<const uint16_t*>(wq(i).payload), E, H, x, lg2);
+                                                   return topk_es<256>(q, lg2, 8, e2, w2, true); });
+        check("engine gemv+es topk", [&](int i) { launch_gemv(q, wq(i), x, lg2, {});
+                                                   return topk_es<256>(q, lg2, 8, e2, w2, true); });
+        Timing tt = time_it(NIT, [&](int) { return topk_es<256>(q, lg2, 8, e2, w2, true); });
+        std::printf("  es topk alone         dev %6.2f us  wall %6.2f us\n", tt.dev_us, tt.wall_us);
     }
     std::printf("DECODE PROBE DONE\n");
     return 0;

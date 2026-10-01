@@ -9,6 +9,8 @@
 //  block. They are therefore written to be fused wherever the data
 //  dependencies allow, not as one kernel per mathematical operation.
 // =====================================================================
+#include <sycl/ext/intel/esimd.hpp>
+#include <limits>
 #include "kernels.hpp"
 #include <climits>
 #include <cmath>
@@ -1020,6 +1022,54 @@ sycl::event router_topk_fixed(sycl::queue& q, const float* logits, int top_k,
             });
     });
 }
+
+// Top-k over 256 router logits in ONE ESIMD thread, all in registers: per
+// round a vector max, the lowest index holding it (the serial kernel's
+// tie-break), then that lane is retired.  The softmax runs over the picks in
+// pick order with the same operations as the sub-group kernel, so the
+// weights are bit-identical for the same logits.  MEASURED 2026-10-01
+// (tools/decode_probe.cpp): 3.2 us device; the sub-group kernel was 8.2-8.8 us
+// per layer in-model.  GRIMOIRE_TOPK_ESIMD=0 = the sub-group kernel.
+template <int E>
+sycl::event router_topk_esimd(sycl::queue& q, const float* logits, int top_k,
+                              int32_t* oe, float* ow, bool normalize,
+                              const std::vector<sycl::event>& deps) {
+    namespace es = sycl::ext::intel::esimd;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(1, 1), [=](sycl::nd_item<1>) SYCL_ESIMD_KERNEL {
+            es::simd<float, E> v = es::block_load<float, E>(logits);
+            es::simd<int, E> idx(0, 1);
+            es::simd_mask<E> live = 1;
+            es::simd<float, 16> sv = 0.0f;
+            es::simd<int, 16> se = 0;
+            const float NEG = -std::numeric_limits<float>::infinity();
+            for (int s = 0; s < top_k; ++s) {
+                es::simd<float, E> vv = es::merge(v, es::simd<float, E>(NEG), live);
+                const float m = es::hmax<float>(vv);
+                es::simd<int, E> cand = es::merge(idx, es::simd<int, E>(0x7fffffff), live && (vv == m));
+                const int i = es::hmin<int>(cand);
+                sv.select<1, 1>(s) = m;
+                se.select<1, 1>(s) = i;
+                live.template select<1, 1>(i) = 0;
+            }
+            float mx = sv[0];
+            for (int s = 1; s < top_k; ++s) { const float c = sv.select<1, 1>(s)[0]; mx = c > mx ? c : mx; }
+            float sum = 0.0f;
+            es::simd<float, 16> ev = 0.0f;
+            for (int s = 0; s < top_k; ++s) {
+                const float e = sycl::exp(float(sv.select<1, 1>(s)[0]) - mx);
+                ev.select<1, 1>(s) = e;
+                sum += e;
+            }
+            if (normalize && sum > 0.0f) ev = ev / sum;
+            for (int s = 0; s < top_k; ++s) {
+                oe[s] = se.select<1, 1>(s)[0];
+                ow[s] = ev.select<1, 1>(s)[0];
+            }
+        });
+    });
+}
 } // namespace
 
 sycl::event launch_router_topk(sycl::queue& q, const float* logits,
@@ -1046,6 +1096,10 @@ sycl::event launch_router_topk(sycl::queue& q, const float* logits,
     // logits, so a genuinely -inf logit cannot be mistaken for an expert
     // that was already picked.
     // Qwen3.5-MoE routes 256 experts; that lands on the register path.
+    static const bool topk_es = [] { const char* e = std::getenv("GRIMOIRE_TOPK_ESIMD");
+        return !(e && *e == '0'); }();
+    if (topk_es && n_experts == 256 && top_k >= 1 && top_k <= 16)
+        return router_topk_esimd<256>(q, logits, top_k, out_expert, out_weight, normalize, deps);
     if (n_experts == SG_SIZE * 16)
         return router_topk_fixed<16>(q, logits, top_k, out_expert, out_weight,
                                      normalize, deps);
