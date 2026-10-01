@@ -24,6 +24,7 @@
 //  bytes per step, irrelevant next to streaming the whole cache.
 // =====================================================================
 #include "kernels.hpp"
+#include <sycl/ext/intel/esimd.hpp>
 #include <limits>
 
 namespace b70 {
@@ -437,8 +438,156 @@ static sycl::event flash_decode_gqa(sycl::queue& q, const AttnParams& p,
     });
 }
 
+
+// ---------------------------------------------------------------------
+// ESIMD split-K decode attention, head_dim 256, FP8 E4M3 KV.
+//
+// The SIMT kernels give a lane one key and walk head_dim serially: at short
+// context one 16-key block costs ~40 us per layer (one thread per EU, a
+// dependent chain -- MEASURED 2026-10-01: splits 8/16/32/64 all 38-42 us),
+// and the GQA kernel is 110 us there.  Here one thread owns GH query heads of
+// one KV head and one split: 16 keys per step, scores vectorized over the
+// keys (s[h] += q[h][d] * K[d][s0..s0+15]), V accumulated as whole 256-dim
+// rows, every K/V byte decoded once for GH heads.  E4M3 decodes exactly
+// through fp16: the byte's 7 magnitude bits at fp16 bits 7..13 plus the sign
+// at bit 15 ARE the value times 2^-8 (subnormals included); the 2^8 folds
+// into q (scores) and into the written partial (V).  Partials keep the
+// [head][split][head_dim] + (m, l) layout, so launch_flash_merge is shared.
+// GRIMOIRE_FLASH_ESIMD=0 = the SIMT kernels.
+// ---------------------------------------------------------------------
+namespace {
+namespace es = sycl::ext::intel::esimd;
+
+template <int N>
+SYCL_ESIMD_FUNCTION inline es::simd<float, N> e4m3x2m8(es::simd<uint8_t, N> b) {
+    es::simd<uint16_t, N> u = b;
+    es::simd<uint16_t, N> hb = ((u & 0x7F) << 7) | ((u & 0x80) << 8);
+    es::simd<sycl::half, N> hv = hb.template bit_cast_view<sycl::half>();
+    return es::simd<float, N>(hv);
+}
+
+template <int GH>
+sycl::event flash_decode_esimd256(sycl::queue& q, const AttnParams& p,
+                                  const std::vector<sycl::event>& deps) {
+    constexpr int HD = 256, NK = 16;
+    const int splits = decode_splits(p);
+    const int G = p.num_heads / p.num_kv_heads;
+    const int hgroups = G / GH;
+    const AttnParams pp = p;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(pp.num_kv_heads) * hgroups * splits, 1),
+            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            const int gid = int(it.get_group(0));
+            const int part = gid % splits;
+            const int rest = gid / splits;
+            const int hg = rest % hgroups;
+            const int kvh = rest / hgroups;
+            const int h0 = kvh * G + hg * GH;
+            const int seq = pp.d_seq_len ? pp.d_seq_len[0] : pp.seq_len;
+            // 16-aligned split boundaries keep every tile load aligned
+            int per = (seq + splits - 1) / splits;
+            per = (per + NK - 1) / NK * NK;
+            const int s_beg = part * per;
+            const int s_end = s_beg + per < seq ? s_beg + per : seq;
+            const float NEG = -std::numeric_limits<float>::infinity();
+            if (s_beg >= s_end) {
+                for (int g = 0; g < GH; ++g) {
+                    const int64_t pidx = int64_t(h0 + g) * splits + part;
+                    pp.part_m[pidx] = NEG;
+                    pp.part_l[pidx] = 0.0f;
+                }
+                return;
+            }
+            const uint8_t* kh = pp.k_cache + int64_t(kvh) * HD * pp.seq_cap;
+            const uint8_t* vh = pp.v_cache + int64_t(kvh) * pp.seq_cap * HD;
+            const uint32_t* kh32 = reinterpret_cast<const uint32_t*>(kh);
+            const unsigned SW = unsigned(pp.seq_cap) - 1;     // K surface: HD rows of seq_cap bytes
+            const float qs = pp.softmax_scale * 256.0f;      // undo K's 2^-8
+            es::simd<float, HD> qv[GH];
+            es::simd<float, HD> acc[GH];
+            float m[GH], l[GH];
+            #pragma unroll
+            for (int g = 0; g < GH; ++g) {
+                qv[g] = es::block_load<float, HD>(pp.q + int64_t(h0 + g) * HD) * qs;
+                acc[g] = 0.0f;
+                m[g] = NEG;
+                l[g] = 0.0f;
+            }
+            es::simd<int, NK> lane(0, 1);
+            for (int s0 = s_beg; s0 < s_end; s0 += NK) {
+                const int nk = s_end - s0 < NK ? s_end - s0 : NK;
+                // every load of the block in flight at once: one memory
+                // latency per 16 keys instead of one per dependent step
+                es::simd<uint32_t, 128> kt[HD / 32];          // [32 dims][16 keys] each
+                #pragma unroll
+                for (int c = 0; c < HD / 32; ++c)
+                    kt[c] = es::load_2d<uint32_t, 4, 32>(kh32, SW, HD - 1, SW, s0 / 4, 32 * c);
+                es::simd<uint8_t, HD> vb[NK];
+                #pragma unroll
+                for (int j = 0; j < NK; ++j)
+                    vb[j] = es::block_load<uint8_t, HD>(vh + int64_t(s0 + j) * HD);
+                es::simd<float, NK> sc[GH];
+                #pragma unroll
+                for (int g = 0; g < GH; ++g) sc[g] = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < HD / 32; ++c) {
+                    es::simd<uint8_t, 512> kb = kt[c].template bit_cast_view<uint8_t>();
+                    es::simd<float, 512> kf = e4m3x2m8<512>(kb);
+                    es::simd<float, 32> qc[GH];
+                    #pragma unroll
+                    for (int g = 0; g < GH; ++g) qc[g] = qv[g].template select<32, 1>(32 * c);
+                    #pragma unroll
+                    for (int r = 0; r < 32; ++r) {
+                        #pragma unroll
+                        for (int g = 0; g < GH; ++g)
+                            sc[g] += float(qc[g][r]) * kf.template select<16, 1>(16 * r);
+                    }
+                }
+                es::simd_mask<NK> valid = lane < nk;
+                es::simd<float, NK> pr[GH];
+                #pragma unroll
+                for (int g = 0; g < GH; ++g) {
+                    es::simd<float, NK> sv = es::merge(sc[g], es::simd<float, NK>(NEG), valid);
+                    const float mb = es::hmax<float>(sv);
+                    const float mn = m[g] > mb ? m[g] : mb;
+                    const float corr = (m[g] == NEG) ? 0.0f : sycl::exp(m[g] - mn);
+                    es::simd<float, NK> e = es::exp(sv - mn);
+                    pr[g] = es::merge(e, es::simd<float, NK>(0.0f), valid);
+                    l[g] = l[g] * corr + es::reduce<float>(pr[g], std::plus<>());
+                    acc[g] *= corr;
+                    m[g] = mn;
+                }
+                #pragma unroll
+                for (int j = 0; j < NK; ++j) {
+                    es::simd<float, HD> vf = e4m3x2m8<HD>(vb[j]);
+                    #pragma unroll
+                    for (int g = 0; g < GH; ++g) acc[g] += float(pr[g][j]) * vf;   // pr = 0 past nk
+                }
+            }
+            #pragma unroll
+            for (int g = 0; g < GH; ++g) {
+                const int64_t pidx = int64_t(h0 + g) * splits + part;
+                es::block_store<float, HD>(pp.partials + pidx * HD, acc[g] * 256.0f);   // undo V's 2^-8
+                pp.part_m[pidx] = m[g];
+                pp.part_l[pidx] = l[g];
+            }
+        });
+    });
+}
+bool flash_esimd_on() {
+    static const bool v = [] { const char* e = std::getenv("GRIMOIRE_FLASH_ESIMD");
+        return !(e && *e == '0'); }();
+    return v;
+}
+} // namespace
+
 sycl::event launch_flash_decode(sycl::queue& q, const AttnParams& p,
                                 const std::vector<sycl::event>& deps) {
+    if (flash_esimd_on() && p.head_dim == 256 && p.num_kv_heads > 0 &&
+        p.num_heads % p.num_kv_heads == 0 && (p.num_heads / p.num_kv_heads) % 2 == 0 &&
+        p.window_left <= 0 && !p.qbits && (p.seq_cap % 16) == 0)
+        return flash_decode_esimd256<2>(q, p, deps);
     static const bool old = std::getenv("GRIMOIRE_FLASH_DECODE_OLD") != nullptr;
     // GC (heads per sub-group) is the largest divisor of the GQA group that
     // keeps GC * head_dim/16 accumulators at 48 or fewer per lane.
