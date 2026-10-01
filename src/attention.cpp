@@ -159,10 +159,25 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                         live = s >= tail || ((pp.qbits[b >> 5] >> (b & 31)) & 1u);
                     }
                     if (live) {
+                        // 16 K bytes in flight per lane before their FMAs:
+                        // the plain loop issued one dependent load per dim
+                        // (256 L2 round trips per 16-key block -- the whole
+                        // 62.8 us of a short-context layer, MEASURED
+                        // 2026-10-01).  Same FMA order over d, so the score
+                        // is bit-identical.
                         float dot = 0.0f;
-                        for (int d = 0; d < HD; ++d)
-                            dot = sycl::fma(qh[d], e4m3_to_f32(
-                                kh[int64_t(d) * pp.seq_cap + s]), dot);
+                        const uint8_t* kp = kh + s;
+                        int d0 = 0;
+                        for (; d0 + 16 <= HD; d0 += 16) {
+                            uint8_t kb[16];
+                            #pragma unroll
+                            for (int u = 0; u < 16; ++u) kb[u] = kp[int64_t(d0 + u) * pp.seq_cap];
+                            #pragma unroll
+                            for (int u = 0; u < 16; ++u)
+                                dot = sycl::fma(qh[d0 + u], e4m3_to_f32(kb[u]), dot);
+                        }
+                        for (; d0 < HD; ++d0)
+                            dot = sycl::fma(qh[d0], e4m3_to_f32(kp[int64_t(d0) * pp.seq_cap]), dot);
                         score = dot * pp.softmax_scale;
                     }
 
@@ -187,15 +202,30 @@ static sycl::event launch_flash_decode_impl(sycl::queue& q, const AttnParams& p,
                     // Every lane visits all SG_SIZE keys of the block but
                     // only the output dims it owns. pj travels by
                     // broadcast, so V is read exactly once.
-                    for (int j = 0; j < SG_SIZE; ++j) {
-                        if (s0 + j >= s_end) break;
-                        const float pb = sycl::group_broadcast(sg, pj, j);
-                        const uint8_t* vrow = vh + int64_t(s0 + j) * pp.head_dim;
+                    // Four keys of V bytes in flight before their FMAs; the
+                    // per-dim FMA chain still runs over j in order.
+                    const int nk = sycl::min(SG_SIZE, s_end - s0);
+                    for (int j0 = 0; j0 < nk; j0 += 4) {
+                        uint8_t vb[4][MAXD];
                         #pragma unroll
-                        for (int d = 0; d < MAXD; ++d)
-                            if (d < dpl)
-                                acc[d] = sycl::fma(pb, e4m3_to_f32(
-                                    vrow[lane + d * SG_SIZE]), acc[d]);
+                        for (int u = 0; u < 4; ++u) {
+                            const int j = sycl::min(j0 + u, nk - 1);
+                            const uint8_t* vrow = vh + int64_t(s0 + j) * pp.head_dim;
+                            #pragma unroll
+                            for (int d = 0; d < MAXD; ++d)
+                                vb[u][d] = d < dpl ? vrow[lane + d * SG_SIZE] : uint8_t(0);
+                        }
+                        #pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int j = j0 + u;
+                            const float pb = sycl::group_broadcast(sg, pj, j);
+                            if (j < nk) {
+                                #pragma unroll
+                                for (int d = 0; d < MAXD; ++d)
+                                    if (d < dpl)
+                                        acc[d] = sycl::fma(pb, e4m3_to_f32(vb[u][d]), acc[d]);
+                            }
+                        }
                     }
                     m = mnew;
                 }

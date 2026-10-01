@@ -968,6 +968,7 @@ sycl::event router_topk_fixed(sycl::queue& q, const float* logits, int top_k,
                     r[slot] = logits[lane + slot * SG_SIZE];
 
                 uint64_t mine = 0;
+                int sel_e = 0; float sel_v = -std::numeric_limits<float>::infinity();
                 for (int s = 0; s < top_k; ++s) {
                     float cv = -std::numeric_limits<float>::infinity();
                     int   ci = INT_MAX, cs = -1;
@@ -985,10 +986,27 @@ sycl::event router_topk_fixed(sycl::queue& q, const float* logits, int top_k,
                                          sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
                                          sycl::minimum<int>());
                     if (ci == bi && cs >= 0) mine |= (1ull << cs);
-                    if (lane == 0) { out_expert[s] = bi; out_weight[s] = bv; }
+                    if (top_k <= SG_SIZE) { if (lane == s) { sel_e = bi; sel_v = bv; } }
+                    else if (lane == 0) { out_expert[s] = bi; out_weight[s] = bv; }
                 }
 
-                if (lane == 0) {
+                // Lane s holds selection s.  This repeats the serial softmax
+                // below, same operations in the same order, on broadcast
+                // registers (bit-identical) instead of 24 dependent global
+                // round trips through out_weight: MEASURED 2026-10-01 the
+                // decode top-k was 10.2 us per layer, 40 layers a token.
+                if (top_k <= SG_SIZE) {
+                    float m = sycl::select_from_group(sg, sel_v, 0);
+                    for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, sycl::select_from_group(sg, sel_v, s));
+                    float sum = 0.0f, my_w = 0.0f;
+                    for (int s = 0; s < top_k; ++s) {
+                        const float e = sycl::exp(sycl::select_from_group(sg, sel_v, s) - m);
+                        sum += e;
+                        if (lane == s) my_w = e;
+                    }
+                    if (normalize && sum > 0.0f) my_w /= sum;
+                    if (lane < top_k) { out_expert[lane] = sel_e; out_weight[lane] = my_w; }
+                } else if (lane == 0) {
                     float m = out_weight[0];
                     for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, out_weight[s]);
                     float sum = 0.0f;
@@ -1056,6 +1074,7 @@ sycl::event launch_router_topk(sycl::queue& q, const float* logits,
                 // so n_experts up to SG_SIZE*64 = 1024 is covered. The
                 // loop it replaced was bounded at 512 by a private array.
                 uint64_t mine = 0;
+                int sel_e = 0; float sel_v = -std::numeric_limits<float>::infinity();
                 for (int s = 0; s < top_k; ++s) {
                     float cv = -std::numeric_limits<float>::infinity();
                     int   ci = INT_MAX;
@@ -1071,12 +1090,29 @@ sycl::event launch_router_topk(sycl::queue& q, const float* logits,
                                          sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
                                          sycl::minimum<int>());
                     if (ci == bi && cs >= 0) mine |= (1ull << cs);
-                    if (lane == 0) { out_expert[s] = bi; out_weight[s] = bv; }
+                    if (top_k <= SG_SIZE) { if (lane == s) { sel_e = bi; sel_v = bv; } }
+                    else if (lane == 0) { out_expert[s] = bi; out_weight[s] = bv; }
                 }
 
                 // softmax over the selected weights; top_k is tiny, so one
                 // lane is the cheapest correct thing here.
-                if (lane == 0) {
+                // Lane s holds selection s.  This repeats the serial softmax
+                // below, same operations in the same order, on broadcast
+                // registers (bit-identical) instead of 24 dependent global
+                // round trips through out_weight: MEASURED 2026-10-01 the
+                // decode top-k was 10.2 us per layer, 40 layers a token.
+                if (top_k <= SG_SIZE) {
+                    float m = sycl::select_from_group(sg, sel_v, 0);
+                    for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, sycl::select_from_group(sg, sel_v, s));
+                    float sum = 0.0f, my_w = 0.0f;
+                    for (int s = 0; s < top_k; ++s) {
+                        const float e = sycl::exp(sycl::select_from_group(sg, sel_v, s) - m);
+                        sum += e;
+                        if (lane == s) my_w = e;
+                    }
+                    if (normalize && sum > 0.0f) my_w /= sum;
+                    if (lane < top_k) { out_expert[lane] = sel_e; out_weight[lane] = my_w; }
+                } else if (lane == 0) {
                     float m = out_weight[0];
                     for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, out_weight[s]);
                     float sum = 0.0f;
@@ -1109,6 +1145,7 @@ sycl::event launch_router_topk_batched(
                 int32_t* oe = out_expert + int64_t(t) * top_k;
                 float* ow = out_weight + int64_t(t) * top_k;
                 uint64_t taken = 0;
+                int sel_e = 0; float sel_v = -std::numeric_limits<float>::infinity();
                 for (int s = 0; s < top_k; ++s) {
                     float cv = -std::numeric_limits<float>::infinity();
                     int ci = INT_MAX, cs = -1;
@@ -1126,9 +1163,24 @@ sycl::event launch_router_topk_batched(
                         sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
                         sycl::minimum<int>());
                     if (ci == bi && cs >= 0 && cs < 64) taken |= 1ull << cs;
-                    if (lane == 0) { oe[s] = bi; ow[s] = bv; }
+                    if (top_k <= SG_SIZE) { if (lane == s) { sel_e = bi; sel_v = bv; } }
+                    else if (lane == 0) { oe[s] = bi; ow[s] = bv; }
                 }
-                if (lane == 0 && normalize) {
+                if (top_k <= SG_SIZE) {
+                    float my_w = sel_v;
+                    if (normalize) {
+                        float m = sycl::select_from_group(sg, sel_v, 0);
+                        for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, sycl::select_from_group(sg, sel_v, s));
+                        float sum = 0.0f;
+                        for (int s = 0; s < top_k; ++s) {
+                            const float e = sycl::exp(sycl::select_from_group(sg, sel_v, s) - m);
+                            sum += e;
+                            if (lane == s) my_w = e;
+                        }
+                        if (sum > 0.0f) my_w /= sum;
+                    }
+                    if (lane < top_k) { oe[lane] = sel_e; ow[lane] = my_w; }
+                } else if (lane == 0 && normalize) {
                     float m = ow[0];
                     for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, ow[s]);
                     float sum = 0.0f;
@@ -1158,6 +1210,7 @@ sycl::event launch_router_topk_bf16_batched(
                 int32_t* oe = out_expert + int64_t(t) * top_k;
                 float* ow = out_weight + int64_t(t) * top_k;
                 uint64_t taken = 0;
+                int sel_e = 0; float sel_v = -std::numeric_limits<float>::infinity();
                 for (int s = 0; s < top_k; ++s) {
                     float cv = -std::numeric_limits<float>::infinity();
                     int ci = INT_MAX, cs = -1;
@@ -1175,9 +1228,24 @@ sycl::event launch_router_topk_bf16_batched(
                         sg, (cv == bv && ci != INT_MAX) ? ci : INT_MAX,
                         sycl::minimum<int>());
                     if (ci == bi && cs >= 0 && cs < 64) taken |= 1ull << cs;
-                    if (lane == 0) { oe[s] = bi; ow[s] = bv; }
+                    if (top_k <= SG_SIZE) { if (lane == s) { sel_e = bi; sel_v = bv; } }
+                    else if (lane == 0) { oe[s] = bi; ow[s] = bv; }
                 }
-                if (lane == 0 && normalize) {
+                if (top_k <= SG_SIZE) {
+                    float my_w = sel_v;
+                    if (normalize) {
+                        float m = sycl::select_from_group(sg, sel_v, 0);
+                        for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, sycl::select_from_group(sg, sel_v, s));
+                        float sum = 0.0f;
+                        for (int s = 0; s < top_k; ++s) {
+                            const float e = sycl::exp(sycl::select_from_group(sg, sel_v, s) - m);
+                            sum += e;
+                            if (lane == s) my_w = e;
+                        }
+                        if (sum > 0.0f) my_w /= sum;
+                    }
+                    if (lane < top_k) { oe[lane] = sel_e; ow[lane] = my_w; }
+                } else if (lane == 0 && normalize) {
                     float m = ow[0];
                     for (int s = 1; s < top_k; ++s) m = sycl::fmax(m, ow[s]);
                     float sum = 0.0f;

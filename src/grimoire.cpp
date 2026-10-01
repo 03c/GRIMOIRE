@@ -9566,7 +9566,9 @@ const float* Grimoire::forward(int token) {
             ap.partials = s.part; ap.part_m = s.pm; ap.part_l = s.pl;
             // FIXED split count so the launch geometry never changes and
             // the graph stays valid; the kernel reads the live length.
-            ap.splits    = GRAPH_SPLITS;
+            static const int dec_splits = [] { const char* e = std::getenv("GRIMOIRE_DECODE_SPLITS");
+                return e && *e ? std::max(1, std::min(MAX_SPLITS, std::atoi(e))) : GRAPH_SPLITS; }();
+            ap.splits    = dec_splits;
             ap.d_seq_len = s.d_seq_len;
             if (i == probe_layer) probe("FA v", s.bbuf, d.kv_heads * d.head_dim);
             // GQA redundancy: this model is 24 query heads over 4 KV heads, so
