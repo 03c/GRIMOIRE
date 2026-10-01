@@ -1575,7 +1575,24 @@ sycl::event moe_mxfp4_esimd(sycl::queue& q, const QuantWeight& w, int Ne, const 
             #undef MOE_ESIMD_FETCH
             if (!active) return;
             const int nb = ng * TNT + tj;
-            if constexpr (EPI == 0) {
+            if constexpr (EPI == 2) {
+                // bf16 output [rows][Ne] (RNE), dword pairs
+                uint32_t* Ob = reinterpret_cast<uint32_t*>(static_cast<sycl_bf16*>(out) + size_t(off[e]) * Ne);
+                const unsigned OW = unsigned(Ne) * 2 - 1;
+                #pragma unroll
+                for (int rb = 0; rb < 4; ++rb)
+                    if (rb < nrb) {
+                        #pragma unroll
+                        for (int hh = 0; hh < 2; ++hh) {
+                            es::simd<float, 128> v = acc.template select<128, 1>((rb * 2 + hh) * 128);
+                            es::simd<uint32_t, 128> u = v.template bit_cast_view<uint32_t>().read();
+                            es::simd<uint32_t, 128> r = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+                            es::simd<uint32_t, 64> lo = r.template select<64, 2>(0), hi = r.template select<64, 2>(1);
+                            es::simd<uint32_t, 64> pk = lo | (hi << 16);
+                            es::store_2d<uint32_t, 8, 8>(Ob, OW, AH, OW, (nb * 32 + 16 * hh) / 2, m0 + 8 * rb, pk);
+                        }
+                    }
+            } else if constexpr (EPI == 0) {
                 float* Oe = static_cast<float*>(out) + size_t(off[e]) * Ne;
                 const unsigned OW = unsigned(Ne) * 4 - 1;
                 if (rowscale) {                       // out row r *= rowscale[off + r]
@@ -1804,7 +1821,11 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
                                      const int32_t* tile_e, const int32_t* tile_mb,
                                      const int32_t* off, const int32_t* cnt, int T,
                                      const std::vector<sycl::event>& deps,
-                                     const float* rowscale) {
+                                     const float* rowscale, bool out_bf16) {
+    if (out_bf16 && (swiglu || rowscale || !moe_esimd_ok(w, Ne, false)))
+        throw std::runtime_error("launch_moe_mxfp4_grouped: bf16 output needs the ESIMD down kernel");
+    if (out_bf16)
+        return moe_mxfp4_esimd<2>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps);
     if (moe_esimd_ok(w, Ne, swiglu))
         return swiglu ? moe_mxfp4_esimd<1>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps)
                       : moe_mxfp4_esimd<0>(q, w, Ne, A, out, tile_e, tile_mb, off, cnt, T, deps,

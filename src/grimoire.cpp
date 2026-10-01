@@ -14394,9 +14394,24 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     sycl_bf16* hb=reinterpret_cast<sycl_bf16*>(mh);
                     launch_moe_mxfp4_grouped(q,d.moe.gate_up,2*I,true,xperm,hb,
                                              d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
+                    // The down GEMM writes bf16 into xperm (free once gate_up has
+                    // read it) and the unpermute reads bf16 -- half the [R][H]
+                    // traffic; expert outputs bf16-rounded, as vLLM keeps them.
+                    // MEASURED 2026-10-01, Ornith 5987 tokens: routed MoE
+                    // 239 -> 224 ms, 24-token text identical to the fp32 path.
+                    // GRIMOIRE_MOE_BF16_OUT=0 = the fp32 path.
+                    static const bool moe_bf16_out = [] {
+                        const char* v = std::getenv("GRIMOIRE_MOE_BF16_OUT");
+                        return !(v && *v == '0'); }();
+                    if(moe_bf16_out && cfg.top_k==8){
+                        launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,xperm,
+                                                 d_te,d_tm,d_off,d_cnt,moe_tab_tiles,{},nullptr,true);
+                        launch_moe_unpermute_bf16(q,xperm,pinv,rwt,r0,M,cfg.top_k,H);
+                    }else{
                     launch_moe_mxfp4_grouped(q,d.moe.down,H,false,hb,yperm,
                                              d_te,d_tm,d_off,d_cnt,moe_tab_tiles);
                     launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
+                    }
                 }else{
                     std::vector<int32_t> hex(R), hp(R), hi(R), count(cfg.n_experts,0), off(cfg.n_experts+1,0);
                     q.memcpy(hex.data(),rex,size_t(R)*sizeof(int32_t)).wait();

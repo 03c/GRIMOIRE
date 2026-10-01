@@ -419,7 +419,8 @@ bool moe_mxfp4_grouped_esimd(const QuantWeight& w, int Ne, bool swiglu);
 sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int Ne,
     bool swiglu, const sycl_bf16* A, void* out, const int32_t* tile_e,
     const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
-    const std::vector<sycl::event>& deps = {}, const float* rowscale = nullptr);
+    const std::vector<sycl::event>& deps = {}, const float* rowscale = nullptr,
+    bool out_bf16 = false);   // !swiglu ESIMD path only: bf16 [rows][Ne] output
 // Same contract, but every tile holds <= 32 rows (verify / draft batches):
 // a per-thread-dequant ESIMD kernel without the SLM staging and barriers.
 sycl::event launch_moe_mxfp4_grouped_small(sycl::queue& q, const QuantWeight& w, int Ne,
