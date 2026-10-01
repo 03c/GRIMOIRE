@@ -8538,7 +8538,14 @@ const float* Grimoire::forward_muse(int token) {
     }
     if (pp_first) {
         // embed, then SCALELESS RMSNorm on the token embedding (Muse: no sqrt(H)).
-        if(!embed_one(token,s.h2))return nullptr;
+        // Under graph capture the embedding must come from s.d_tok, as in
+        // forward(): a host token is baked into the recorded node and every
+        // replay re-embeds the captured token.  MEASURED 2026-10-01: with
+        // graph replay on by default (7b0663e) Muse decoded nothing but
+        // empty tokens; GRIMOIRE_DECODE_GRAPH=0 was coherent.
+        if (recording && !tp_enabled())
+            launch_embed_batched(q, embed, s.d_tok, s.h2, 1, H, none);
+        else if(!embed_one(token,s.h2))return nullptr;
         launch_rmsnorm_residual(q, s.h2, nullptr, muse_zero, s.h, H, eps, none);
     } else {
         // A later stage joins mid-network: it must NOT re-embed (no table
