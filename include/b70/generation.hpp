@@ -171,12 +171,22 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
             return v && *v ? std::max(0, std::atoi(v)) : 0; }();
         if(!e.pp_enabled() || pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
             return e.prefill(tail);
+        static const bool pp_timing = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
+        const auto pt0 = std::chrono::steady_clock::now();
         size_t off = 0;
         while(off < tail.size()) {
             const size_t want = (off == 0 && pp_first > 0) ? size_t(pp_first) : size_t(pp_chunk);
             const size_t len = std::min(want, tail.size() - off);
+            const auto c0 = std::chrono::steady_clock::now();
             if(!e.prefill(std::vector<int32_t>(tail.begin() + off, tail.begin() + off + len)))
                 return false;
+            if(pp_timing) {
+                e.sync();
+                const auto c1 = std::chrono::steady_clock::now();
+                std::fprintf(stderr, "    PP chunk %zu+%zu: start %.1f end %.1f ms\n", off, len,
+                    std::chrono::duration<double, std::milli>(c0 - pt0).count(),
+                    std::chrono::duration<double, std::milli>(c1 - pt0).count());
+            }
             off += len;
         }
         return true;

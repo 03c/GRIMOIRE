@@ -12707,24 +12707,45 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             &d.v_proj,&d.o_proj,&d.router,&d.sh_gu,&d.sh_down,&d.sh_gate_q,&d.o_gate};
         for (auto* w : ws) { W = std::max(W, w->output_rows()); W = std::max(W, w->w.K); }
     }
-    auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
+    // Prefill scratch is CACHED across calls (grow-only, by allocation order):
+    // every prefill used to malloc and free ~25 device buffers -- ~10-20 ms
+    // per call, paid per chunk on every rank by the chunked PP prefill and
+    // per request by everything else.  A block too small for this call is
+    // replaced after a queue drain.  GRIMOIRE_PREFILL_SCRATCH_FREE=1 = the
+    // old malloc/free per call.
+    static const bool pf_free = std::getenv("GRIMOIRE_PREFILL_SCRATCH_FREE") != nullptr;
+    static std::vector<std::tuple<void*, size_t, bool>> pf_cache;
+    size_t pf_ci = 0;
+    auto pf_alloc = [&](size_t bytes, bool shared) -> void* {
+        const size_t b = std::max<size_t>(bytes, 64);
+        if (pf_free) return shared ? sycl::malloc_shared(b, q) : sycl::malloc_device(b, q);
+        const size_t i = pf_ci++;
+        if (i >= pf_cache.size()) pf_cache.emplace_back(nullptr, size_t(0), shared);
+        auto& [p, sz, sh] = pf_cache[i];
+        if (p && sz >= b && sh == shared) return p;
+        if (p) { q.wait(); sycl::free(p, q); p = nullptr; sz = 0; }
+        p = shared ? sycl::malloc_shared(b, q) : sycl::malloc_device(b, q);
+        sz = p ? b : 0; sh = shared;
+        return p;
+    };
+    auto df = [&](size_t n) { return static_cast<float*>(pf_alloc(n * sizeof(float), false)); };
     float *bh=df(size_t(M)*H), *bn=df(size_t(M)*H), *r0=df(size_t(M)*H), *r1=df(size_t(M)*H);
     float *t0=df(size_t(M)*W), *t1=df(size_t(M)*W), *t2=df(size_t(M)*W),
           *t3=df(size_t(M)*W), *t4=df(size_t(M)*W);
     float* la_fused=df(size_t(M)*12352);
-    sycl_bf16* xb=sycl::malloc_device<sycl_bf16>(size_t(M)*W,q);
-    sycl_bf16* bn_bf=sycl::malloc_device<sycl_bf16>(size_t(M)*H,q);
+    sycl_bf16* xb=static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(M)*W)*sizeof(sycl_bf16),false));
+    sycl_bf16* bn_bf=static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(M)*H)*sizeof(sycl_bf16),false));
     // W4A8 activation staging: int8 rows plus one dequant scale per row.
-    int8_t* a8  = w4a8_enabled()?sycl::malloc_device<int8_t>(size_t(M)*std::max(H,W),q):nullptr;
-    float*  a8s = w4a8_enabled()?sycl::malloc_device<float>(size_t(M),q):nullptr;
-    int32_t* dtok=sycl::malloc_device<int32_t>(M,q);
+    int8_t* a8  = w4a8_enabled()?static_cast<int8_t*>(pf_alloc(size_t(size_t(M)*std::max(H,W))*sizeof(int8_t),false)):nullptr;
+    float*  a8s = w4a8_enabled()?static_cast<float*>(pf_alloc(size_t(size_t(M))*sizeof(float),false)):nullptr;
+    int32_t* dtok=static_cast<int32_t*>(pf_alloc(size_t(M)*sizeof(int32_t),false));
     float* batch_logits = next_tokens
-        ? sycl::malloc_device<float>(size_t(M) * cfg.vocab, q) : nullptr;
+        ? static_cast<float*>(pf_alloc(size_t(size_t(M) * cfg.vocab)*sizeof(float),false)) : nullptr;
     // Dense checkpoints legitimately have top_k == 0.  USM zero-byte
     // allocation returns null and used to make their prefill fail before the
     // first kernel, even though these placeholders are never consumed.
     const int alloc_top_k=std::max(1,cfg.top_k);
-    int32_t* rex=sycl::malloc_device<int32_t>(size_t(M)*alloc_top_k,q);
+    int32_t* rex=static_cast<int32_t*>(pf_alloc(size_t(size_t(M)*alloc_top_k)*sizeof(int32_t),false));
     float* rwt=df(size_t(M)*alloc_top_k);
     float* rlog=df(size_t(M)*std::max(1,cfg.n_experts));
     float* mh=df(size_t(M)*std::max(1,cfg.top_k*cfg.moe_inter));
@@ -12877,35 +12898,35 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const size_t bridge_elems=std::max(std::max(std::max(Rpad*std::max(H,I),
                                                 size_t(M)*W),gdn_qkv_elems),
                                        attn_stage_elems);
-    sycl_bf16* xperm=sycl::malloc_device<sycl_bf16>(bridge_elems,q);
+    sycl_bf16* xperm=static_cast<sycl_bf16*>(pf_alloc(size_t(bridge_elems)*sizeof(sycl_bf16),false));
     sycl_bf16* grouped_out=(xe2_grouped||xe2_grouped_mxfp4||xe2_dense_mxfp4||xe2_attention||xe2_gdn||od)
-        ? sycl::malloc_device<sycl_bf16>(std::max(std::max(Rpad*std::max(H,2*I),
-              size_t(M)*W),gdn_tokens*size_t(Hv)*Dv),q) : nullptr;
-    sycl_bf16* moe_res=defer_moe_gather?sycl::malloc_device<sycl_bf16>(Rpad*H,q):nullptr;
+        ? static_cast<sycl_bf16*>(pf_alloc(size_t(std::max(std::max(Rpad*std::max(H,2*I),
+              size_t(M)*W),gdn_tokens*size_t(Hv)*Dv))*sizeof(sycl_bf16),false)) : nullptr;
+    sycl_bf16* moe_res=defer_moe_gather?static_cast<sycl_bf16*>(pf_alloc(size_t(Rpad*H)*sizeof(sycl_bf16),false)):nullptr;
     float* yperm=df(Rpad*H);
-    int32_t* ptoken=sycl::malloc_device<int32_t>(R,q);
+    int32_t* ptoken=static_cast<int32_t*>(pf_alloc(size_t(R)*sizeof(int32_t),false));
     // Grouped MoE tile table: (expert, m-tile) pairs + per-expert offset and
     // row count.  At most E + R/rows tiles.
     const int moe_tab_tiles = std::max(1,cfg.n_experts) + R / std::max(1,moe_grouped_rows()) + 1;
-    int32_t* moe_tab=sycl::malloc_device<int32_t>(
-        size_t(2 * moe_tab_tiles + 2 * std::max(1,cfg.n_experts)), q);
-    int32_t* pinv=sycl::malloc_device<int32_t>(R,q);
+    int32_t* moe_tab=static_cast<int32_t*>(pf_alloc(size_t(
+        size_t(2 * moe_tab_tiles + 2 * std::max(1,cfg.n_experts)))*sizeof(int32_t),false));
+    int32_t* pinv=static_cast<int32_t*>(pf_alloc(size_t(R)*sizeof(int32_t),false));
     // Shared expert through the grouped ESIMD GEMM as ONE expert of M rows:
     // its tile table never changes during a prompt, so it is built once here.
     const int sh_tiles=(M+moe_grouped_rows()-1)/moe_grouped_rows();
-    int32_t* sh_tab=sycl::malloc_device<int32_t>(size_t(2*sh_tiles+2),q);
+    int32_t* sh_tab=static_cast<int32_t*>(pf_alloc(size_t(size_t(2*sh_tiles+2))*sizeof(int32_t),false));
     if(sh_tab){
         std::vector<int32_t> h(size_t(2*sh_tiles+2));
         for(int t=0;t<sh_tiles;++t){h[size_t(t)]=0;h[size_t(sh_tiles+t)]=t;}
         h[size_t(2*sh_tiles)]=0; h[size_t(2*sh_tiles+1)]=M;
         q.memcpy(sh_tab,h.data(),h.size()*sizeof(int32_t)).wait();   // h dies here
     }
-    int32_t* grouped_rows=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_shared<int32_t>(E,q) : nullptr;
-    int32_t* grouped_atomic=(xe2_grouped||xe2_grouped_mxfp4) ? sycl::malloc_device<int32_t>(1,q) : nullptr;
+    int32_t* grouped_rows=(xe2_grouped||xe2_grouped_mxfp4) ? static_cast<int32_t*>(pf_alloc(size_t(E)*sizeof(int32_t),true)) : nullptr;
+    int32_t* grouped_atomic=(xe2_grouped||xe2_grouped_mxfp4) ? static_cast<int32_t*>(pf_alloc(size_t(1)*sizeof(int32_t),false)) : nullptr;
     float* aux0=need_aux?df(size_t(M)*W):nullptr;
     float* aux1=need_aux?df(size_t(M)*W):nullptr;
-    sycl_bf16* aux_xb=need_aux?sycl::malloc_device<sycl_bf16>(size_t(M)*W,q):nullptr;
-    sycl_bf16* aux_out=need_aux?sycl::malloc_device<sycl_bf16>(size_t(M)*W,q):nullptr;
+    sycl_bf16* aux_xb=need_aux?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(M)*W)*sizeof(sycl_bf16),false)):nullptr;
+    sycl_bf16* aux_out=need_aux?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(M)*W)*sizeof(sycl_bf16),false)):nullptr;
     std::vector<void*> mem={bh,bn,r0,r1,t0,t1,t2,t3,t4,la_fused,xb,bn_bf,dtok,rex,rwt,rlog,mh,alpha,beta,moe_tab,
         xperm,yperm,ptoken,pinv};
     if (next_tokens) mem.push_back(batch_logits);
@@ -12916,11 +12937,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     if(xe2_grouped||xe2_grouped_mxfp4){mem.push_back(grouped_rows);mem.push_back(grouped_atomic);}
     mem.push_back(sh_tab);
     const size_t gdn_pitch=gdn_tokens;
-    sycl_bf16* gdn_a=xe2_gdn_raw?sycl::malloc_device<sycl_bf16>(size_t(Hv)*gdn_pitch*64,q):nullptr;
-    sycl_bf16* gdn_w=xe2_gdn_raw?sycl::malloc_device<sycl_bf16>(size_t(Hv)*gdn_pitch*Dk,q):nullptr;
-    sycl_bf16* gdn_u=xe2_gdn_raw?sycl::malloc_device<sycl_bf16>(size_t(Hv)*gdn_pitch*Dv,q):nullptr;
+    sycl_bf16* gdn_a=xe2_gdn_raw?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(Hv)*gdn_pitch*64)*sizeof(sycl_bf16),false)):nullptr;
+    sycl_bf16* gdn_w=xe2_gdn_raw?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(Hv)*gdn_pitch*Dk)*sizeof(sycl_bf16),false)):nullptr;
+    sycl_bf16* gdn_u=xe2_gdn_raw?static_cast<sycl_bf16*>(pf_alloc(size_t(size_t(Hv)*gdn_pitch*Dv)*sizeof(sycl_bf16),false)):nullptr;
     if(xe2_gdn_raw){mem.push_back(gdn_a);mem.push_back(gdn_w);mem.push_back(gdn_u);}
-    int8_t* od_zp=od ? sycl::malloc_device<int8_t>(1,q) : nullptr;
+    int8_t* od_zp=od ? static_cast<int8_t*>(pf_alloc(size_t(1)*sizeof(int8_t),false)) : nullptr;
     if(od_zp){const int8_t z=8;q.memcpy(od_zp,&z,1);mem.push_back(od_zp);}
     for (size_t mi=0;mi<mem.size();++mi) if (!mem[mi]) {
         // MUST match the `mem` initialiser above element for element.
@@ -12935,18 +12956,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         const char* name=mi<sizeof(base_names)/sizeof(base_names[0])?base_names[mi]:"optional";
         std::fprintf(stderr,"    prefill allocation failed: %s (M=%d H=%d W=%d R=%d I=%d)\n",
                      name,M,H,W,R,I);
-        for(void* z:mem) if(z) sycl::free(z,q); return false;
+        if(pf_free) for(void* z:mem) if(z) sycl::free(z,q); return false;
     }
     q.memcpy(dtok,tokens.data(),size_t(M)*sizeof(int32_t));
     if (pp_enabled() && pp_rank > 0) {
         if (!pp_recv_hidden(bh, size_t(M) * H)) {
             std::fprintf(stderr,"PP rank %d: batched hidden receive failed\n",pp_rank);
-            for(void* z:mem) if(z) sycl::free(z,q);
+            if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
         if (!pp_recv_taps(start_pos, M)) {
             std::fprintf(stderr,"PP rank %d: batched tap receive failed\n",pp_rank);
-            for(void* z:mem) if(z) sycl::free(z,q);
+            if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
     } else {
@@ -14541,12 +14562,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         launch_add(q,bh,r1,M*H,{});
         if (!pp_send_hidden(bh, size_t(M) * H)) {
             std::fprintf(stderr,"PP rank %d: batched hidden send failed\n",pp_rank);
-            for(void* z:mem) if(z) sycl::free(z,q);
+            if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
         if (!pp_send_taps(start_pos, M)) {
             std::fprintf(stderr,"PP rank %d: batched tap send failed\n",pp_rank);
-            for(void* z:mem) if(z) sycl::free(z,q);
+            if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
             return false;
         }
     } else {
@@ -14642,7 +14663,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     q.wait();
     if (next_tokens && pp_enabled() && !pp_sync_tokens(*next_tokens)) {
         std::fprintf(stderr, "PP rank %d: verified-token sync failed\n", pp_rank);
-        for(void* z:mem) if(z) sycl::free(z,q);
+        if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);
         return false;
     }
 
@@ -14702,7 +14723,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         double(spec_route_unique) : 0.0);
     }
     for(auto& p:od_plans){if(p.scratch)sycl::free(p.scratch,q);od.destroy(p.p);}
-    for(void* p:mem) sycl::free(p,q);
+    if(pf_free) for(void* p:mem) sycl::free(p,q);
     if(prefill_host_progress){
         std::fprintf(stderr,"    prefill stage: returning\n");std::fflush(stderr);}
     return true;
