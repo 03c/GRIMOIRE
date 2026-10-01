@@ -150,7 +150,38 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
     // logits rather than leaving the previous request's in place.
     const std::vector<int32_t> tail = resumed
         ? std::vector<int32_t>(prompt.begin()+reuse, prompt.end()) : prompt;
-    if(!e.prefill(tail)) {
+    // Pipeline parallel: feed a long prompt in chunks so the ranks overlap --
+    // rank 0 runs its layers on chunk c+1 while rank 1 runs its layers on
+    // chunk c (one whole-prompt prefill left each rank idle while the other
+    // worked: PP=2 prefill was no faster than one card).  Every rank runs this
+    // same code on the same prompt, so the chunking agrees.
+    // GRIMOIRE_PP_CHUNK=<tokens> (0 = one prefill).  MEASURED 2026-10-01,
+    // Ornith 5987 tokens on gpu0+gpu1, GRIMOIRE_PP_LAYERS=19,21: chunk 2048
+    // 0.630 s (9,503 tok/s; one B70: 0.703 s, 8,516), 1536 0.648, 1200
+    // 0.706, 3000 0.749; a short first chunk (GRIMOIRE_PP_CHUNK_FIRST)
+    // is slower.  Default split 24,16: chunk 2048 0.678 s, no chunks 0.737.
+    auto prefill_tail = [&]() -> bool {
+        static const int pp_chunk = [] {
+            const char* v = std::getenv("GRIMOIRE_PP_CHUNK");
+            return v && *v ? std::max(0, std::atoi(v)) : 2048; }();
+        // GRIMOIRE_PP_CHUNK_FIRST: a shorter first chunk fills the pipeline
+        // sooner (the last rank idles until the first chunk arrives).
+        static const int pp_first = [] {
+            const char* v = std::getenv("GRIMOIRE_PP_CHUNK_FIRST");
+            return v && *v ? std::max(0, std::atoi(v)) : 0; }();
+        if(!e.pp_enabled() || pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
+            return e.prefill(tail);
+        size_t off = 0;
+        while(off < tail.size()) {
+            const size_t want = (off == 0 && pp_first > 0) ? size_t(pp_first) : size_t(pp_chunk);
+            const size_t len = std::min(want, tail.size() - off);
+            if(!e.prefill(std::vector<int32_t>(tail.begin() + off, tail.begin() + off + len)))
+                return false;
+            off += len;
+        }
+        return true;
+    };
+    if(!prefill_tail()) {
         // A rejected batch may already have submitted work. Drain before a
         // sequential retry so no token is processed twice.  A resumed
         // request must NOT reset here -- that would discard the very

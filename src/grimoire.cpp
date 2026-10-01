@@ -2747,7 +2747,10 @@ struct Grimoire {
     int   dag_mask = 0; // 1 linear-attn, 2 full-attn, 4 MoE/shared overlap
     // Exhaustive B70 sweep: all four fusions preserve the token hash and,
     // together with GEMV 16/1, are the fastest coherent configuration.
-    int   fusion_mask = 15; // 1 DN norm+gate, 2 QK norm+rope, 4 MoE join, 8 pos
+    // 1 DN norm+gate, 2 QK norm+rope, 4 MoE join, 8 pos, 16 DN conv+L2.
+    // GRIMOIRE_FUSION_MASK overrides the default.
+    int   fusion_mask = []{ const char* e = std::getenv("GRIMOIRE_FUSION_MASK");
+                            return e && *e ? std::atoi(e) : 15; }();
     std::vector<sycl::event> dag_tail;
     sycl::event dag_logits;
     bool  tl_done = false;
@@ -7142,7 +7145,28 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         };
         restore();
         const std::vector<int32_t> tail(prompt.begin()+reused, prompt.end());
-        if (!prefill(tail, nullptr, nullptr, false)) {
+        // Pipeline parallel: feed a long prompt in chunks so the ranks overlap
+        // -- rank 0 runs its layers on chunk c+1 while rank 1 runs its layers
+        // on chunk c.  One whole-prompt prefill leaves every rank idle while
+        // the others work, so PP=2 prefill was no faster than one card.
+        // Every rank runs this same code on the same prompt, so the chunking
+        // agrees.  GRIMOIRE_PP_CHUNK=<tokens> (0 = one prefill).
+        static const int pp_chunk = [] {
+            const char* v = std::getenv("GRIMOIRE_PP_CHUNK");
+            return v && *v ? std::max(0, std::atoi(v)) : 2048; }();
+        auto prefill_tail = [&]() -> bool {
+            if (!pp_enabled() || pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
+                return prefill(tail, nullptr, nullptr, false);
+            std::fprintf(stderr, "    PP chunked prefill: %zu tokens in chunks of %d (rank %d)\n",
+                         tail.size(), pp_chunk, pp_rank);
+            for (size_t off = 0; off < tail.size(); off += size_t(pp_chunk)) {
+                const size_t len = std::min(size_t(pp_chunk), tail.size() - off);
+                const std::vector<int32_t> chunk(tail.begin() + off, tail.begin() + off + len);
+                if (!prefill(chunk, nullptr, nullptr, false)) return false;
+            }
+            return true;
+        };
+        if (!prefill_tail()) {
             // A failed prefill may already have advanced recurrent state.
             sync(); restore();
             for (int32_t t : tail)
