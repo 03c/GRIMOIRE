@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "gemv_step.hpp"
+#include <sycl/ext/intel/esimd.hpp>
 #include <cstdlib>
 
 namespace b70 {
@@ -704,9 +705,139 @@ int gemv_opt_override() {
     return v;
 }
 
+
+// ---------------------------------------------------------------------
+// ESIMD decode GEMV for MXFP4 (M = 1), the llm-scaler shape: a work-group of
+// KS threads owns R output rows, each thread streams its K slice of those
+// rows with contiguous 64-byte block loads, the activation comes from L1
+// (no SLM staging), E2M1 decodes through two 1 KB SLM tables (byte -> value of
+// the low / high nibble) and the E8M0 scale applies once per 32-element block.
+// MEASURED IN-MODEL (GRIMOIRE_TIMELINE, Ornith decode, weights from DRAM):
+//   N=2048 K=4096 (out / o)  R4 KS4  16.0 / 16.4 us  (SIMT gemv_wide 20.0 / 20.2)
+//   N=1024 K=2048 (k+v)      R4 KS4   9.1 us         (10.7)
+//   N=4096 K=2048 (z)        R8 KS2  21.1 us         (14.5 -- NOT used)
+// tools/esgemv_probe.cpp re-runs the same weights back to back, so its
+// numbers are L2-hot (13.1 / 5.1 / 13.4 us) -- do not trust them alone.
+// The sum is in a different order than GemvStep's, so it is NOT
+// bit-identical to the SIMT GEMV; exact speculative verify (which batches
+// rows through the SIMT kernel) keeps using that one only for M > 1, and
+// decode goes through here for these shapes.  GRIMOIRE_ESGEMV=0 = off.
+// ---------------------------------------------------------------------
+namespace {
+const float* esgemv_lut(sycl::queue& q) {
+    static float* lut = nullptr;
+    if (!lut) {
+        lut = sycl::malloc_device<float>(512, q);
+        float* L = lut;                          // kernels cannot touch a static
+        // built by a kernel: no host buffer, no wait -- safe under graph capture
+        q.parallel_for(sycl::range<1>(512), [=](sycl::id<1> i) {
+            const int b = int(i[0]) & 255, nib = int(i[0]) < 256 ? (b & 15) : (b >> 4);
+            const int m = nib & 7;
+            const float v = m < 2 ? 0.5f * float(m) : float(2 + (m & 1)) * float(1 << (m >> 1)) * 0.25f;
+            L[i[0]] = (nib & 8) ? -v : v;
+        });
+    }
+    return lut;
+}
+
+template <int R, int KS>
+sycl::event esgemv_mxfp4(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                         const std::vector<sycl::event>& deps) {
+    namespace es = sycl::ext::intel::esimd;
+    const float* lut = esgemv_lut(q);
+    const int N = w.N, K = w.K;
+    const uint8_t* pay = w.payload;
+    const uint8_t* scl = static_cast<const uint8_t*>(w.scales);
+    const size_t rowB = w.row_bytes, rowS = w.row_scales;
+    const int groups = (N + R - 1) / R;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<2048 + KS * R * 4>();
+            const int t = int(it.get_local_id(0));
+            for (int i = t; i < 16; i += KS)
+                es::slm_block_store<float, 32>(i * 128, es::block_load<float, 32>(lut + i * 32));
+            es::barrier();
+            const int n0 = int(it.get_group(0)) * R;
+            const int kp = K / KS, kb = t * kp;
+            es::simd<float, 16> tot[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) tot[r] = 0.0f;
+            for (int k = kb; k < kb + kp; k += 128) {
+                es::simd<float, 128> xv = es::block_load<float, 128>(x + k);
+                es::simd<uint8_t, 64> pb[R];
+                es::simd<uint32_t, 4> sb[R];
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int n = n0 + r < N ? n0 + r : N - 1;
+                    pb[r] = es::block_load<uint8_t, 64>(pay + size_t(n) * rowB + k / 2);
+                    es::simd<uint8_t, 4> s4 = es::block_load<uint8_t, 4>(scl + size_t(n) * rowS + k / 32);
+                    sb[r] = es::convert<uint32_t>(s4);
+                }
+                #pragma unroll
+                for (int b = 0; b < 4; ++b) {
+                    es::simd<float, 32> x32 = xv.template select<32, 1>(32 * b);
+                    es::simd<float, 16> xe = x32.template select<16, 2>(0);
+                    es::simd<float, 16> xo = x32.template select<16, 2>(1);
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        es::simd<uint8_t, 16> by = pb[r].template select<16, 1>(16 * b);
+                        es::simd<uint32_t, 16> addr = es::convert<uint32_t>(by) << 2;
+                        es::simd<float, 16> wl = es::slm_gather<float, 16>(addr);
+                        es::simd<float, 16> wh = es::slm_gather<float, 16>(addr + 1024u);
+                        es::simd<float, 16> part = wl * xe + wh * xo;
+                        const uint32_t e = sb[r][b];
+                        const float sc = sycl::bit_cast<float>(e ? e << 23 : 0x00400000u);
+                        tot[r] += part * sc;
+                    }
+                }
+            }
+            float res[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) res[r] = es::reduce<float>(tot[r], std::plus<>());
+            if constexpr (KS == 1) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r) if (n0 + r < N) y[n0 + r] = res[r];
+            } else {
+                es::simd<float, R> rv;
+                #pragma unroll
+                for (int r = 0; r < R; ++r) rv[r] = res[r];
+                es::slm_block_store<float, R>(2048 + t * R * 4, rv);
+                es::barrier();
+                if (t == 0) {
+                    es::simd<float, R> acc = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < KS; ++j) acc += es::slm_block_load<float, R>(2048 + j * R * 4);
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) if (n0 + r < N) y[n0 + r] = acc[r];
+                }
+            }
+        });
+    });
+}
+
+// The measured winners only; everything else stays on the SIMT kernels.
+bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                const std::vector<sycl::event>& deps, sycl::event& out) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV");
+        return !(e && *e == '0'); }();
+    const int N = w.N, K = w.K;
+    if (!on || w.fmt != Fmt::MXFP4 || !w.payload || !w.scales || K % 128 != 0 ||
+        w.row_bytes < size_t(K / 2) || w.row_scales < size_t(K / 32) || (w.row_bytes % 64) != 0)
+        return false;
+    if (N <= 2048 && K == 4096 && N % 4 == 0) { out = esgemv_mxfp4<4, 4>(q, w, x, y, deps); return true; }
+    if (N <= 1024 && K == 2048 && N % 4 == 0) { out = esgemv_mxfp4<4, 4>(q, w, x, y, deps); return true; }
+    return false;
+}
+} // namespace
+
 template <Fmt F, int MB = 1>
 sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
                      float* y, const std::vector<sycl::event>& deps, int mc = 1) {
+    if constexpr (F == Fmt::MXFP4 && MB == 1) {
+        sycl::event ev;
+        if (esgemv_try(q, w, x, y, deps, ev)) return ev;
+    }
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;
     if (epl > GemvGeom<F>::EPL_MAX) epl = GemvGeom<F>::EPL_MAX;
