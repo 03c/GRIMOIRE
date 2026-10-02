@@ -8,7 +8,7 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status:** Active development. The repository contains the engine and its ongoing optimization work. A ready-to-use inference image or downloadable model package will be added here later.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. A ready-to-use inference image or downloadable model package will be added here later.
 
 ## Why GRIMOIRE was created
 
