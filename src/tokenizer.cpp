@@ -215,7 +215,23 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
             const std::string content = json_string(js, r);
             special_ids_[id] = 1;
             special_by_text_[content] = id;
-            if (size_t(id) < id_to_tok_.size()) id_to_tok_[size_t(id)] = content;
+            // Added/special tokens are almost always appended AFTER the base
+            // BPE vocab, at ids beyond id_to_tok_'s initial size (set from
+            // the base vocab alone, before this loop runs).  The old guard
+            // (`if id < size()`) silently dropped every such mapping instead
+            // of growing the vector -- vocab_size() (== id_to_tok_.size())
+            // then under-reported the model's real vocabulary by exactly
+            // the special-token count.  MEASURED 2026-10-02: Ornith's base
+            // vocab is 248,044; <|im_start|>/<|im_end|> sit at 248,045 and
+            // 248,046.  Every chat-templated prompt starts with
+            // <|im_start|>, so grimoire-server's bounds check
+            // (generation_budget, using this vocab_size()) rejected EVERY
+            // /v1/chat/completions request with "prompt token outside model
+            // vocabulary" -- while /v1/completions, which never emits a
+            // special token, was unaffected.  Growing the vector here fixes
+            // vocab_size() for every caller, not just the server.
+            if (size_t(id) >= id_to_tok_.size()) id_to_tok_.resize(size_t(id) + 1);
+            id_to_tok_[size_t(id)] = content;
             tok_to_id_[content] = id;
             q = js.find("\"id\"", idp + 1);
             if (q == std::string::npos || q > end) break;
