@@ -2129,6 +2129,15 @@ struct Grimoire {
     bool pp_recv_taps(int first,int rows);
     int  pp_sync_token(int token);
     bool tp_allgather(float* dev, int elems, int begin, int count);
+    // N independent TP-sharded GEMVs (same read-only input, disjoint output
+    // buffers, no inter-dependency) exchanged in ONE socket round trip
+    // instead of N -- each spec is {device buffer, its FULL (unsharded)
+    // element count}.  The caller must already have written this rank's
+    // local [begin,begin+count) slice of EVERY spec before calling this
+    // (gemv_any's TP branch does that for a single weight; the batched
+    // call sites below do it for each weight in the group, then call this
+    // once).  See its definition for the measured win.
+    bool tp_allgather_multi(const std::vector<std::pair<float*,int>>& specs);
     bool tp_allreduce_sum(float* dev, int elems);
     // Every TP rank contributes `value`; every rank gets back the common
     // value if all were equal, else -1.  One int each way, on the control
@@ -2985,6 +2994,21 @@ struct Grimoire {
         return launch_gemv(q, dq.w, x, y, deps);
     }
 
+    // The compute half of gemv_any's TP branch, with NO wait and NO gather:
+    // for callers that issue several of these against independent output
+    // buffers (same input, no data dependency between them) and then gather
+    // all of them in ONE tp_allgather_multi call instead of one each.
+    // dq MUST be TP-sharded; callers check dq.tp_sharded() themselves so
+    // they can fall back to gemv_any for the (rare) replicated case.
+    sycl::event gemv_tp_local(const DevQuant& dq, const float* x, float* y,
+                              const std::vector<sycl::event>& deps) {
+        const int begin = dq.row_begin;
+        if (dq.has_i4())
+            return launch_gemv_int4sym(q, dq.i4, dq.i4s, x, y + begin,
+                                       dq.w.N, dq.w.K, deps);
+        return launch_gemv(q, dq.w, x, y + begin, deps);
+    }
+
     // Route a single-token MXFP4 projection through oneDNN. Opt-in while it is
     // being measured; the plan is cached per (N,K) because building a oneDNN
     // primitive_desc per call would dwarf the 48 us it takes to run.
@@ -3718,6 +3742,82 @@ bool Grimoire::tp_allgather(float* dev, int elems, int begin, int count) {
            !fd_read_all(fd,pipe_host,size_t(elems)*sizeof(float)))return false;
     }
     q.memcpy(dev,pipe_host,size_t(elems)*sizeof(float)).wait();
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Batched all-gather for several independent TP-sharded weights at once.
+//
+// MEASURED 2026-10-02, Ornith decode, TP=2 on two B70s: per-weight
+// tp_allgather (gemv_any's TP branch: GEMV -> ev.wait() -> full D2H/socket/
+// H2D round trip) is called roughly 280-300 times per token (one per
+// TP-sharded dense projection, x40 layers), against a plain-decode token
+// cost of 5.0 ms on one card -- the explicit per-call wait plus the
+// syscall/queue-sync overhead of that many isolated round trips is what
+// made TP decode 36 tok/s against one card's 199.
+//
+// This does the same algebra (every rank already knows every spec's FULL
+// element count and the deterministic (elems*rank)/tp_world split
+// tp_shard_rows used to shard it, so no header or negotiation is needed)
+// but for N specs at once: this rank's local slice of EVERY spec is
+// written directly into its absolute offset inside ONE pinned buffer,
+// every other rank's slice is read into the same buffer's matching gaps,
+// and the fully assembled buffer is sent back in ONE message -- one round
+// trip for the whole group instead of N.
+// ---------------------------------------------------------------------
+bool Grimoire::tp_allgather_multi(const std::vector<std::pair<float*,int>>& specs) {
+    if (!tp_enabled() || tp_peer_fd.empty()) return false;
+    if (specs.empty()) return true;
+    const int n = int(specs.size());
+    auto slice = [&](int elems, int rank) -> std::pair<int,int> {
+        const int b = (elems * rank) / tp_world;
+        const int e = (elems * (rank + 1)) / tp_world;
+        return {b, e - b};
+    };
+    size_t total = 0;
+    const size_t nsz = size_t(n);
+    std::vector<size_t> base(nsz);
+    for (int i = 0; i < n; ++i) { base[size_t(i)] = total; total += size_t(specs[size_t(i)].second); }
+    if (total > pipe_host_elems) {
+        if (pipe_host) sycl::free(pipe_host, q);
+        pipe_host = sycl::malloc_host<float>(total, q);
+        pipe_host_elems = pipe_host ? total : 0;
+    }
+    if (!pipe_host) return false;
+    std::vector<int> my_begin(nsz), my_count(nsz);
+    for (int i = 0; i < n; ++i) {
+        const auto [b, c] = slice(specs[size_t(i)].second, tp_rank);
+        my_begin[size_t(i)] = b; my_count[size_t(i)] = c;
+        if (c > 0)
+            q.memcpy(pipe_host + base[size_t(i)] + size_t(b),
+                     specs[size_t(i)].first + b, size_t(c) * sizeof(float));
+    }
+    q.wait();
+    if (tp_rank == 0) {
+        for (int r = 1; r < tp_world; ++r) {
+            for (int i = 0; i < n; ++i) {
+                const auto [b, c] = slice(specs[size_t(i)].second, r);
+                if (c > 0 && !fd_read_all(tp_peer_fd[size_t(r)],
+                        pipe_host + base[size_t(i)] + size_t(b), size_t(c) * sizeof(float)))
+                    return false;
+            }
+        }
+        for (int r = 1; r < tp_world; ++r)
+            if (!fd_write_all(tp_peer_fd[size_t(r)], pipe_host, total * sizeof(float)))
+                return false;
+    } else {
+        const int fd = tp_peer_fd[0];
+        for (int i = 0; i < n; ++i)
+            if (my_count[size_t(i)] > 0 && !fd_write_all(fd,
+                    pipe_host + base[size_t(i)] + size_t(my_begin[size_t(i)]),
+                    size_t(my_count[size_t(i)]) * sizeof(float)))
+                return false;
+        if (!fd_read_all(fd, pipe_host, total * sizeof(float))) return false;
+    }
+    for (int i = 0; i < n; ++i)
+        q.memcpy(specs[size_t(i)].first, pipe_host + base[size_t(i)],
+                 size_t(specs[size_t(i)].second) * sizeof(float));
+    q.wait();
     return true;
 }
 
@@ -9562,7 +9662,38 @@ const float* Grimoire::forward(int token) {
 
         if (d.kind == LayerKind::LINEAR_ATTN) {
             const int qkv_ch = d.la_qkv.output_rows(); // logical full shape
-            gemv_any(d.la_qkv, s.h2, s.qkv, none);
+            // Batched TP gather: la_qkv, la_ab and la_z all read the SAME
+            // input (s.h2) and write disjoint buffers with no dependency
+            // between them -- only their CONSUMERS (conv1d, deltanet_gates,
+            // the gated norm below) need the fully gathered result.  Moving
+            // la_ab's and la_z's local compute up here and gathering all
+            // three together removes 2 of every 3 round trips on every
+            // DeltaNet layer (30 of Ornith's 40).  This only reorders WHEN
+            // each GEMV's own compute is issued, not any model math; the
+            // MK() timeline markers below keep their names and positions,
+            // so under TP "ab gemv + gates" / "z gemv" show mostly the
+            // gates/consumer cost (their GEMV already ran up here) while
+            // "la_qkv gemv" absorbs the batched gather -- a profiling
+            // relabeling, not a correctness change.  Falls back to the
+            // per-weight path if any of the three isn't actually TP-sharded.
+            // GRIMOIRE_TP_BATCH_DN=0 disables it.
+            static const bool tp_batch_dn = !std::getenv("GRIMOIRE_TP_BATCH_DN") ||
+                std::atoi(std::getenv("GRIMOIRE_TP_BATCH_DN")) != 0;
+            const bool batch_dn = tp_enabled() && tp_batch_dn &&
+                d.la_qkv.tp_sharded() && d.la_ab.tp_sharded() && d.la_z.tp_sharded();
+            if (batch_dn) {
+                gemv_tp_local(d.la_qkv, s.h2, s.qkv, none);
+                gemv_tp_local(d.la_ab, s.h2, s.abuf, none);
+                gemv_tp_local(d.la_z, s.h2, s.zbuf, none);
+                q.wait();
+                const std::vector<std::pair<float*,int>> dn_specs{
+                    {s.qkv, qkv_ch}, {s.abuf, d.la_ab.output_rows()},
+                    {s.zbuf, d.la_z.output_rows()}};
+                if (!tp_allgather_multi(dn_specs))
+                    throw std::runtime_error("TP batched DN all-gather failed");
+            } else {
+                gemv_any(d.la_qkv, s.h2, s.qkv, none);
+            }
             if (i == probe_layer) probe("L0 qkv proj", s.qkv, qkv_ch);
             MK("  la_qkv gemv");
 
@@ -9590,7 +9721,7 @@ const float* Grimoire::forward(int token) {
             MK("  l2norm_heads");
 
             // one launch produces both a and b, laid out back to back
-            gemv_any(d.la_ab, s.h2, s.abuf, none);
+            if (!batch_dn) gemv_any(d.la_ab, s.h2, s.abuf, none);
             launch_deltanet_gates(q, s.abuf, s.abuf + Hv, d.la_Alog, d.la_dtb,
                                   s.alpha, s.beta, Hv, none);
             MK("  ab gemv + gates");
@@ -9610,7 +9741,7 @@ const float* Grimoire::forward(int token) {
             // Normalising the PRODUCT instead -- rms_norm(out * silu(z))
             // -- is a different operation and rescales by the gate's own
             // magnitude, which quietly destroys the output distribution.
-            gemv_any(d.la_z, s.h2, s.zbuf, none);
+            if (!batch_dn) gemv_any(d.la_z, s.h2, s.zbuf, none);
             if (i == probe_layer) probe("L0 z", s.zbuf, Hv * Dv);
             MK("  z gemv");
             if (fusion_mask & 1)
@@ -9633,15 +9764,38 @@ const float* Grimoire::forward(int token) {
             // head, so only half its rows are queries. Feeding all of
             // them to attention treats gate values as queries.
             const bool gated = (QD == 2 * cfg.n_heads * d.head_dim);
-            gemv_any(d.q_proj, s.h2, s.qkv, none);
+            // Batched TP gather: q/k/v read the SAME input (s.h2) and write
+            // disjoint buffers with no dependency between them, so under TP
+            // all three local GEMVs can be issued back to back and gathered
+            // in ONE round trip instead of three.  MEASURED 2026-10-02: see
+            // tp_allgather_multi's own comment for the per-call overhead this
+            // removes.  Falls back to the per-weight path whenever any of
+            // the three is not actually TP-sharded (tiny-vector replication)
+            // or the model routes v through the K2 sparse value lookup
+            // instead of a plain GEMV.  GRIMOIRE_TP_BATCH_QKV=0 disables it.
+            static const bool tp_batch_qkv = !std::getenv("GRIMOIRE_TP_BATCH_QKV") ||
+                std::atoi(std::getenv("GRIMOIRE_TP_BATCH_QKV")) != 0;
+            if (tp_enabled() && tp_batch_qkv && !d.k2_sparse &&
+                d.q_proj.tp_sharded() && d.k_proj.tp_sharded() && d.v_proj.tp_sharded()) {
+                gemv_tp_local(d.q_proj, s.h2, s.qkv, none);
+                gemv_tp_local(d.k_proj, s.h2, s.zbuf, none);
+                gemv_tp_local(d.v_proj, s.h2, s.bbuf, none);
+                q.wait();
+                const std::vector<std::pair<float*,int>> qkv_specs{
+                    {s.qkv, QD}, {s.zbuf, KD}, {s.bbuf, d.v_proj.output_rows()}};
+                if (!tp_allgather_multi(qkv_specs))
+                    throw std::runtime_error("TP batched qkv all-gather failed");
+            } else {
+                gemv_any(d.q_proj, s.h2, s.qkv, none);
+                gemv_any(d.k_proj, s.h2, s.zbuf, none);
+                if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
+                else gemv_any(d.v_proj, s.h2, s.bbuf, none);
+            }
             if (gated)
                 launch_split_qgate(q, s.qkv, s.qsplit, s.gsplit,
                                    cfg.n_heads, d.head_dim, none);
             float* qvec = gated ? s.qsplit : s.qkv;
             MK("  q gemv + split");
-            gemv_any(d.k_proj, s.h2, s.zbuf, none);
-            if (d.k2_sparse) mova_value_m1(d, s.h2, s.bbuf, none);
-        else gemv_any(d.v_proj, s.h2, s.bbuf, none);
             MK("  k+v gemv");
 
             const int qheads = cfg.n_heads;
