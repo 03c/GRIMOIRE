@@ -99,4 +99,33 @@ run fn-l Qwen3.8-Flash-Next-NVFP4 bf16 24 "$LONG" "$FN"; show fn-l
 run fn-h Qwen3.8-Flash-Next-NVFP4 bf16 64 "$SHORT" "$FN
 GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits"
 echo "    hot-expert placement (hits file): short $(el fn-h) s vs $(el fn-s) s  text: $(same fn-s fn-h)"
+echo "== Full zoo sweep 2026-10-02: every remaining checkpoint in /models, short prompt"
+run z-mugptq  Muse-Glimmer-30B-GPTQ-INT4             int4 40 "$SHORT"
+run z-mumx    Muse-Glimmer-30B-MXFP4                 mxfp4 40 "$SHORT"
+run z-ornbare Ornith-1.5-35B-A3B                     mxfp4 40 "$SHORT"
+run z-orngptq Ornith-1.5-35B-A3B-GPTQ-Int4           int4 40 "$SHORT"
+run z-ornar   Ornith-1.5-35B-A3B-INT4-W4A16-AutoRound int4 40 "$SHORT"
+run z-ornmtpfx Ornith-1.5-35B-A3B-MTPFIX             mxfp4 40 "$SHORT"
+run z-q36gptq Qwen3.6-35B-A3B-GPTQ-Int4              int4 40 "$SHORT"
+run z-q38bare Qwen3.8-27B                            mxfp4 40 "$SHORT"
+run z-q38gm   Qwen3.8-27B-GPTQ-Int4-MTP-BF16         int4 40 "$SHORT"
+run z-q38ar   Qwen3.8-27B-MXFP4-AutoRound/Qwen3.8-27B-mxfp-w4g32 mxfp4 40 "$SHORT"
+run z-q38i4ar Qwen3.8-27B-int4-AutoRound             int4 40 "$SHORT"
+# Qwen3.8-27B-int4-ov is skipped on purpose: OpenVINO IR format (.xml/.bin,
+# vision-capable), the vLLM/OpenVINO int4-ov reference baseline this project
+# measures ITSELF against (see grimoire-vllm-baseline-measured) -- not a
+# GRIMOIRE-loadable checkpoint and never will be (no vLLM/OpenVINO, ever).
+echo "== DFlash draft pairings not otherwise covered above"
+run z-q36df Qwen3.6-35B-A3B-GPTQ-Int4 int4 48 "$STORY" "GRIMOIRE_DFLASH_MODEL=/models/Qwen3.6-35B-A3B-DFlash
+GRIMOIRE_SPEC_STATS=1"
+grep -h "spec:" "$OUT/z-q36df.log" | tail -1 | sed 's/^/    /'
+run z-q35df Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE mxfp4 48 "$STORY" "GRIMOIRE_DFLASH_MODEL=/models/Qwen3.5-35B-A3B-DFlash
+GRIMOIRE_SPEC_STATS=1"
+grep -h "spec:" "$OUT/z-q35df.log" | tail -1 | sed 's/^/    /'
+# K2-Horizon-MoVA-36B-A4B: own architecture (K2), own sweep script
+# (tools/k2sweep.sh); smoke-tested here so a shared-code regression catches
+# it too (it is NOT a Qwen3.5-MoE derivative and shares no weights with
+# anything else in this list -- it caught real bugs in 2026-09-28 that a
+# Qwen-family-only regression would have missed entirely).
+run z-k2 K2-Horizon-MoVA-36B-A4B mxfp4 64 "$SHORT"; show z-k2
 echo "ALL DONE"
