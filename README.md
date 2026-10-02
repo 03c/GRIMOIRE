@@ -1,5 +1,7 @@
 # GRIMOIRE
 
+![GRIMOIRE LLM inference banner](assets/grimoire-banner.jpg)
+
 **LLM inference built for Intel Arc Pro B70 Battlemage GPUs.**
 
 GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. It is being developed to run and optimize large language models directly on Intel Battlemage hardware, with a focus on the Arc Pro B70.
