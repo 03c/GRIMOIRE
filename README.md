@@ -86,7 +86,22 @@ than plain decode on every model it's paired with — functional, not yet a thro
 
 ## Getting started
 
-The engine and build scripts are in this repository. A packaged inference image and a simple download-and-run path for users will be published here when they are ready. Until then, use the repository's current build instructions and check the project status before choosing a model or format.
+The engine and build scripts are in this repository, along with a `Dockerfile` that
+builds a minimal runtime image -- just GRIMOIRE's own binaries plus Intel's GPU driver
+stack, nothing else:
+
+```
+docker build -t grimoire-b70 .
+docker run --init --stop-timeout 300 --device /dev/dri/renderDXXX \
+    -v /path/to/your/models:/models -p 8000:8000 \
+    grimoire-b70 server --model /models/<checkpoint> --proj mxfp4 --port 8000
+```
+
+`--init` and a generous `--stop-timeout` are not optional: GPU work in flight when a
+container is killed without them can wedge the card hard enough to need a power cycle.
+Replace `server` with `generate -m ... -p "..." -n <tokens>` for a one-shot CLI run
+instead of the HTTP server. Check the project status and the model table above before
+choosing a model or format.
 
 ## Development notes
 
