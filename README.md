@@ -52,6 +52,38 @@ The two-GPU figures demonstrate an actively developed path. Tensor and pipeline 
 
 Results change as kernels and test coverage evolve. The commit links include the measurements, validation notes, and limitations for each change. The latest model-zoo audit reports **27 confirmed working model/checkpoint combinations** in the local regression sweep, with additional formats and configurations correctly identified as out of scope. [Latest audit](https://github.com/doopeworld/GRIMOIRE/commit/994072e2b75362071eb40aa39455b6a0476c9f2d)
 
+## Supported models
+
+Everything below is validated end-to-end — loaded, generating coherent text, checked
+against a reference where one exists — on one Intel Arc Pro B70, by the project's own
+regression suite. That suite runs after every change that touches shared decode, prefill,
+attention, or MoE code, not as a one-time check.
+
+| Model | Formats | Role | Notes |
+|---|---|---|---|
+| Ornith-1.5-35B-A3B | MXFP4, NVFP4, FP8, GPTQ-Int4, INT4 (AutoRound W4A16), bf16 source | target | 35B MoE, 256 experts / top-8. 198.6 tok/s decode, 10,030–10,165 tok/s prefill (2×B70), both above |
+| Ornith-1.5-35B-A3B-DFlash2 | MXFP4 | speculative draft | for Ornith-1.5-35B-A3B |
+| Qwen3.8-27B | MXFP4 (two independent conversions), NVFP4, FP8, W4A16, GPTQ-Int4, INT4 (AutoRound), bf16 source | target | reference point for the vLLM/OpenVINO int4-ov baseline this project compares against |
+| Qwen3.8-27B + native MTP head | MXFP4 or GPTQ-Int4 | target | multi-token prediction |
+| Qwen3.8-27B-DFlash2 | MXFP4 | speculative draft | for Qwen3.8-27B |
+| Qwen3.6-35B-A3B-GPTQ-Int4 | GPTQ-Int4 | target | 35B MoE |
+| Qwen3.6-35B-A3B-DFlash | bf16 | speculative draft | for its own GPTQ-Int4 target |
+| Qwen3.5-35B-A3B-DFlash | bf16 | speculative draft | for Ornith, which shares its base architecture |
+| Qwen3.8-Flash-Next | NVFP4 | target | too large for one B70's VRAM; tiered across VRAM, system RAM, and SSD |
+| Muse-Glimmer-30B | INT4 (W4A16), GPTQ-INT4, MXFP4 | target | hybrid sliding-window / full attention |
+| K2-Horizon-MoVA-36B-A4B | MXFP4 (quantized on load from its bf16 release) | target | 36B MoE, its own architecture rather than a Qwen3.5-MoE derivative |
+| Agnes-3.0-Flash | MXFP4 | target | |
+
+All seven weight formats (BF16, FP8 E4M3/E5M2, INT8, INT4, MXFP8, MXFP4) run through one
+decode path shared by every model above and by the host-side tests.
+
+Tensor-parallel and pipeline-parallel both run correctly across two B70s, but they exist
+for checkpoints whose own footprint doesn't fit one card's VRAM — every model in the
+table fits a single B70 and runs fastest that way.
+
+Speculative decoding (the MTP and DFlash2 rows above) is currently correct but *slower*
+than plain decode on every model it's paired with — functional, not yet a throughput win.
+
 ## Getting started
 
 The engine and build scripts are in this repository. A packaged inference image and a simple download-and-run path for users will be published here when they are ready. Until then, use the repository's current build instructions and check the project status before choosing a model or format.
