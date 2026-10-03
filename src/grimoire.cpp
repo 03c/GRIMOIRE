@@ -15967,6 +15967,12 @@ void GrimoireScheduler::run() {
         if (active.empty()) continue;
 
         // ---- step every live request together ------------------------
+        // GRIMOIRE_BATCH_HOST_TIMING=1: where a scheduler step's wall time
+        // goes (the engine call vs the bookkeeping around it).
+        static const bool sched_timing = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
+        static std::chrono::steady_clock::time_point st_prev{};
+        static double st_wall = 0, st_engine = 0, st_post = 0; static int st_n = 0, st_rows = 0;
+        const auto st_t0 = std::chrono::steady_clock::now();
         std::vector<int32_t> toks; std::vector<int> slots, poss;
         std::vector<size_t> which;
         for (size_t k = 0; k < active.size(); ++k) {
@@ -16010,6 +16016,7 @@ void GrimoireScheduler::run() {
                 }
             } catch (const std::exception& ex) { failed = true; err = ex.what(); }
         }
+        const auto st_t1 = std::chrono::steady_clock::now();
         std::vector<std::shared_ptr<SchedJob>> keep;
         for (size_t k = 0; k < active.size(); ++k) {
             auto& j = active[k];
@@ -16041,6 +16048,24 @@ void GrimoireScheduler::run() {
             if(!done) keep.push_back(j);
         }
         active.swap(keep);
+        if (sched_timing && toks.size() > 1) {
+            const auto st_t2 = std::chrono::steady_clock::now();
+            using ms = std::chrono::duration<double, std::milli>;
+            if (st_prev.time_since_epoch().count()) st_wall += ms(st_t0 - st_prev).count();
+            st_engine += ms(st_t1 - st_t0).count();
+            st_post += ms(st_t2 - st_t1).count();
+            st_rows += int(toks.size());
+            st_prev = st_t0;
+            if (++st_n == 64) {
+                std::fprintf(stderr, "    scheduler timing: %d batched steps, avg M %.1f: step-to-step %.2f ms, "
+                             "engine call %.2f ms, token bookkeeping %.3f ms\n",
+                             st_n, double(st_rows) / st_n, st_wall / (st_n - 1), st_engine / st_n, st_post / st_n);
+                st_wall = st_engine = st_post = 0; st_n = st_rows = 0;
+                st_prev = {};
+            }
+        } else if (sched_timing) {
+            st_prev = {};
+        }
     }
 }
 

@@ -348,3 +348,89 @@ unresolved merge-conflict marker in vllm/model_executor/models/qwen3_dflash.py:7
 (`<<<<<<< HEAD` / `>>>>>>> v0.30.0`). On XPU, get_quantization_config() imports it for every
 quantized model, so vLLM dies with a SyntaxError. The reference run mounted a resolved copy of
 that one file (HEAD side kept); the image was not changed.
+
+## 8. Batched decode, GRIMOIRE's own kernels (2026-10-03 evening, main 4706273 / 18d07bc / 0dc218b)
+
+Resumed from section 6. Ian's target is Ornith c8 around 800 tok/s.
+**Physical ceiling at c8:** about 5.6 GB has to move per 8-row step:
+- ~57 of 256 experts touched: 3.6 GB
+- dense layers + lm_head: 1.0 GB
+- 8 DeltaNet states read and written: 1.0 GB
+
+At 600 GB/s that is 9.4 ms per step, so ~850 tok/s is the hard limit; ~600 is realistic.
+
+All new code is in GRIMOIRE's own SYCL/ESIMD. It is default for batched decode across sequences
+(`seqb`, not a verify). Speculative verify keeps its old path, because its acceptance was tuned
+on that rounding.
+
+| piece | where | switch |
+|---|---|---|
+| small-M MXFP4 DPAS GEMM, 16 cols/thread, exact ALU E2M1 decode, scale after DPAS | gemm_fast.cpp `launch_mxfp4_smallm` | `GRIMOIRE_SMALLM_DPAS` 1/0 |
+| same for BF16 weights (router, DeltaNet gates), no decode | `launch_bf16_smallm` | same |
+| grouped MoE, gate_up with weights as the DPAS A operand ("AW") | `moe_mxfp4_smallm_aw_gate_up` | `GRIMOIRE_MOE_AW=0` |
+| grouped MoE down, 16 cols/thread | `launch_moe_mxfp4_smallm` | `GRIMOIRE_MOE_SMALLM_DPAS` 1/0 |
+| DeltaNet step + conv, one launch for all rows | `launch_deltanet_step_rows`, `launch_causal_conv1d_split_rows` | `GRIMOIRE_ROWS_BATCH=0` |
+| rope, kv append, ESIMD flash decode + merge for all rows | `launch_*_rows` (prefill.cpp, attention.cpp) | same |
+| attention lengths uploaded once per step | grimoire.cpp `rows_len_dev` | same |
+
+Debug switches:
+- `GRIMOIRE_SMALLM_VERIFY=1`: new GEMMs against the reference, max|diff|/max|ref|.
+- `GRIMOIRE_ROWS_VERIFY=1`: per-row reference, bit for bit.
+- `GRIMOIRE_BATCH_HOST_TIMING=1`: host enqueue vs device wait per step, and scheduler step-to-step time.
+- `GRIMOIRE_HOST_REGIONS=1`: host time per region.
+
+**llama-benchy pp512/tg64, Ornith MXFP4, gpu0, total tok/s** (coherence PASSED every run):
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| v1.2 (morning) | 193 | 95 | 133 | 176 |
+| 4706273: small-M GEMMs + DN/conv rows | 193.7 | 144.1 | 178.9 | 218.4 (peak 273) |
+| 18d07bc: + attention rows | 193.7 | 147.2 | 188.6 | 234.8 (peak 297) |
+| 0dc218b: + BF16 GEMM + AW gate_up | 193.9 | 146.0 | 196.7 | **254.2 (peak 330)** |
+| vLLM GPTQ-int4, same card (its own container) | 72.6 | 125.2 | 210.6 | 332.0 (peak 420) |
+
+**Device time per M=8 step** (GRIMOIRE_PROFILE_PREFILL, no syncs): 23.5 → 21.8 → **19.24 ms**.
+
+| region | ms |
+|---|---:|
+| routed MoE | 10.84 |
+| post norm + route | 1.36 |
+| DN recurrence | 1.27 (state bandwidth) |
+| DN qkv / out / z | 0.90 / 0.78 / 0.62 |
+| logits | 0.67 |
+| shared expert | 1.09 |
+| attention (flash + rope/kv) | 0.37 |
+
+**The step is GPU-bound and the scheduler is free.** The host enqueues a step in ~6 ms, then
+blocks in the token readback until the device finishes. Steady-state step-to-step is 19.4 ms at
+M≈7 and the engine call is 19.4 ms of it. Engine decode at c8 is therefore ~410 tok/s, the same
+as vLLM's 420 peak.
+
+**The remaining c8 gap is prompt admission.** GRIMOIRE prefills each new prompt on its own
+(pp512 c8 4,556 tok/s total) while every decoding row waits. vLLM prefills them together
+(10,294 tok/s).
+
+Numerics:
+- dense MXFP4 vs the fp32 decode GEMV: ≤ 2.6e-3. This is bf16 activations, the same as the old small-M path.
+- BF16 router/gates: ≤ 1.15e-3.
+- MoE vs the old grouped kernel: ≤ 1.2e-4.
+
+Batched outputs are coherent and on-topic on Ornith MXFP4 / GPTQ-Int4, Qwen3.8-27B-MXFP4, K2
+and Agnes (tools/bench/texts8.py).
+
+**MoE kernel findings** (tools/moe_smallm_probe.cpp, Ornith shapes from DRAM, ~57 experts):
+- Both old designs run at ~300 GB/s: 16-cols/thread DPAS, and the GRIMOIRE_MOE_GEMV_SMALL GEMV.
+- With the E2M1 decode removed the old layout still only reaches 375–420 GB/s. So its 32-byte
+  transposed tiles over short K streams are the limit.
+- Deeper prefetch is slower. Contiguous expert ids don't help (not TLB).
+- AW gate_up: 297 → 380 GB/s. It is now ALU-bound at ~1.3 instructions per weight byte.
+- An SLM lookup-table decode is slower (219 vs 168 us).
+
+**Next, in order:**
+1. **Batch prompt admission.** Prefill all waiting prompts in one forward:
+   - dense / MoE run over all tokens;
+   - conv / DeltaNet / attention run per span;
+   - decode rows ride along.
+2. **Shared expert** (1.09 ms) as one more tile of the routed launch.
+3. **Dense projections** (3.4 ms) on the AW layout.
+4. **fp16 operands** for the MoE, to cut decode ALU (~5 of ~19 instructions per 16 lanes).
