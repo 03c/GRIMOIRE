@@ -13057,6 +13057,38 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const int H = cfg.hidden, Hk = cfg.lin_k_heads, Dk = cfg.lin_k_dim;
     const int Hv = cfg.lin_v_heads, Dv = cfg.lin_v_dim;
     const int qkv_ch = 2 * Hk * Dk + Hv * Dv;
+    // Batched decode: each row's sequence slot, BY VALUE, for the kernels
+    // that do one launch per layer over all rows (DeltaNet step, conv) where
+    // the loops below used to launch once per row.  GRIMOIRE_ROWS_BATCH=0 =
+    // the per-row loops.
+    static const bool rows_batch = [] {
+        const char* e = std::getenv("GRIMOIRE_ROWS_BATCH"); return !(e && *e == '0'); }();
+    // GRIMOIRE_BATCH_HOST_TIMING=1: per batched step, host time spent
+    // enqueueing vs waiting for the device (printed every 64 steps).
+    static const bool host_split = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    RowSlots rslots{};
+    const bool rows_ok = seqb && rows_batch && M <= kMaxRowSlots;
+    if (rows_ok) for (int r = 0; r < M; ++r) rslots.slot[r] = seqb->slot[r];
+    // Each row's attention length (pos + 1), uploaded once per step from a
+    // pinned staging buffer (in-order queue; the previous step's copy is
+    // waited on before the staging buffer is rewritten).
+    static int32_t* rows_len_buf = nullptr;
+    static int32_t* rows_len_host = nullptr;
+    static sycl::event rows_len_ev;
+    int32_t* rows_len_dev = nullptr;
+    if (seqb && rows_batch && M <= 1024) {
+        if (!rows_len_buf) {
+            rows_len_buf = sycl::malloc_device<int32_t>(1024, q);
+            rows_len_host = sycl::malloc_host<int32_t>(1024, q);
+        }
+        if (rows_len_buf && rows_len_host) {
+            rows_len_ev.wait();
+            for (int r = 0; r < M; ++r) rows_len_host[r] = seqb->pos[r] + 1;
+            rows_len_ev = q.memcpy(rows_len_buf, rows_len_host, size_t(M) * sizeof(int32_t));
+            rows_len_dev = rows_len_buf;
+        }
+    }
     int W = mtp.ok ? 2*H : H;
     for (const auto& d : L) {
         const DevQuant* ws[] = {&d.la_qkv,&d.la_z,&d.la_out,&d.la_ab,&d.la_all,&d.q_proj,&d.k_proj,
@@ -13384,7 +13416,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // layer, flushed -- the last line before a device hang names the region
     // that hung (the K2-Horizon engine reset of 2026-09-26).
     static const bool trace_prefill=std::getenv("GRIMOIRE_TRACE_PREFILL")!=nullptr;
+    // GRIMOIRE_HOST_REGIONS=1 (batched decode): HOST time between region
+    // marks, no device sync -- where the enqueue time of a step goes.
+    static const bool host_regions = std::getenv("GRIMOIRE_HOST_REGIONS") != nullptr;
+    static std::map<std::string,double> hr_sums;
+    static std::vector<std::string> hr_order;
+    auto hr_prev = std::chrono::steady_clock::now();
     auto pp_mark=[&](const char* completed_region){
+        if(host_regions && seqb){
+            const auto now=std::chrono::steady_clock::now();
+            if(hr_sums.find(completed_region)==hr_sums.end()) hr_order.push_back(completed_region);
+            hr_sums[completed_region]+=std::chrono::duration<double,std::milli>(now-hr_prev).count();
+            hr_prev=now;
+        }
         if(trace_prefill){
             q.wait();
             std::fprintf(stderr,"[trace-p] L%d %s\n",cur_layer,completed_region);
@@ -13499,10 +13543,36 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     static const bool smallm_gemv = std::getenv("GRIMOIRE_SMALLM_GEMV") != nullptr;
     static sycl_bf16* smallm_bf = nullptr;
     static size_t smallm_cap = 0;
+    // launch_mxfp4_smallm: a DPAS GEMM that streams the weight once with 16
+    // columns per thread (gemm_fast.cpp) instead of the grouped MoE kernel's
+    // 256-row tiles.  DEFAULT for batched decode across sequences (seqb, not
+    // a verify): MEASURED 2026-10-03, Ornith served, llama-benchy pp512/tg64
+    // total tok/s c2 95 -> 144, c4 133 -> 179, c8 176 -> 218 (with the
+    // grouped MoE twin below).  Speculative verify keeps the old path: its
+    // acceptance depends on rounding and was tuned on it.
+    // GRIMOIRE_SMALLM_DPAS=1 everywhere M is 2..16, =0 never.
+    static const int smallm_dpas_env = [] {
+        const char* e = std::getenv("GRIMOIRE_SMALLM_DPAS"); return e && *e ? (*e != '0' ? 1 : 0) : -1; }();
+    const bool smallm_dpas = smallm_dpas_env == 1 || (smallm_dpas_env < 0 && seqb && !seqb->verify);
+    // GRIMOIRE_SMALLM_VERIFY=1 (debug, synchronizes): once per shape, run the
+    // reference next to the DPAS kernels and print max|diff| / max|ref|.
+    static const bool smallm_verify = std::getenv("GRIMOIRE_SMALLM_VERIFY") != nullptr;
+    auto smallm_report=[&](const char* what,int N,int K,const float* got,const float* ref,size_t n){
+        std::vector<float> a(n), b(n);
+        q.memcpy(a.data(),got,n*sizeof(float)); q.memcpy(b.data(),ref,n*sizeof(float)); q.wait();
+        double mx=0, md=0;
+        for(size_t i=0;i<n;++i){
+            mx=std::max(mx,double(std::fabs(b[i]))); md=std::max(md,double(std::fabs(a[i]-b[i])));
+        }
+        std::fprintf(stderr,"    smallm verify %-6s N=%-6d K=%-5d M=%-2d max|ref| %.4g max|diff| %.4g rel %.2e\n",
+                     what,N,K,M,mx,md,mx>0?md/mx:md);
+    };
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
-        if(M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
-           w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false)){
+        const bool dpas_ok = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y);
+        if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
+           w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
             const size_t need=size_t(M)*size_t(w.w.K);
             if(need>smallm_cap){
                 if(smallm_bf){ q.wait(); sycl::free(smallm_bf,q); }
@@ -13511,6 +13581,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             if(smallm_bf){
                 launch_f32_to_bf16(q,x,smallm_bf,need);
+                if(dpas_ok){
+                    launch_mxfp4_smallm(q,w.w,smallm_bf,y,M);
+                    static std::set<std::tuple<int,int,int>> checked;
+                    if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
+                        // reference: the decode GEMV, fp32 activations, row by row
+                        float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
+                        for(int r=0;r<M;++r)
+                            launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
+                        smallm_report("dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
+                        sycl::free(ref,q);
+                    }
+                    return;
+                }
                 // sh_tab with one tile: te[0]=0, tmb[0]=0, off[0]=0, cnt[0]=M
                 static const bool dense_small = std::getenv("GRIMOIRE_DENSE_SMALL_KERNEL") != nullptr;
                 if(dense_small)
@@ -14039,7 +14122,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // does: read the ring for all K-1 history taps, then
                 // shift this token in.  Calling the batched routine with
                 // one row rather than writing a second one is what keeps
-                // the two from drifting apart.
+                // the two from drifting apart.  rows_ok: the same kernel-4
+                // arithmetic for every row in one launch, each row on its
+                // own ring (launch_causal_conv1d_split_rows).
+                if(rows_ok && !capture_spec && causal_conv1d_rows_ok(cfg.conv_kernel))
+                    launch_causal_conv1d_split_rows(q,t0,d.la_conv,d.conv_base,
+                        int64_t(d.conv_slot),rslots,M,ch,cfg.conv_kernel,t1,t2,t3,qs,vs);
+                else
                 for(int r=0;r<M;++r){
                     float* ring=d.conv_base+size_t(seqb->slot[r])*d.conv_slot;
                     ConvParams cp{t0+int64_t(r)*ch,d.la_conv,ring,nullptr,
@@ -14102,7 +14191,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // the token dimension anyway, so at small M just run the decode
                 // kernel once per token: 4 tokens = 1.7 ms instead of 7.2.
                 // This is what makes an MTP verify batch affordable.
-                if(seqb||M<=16){
+                if(rows_ok && !capture_spec){
+                    // batched decode: every row's step in one launch, each on
+                    // its own state slot (launch_deltanet_step_rows)
+                    DeltaNetParams sp{};
+                    sp.q=t1; sp.k=t2; sp.v=t3; sp.a=alpha; sp.beta=beta;
+                    sp.state=d.dn_base; sp.out=t0;
+                    sp.n_heads=Hv; sp.k_dim=Dk; sp.v_dim=Dv; sp.n_k_heads=Hk;
+                    launch_deltanet_step_rows(q,sp,M,rslots,int64_t(d.dn_slot),{});
+                }else if(seqb||M<=16){
                     for(int t=0;t<M;++t){
                         DeltaNetParams sp{};
                         sp.q     = t1 + size_t(t)*Hk*Dk;
@@ -14356,10 +14453,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // single-token decode.  Getting this off by one is the
                 // difference between a model that reads its own last
                 // token and one that does not, and both are fluent.
-                {
+                // The lengths are uploaded ONCE per step (rows_len_dev, before
+                // the layer loop): a per-layer upload + wait drained the queue
+                // once per attention layer.
+                const int32_t* d_lens=rows_len_dev;
+                if(!d_lens){
                     std::vector<int32_t> lens(size_t(M), 0);
                     for(int r=0;r<M;++r)lens[size_t(r)]=seqb->pos[r]+1;
                     q.memcpy(dtok,lens.data(),size_t(M)*sizeof(int32_t)).wait();
+                    d_lens=dtok;
                 }
                 for(int r=0;r<M;++r){
                     AttnParams ap{};
@@ -14372,7 +14474,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     ap.num_kv_heads=d.kv_heads;
                     ap.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
                     ap.partials=s.part;ap.part_m=s.pm;ap.part_l=s.pl;
-                    ap.splits=GRAPH_SPLITS;ap.d_seq_len=dtok+r;
+                    ap.splits=GRAPH_SPLITS;ap.d_seq_len=d_lens+r;
                     launch_flash_decode(q,ap,{});
                     launch_flash_merge(q,ap,{});
                 }
@@ -14657,11 +14759,38 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     std::atoi(std::getenv("GRIMOIRE_MOE_TILE_CAP")) != 0;
                 const int32_t tcap = cap_tiles
                     ? std::min<int32_t>(moe_tab_tiles, M*cfg.top_k) : moe_tab_tiles;
+                // launch_moe_mxfp4_smallm (M <= 16): 16 columns per thread
+                // with the touched experts' weights streamed once
+                // (gemm_fast.cpp), instead of 256-row tiles.  Default for
+                // batched decode across sequences, as launch_mxfp4_smallm.
+                // GRIMOIRE_MOE_SMALLM_DPAS=1 everywhere, =0 never.
+                static const int moe_dpas_env = [] {
+                    const char* e = std::getenv("GRIMOIRE_MOE_SMALLM_DPAS"); return e && *e ? (*e != '0' ? 1 : 0) : -1; }();
+                const bool moe_dpas = moe_dpas_env == 1 || (moe_dpas_env < 0 && seqb && !seqb->verify);
+                if(moe_dpas && moe_mxfp4_smallm_ok(d.moe.gate_up,2*I,true,M,xperm,hb) &&
+                   moe_mxfp4_smallm_ok(d.moe.down,H,false,M,hb,yperm)){
+                    launch_moe_mxfp4_smallm(q,d.moe.gate_up,2*I,true,xperm,hb,d_te,d_off,d_cnt,tcap,M);
+                    launch_moe_mxfp4_smallm(q,d.moe.down,H,false,hb,yperm,d_te,d_off,d_cnt,tcap,M);
+                    static std::set<std::pair<int,int>> checked;
+                    if(smallm_verify && checked.insert({li,M}).second){
+                        // reference: the grouped ESIMD pair this replaces
+                        const size_t rows=size_t(M)*cfg.top_k+256;
+                        sycl_bf16* hr=sycl::malloc_device<sycl_bf16>(rows*I,q);
+                        float* yr=sycl::malloc_device<float>(rows*H,q);
+                        launch_moe_mxfp4_grouped_small(q,d.moe.gate_up,2*I,true,xperm,hr,
+                                                       d_te,d_tm,d_off,d_cnt,tcap);
+                        launch_moe_mxfp4_grouped_small(q,d.moe.down,H,false,hr,yr,
+                                                       d_te,d_tm,d_off,d_cnt,tcap);
+                        smallm_report("moe",H,I,yperm,yr,size_t(M)*cfg.top_k*H);
+                        sycl::free(hr,q); sycl::free(yr,q);
+                    }
+                }else{
                 // M < 32, so every expert has <= 31 rows: the small-batch kernel
                 launch_moe_mxfp4_grouped_small(q,d.moe.gate_up,2*I,true,xperm,hb,
                                                d_te,d_tm,d_off,d_cnt,tcap);
                 launch_moe_mxfp4_grouped_small(q,d.moe.down,H,false,hb,yperm,
                                                d_te,d_tm,d_off,d_cnt,tcap);
+                }
                 launch_moe_unpermute(q,yperm,pinv,rwt,r0,M,cfg.top_k,H);
             }else if(M>=32 && device_can_matrix(q) && !tp_enabled()){
                 if(xe2_grouped_mxfp4 && d.moe.gate_up.fmt==Fmt::MXFP4){
@@ -15045,7 +15174,32 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if (!pp_enabled() || pp_rank == pp_world - 1)
             q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
     }
+    const auto t_enq = std::chrono::steady_clock::now();
     q.wait();
+    if (host_split && seqb) {
+        static double enq_ms = 0, wait_ms = 0; static int nst = 0, nrows = 0;
+        const auto t_end = std::chrono::steady_clock::now();
+        enq_ms += std::chrono::duration<double, std::milli>(t_enq - t_pf0).count();
+        wait_ms += std::chrono::duration<double, std::milli>(t_end - t_enq).count();
+        nrows += M;
+        if (host_regions) {
+            hr_sums["(tail: head + readback enqueue)"] +=
+                std::chrono::duration<double, std::milli>(t_enq - hr_prev).count();
+        }
+        if (++nst == 64) {
+            std::fprintf(stderr, "    batch host timing: %d steps, avg M %.1f: enqueue %.2f ms + wait %.2f ms per step\n",
+                         nst, double(nrows) / nst, enq_ms / nst, wait_ms / nst);
+            if (host_regions) {
+                std::vector<std::pair<double, std::string>> v;
+                for (auto& kv : hr_sums) v.push_back({kv.second / nst, kv.first});
+                std::sort(v.rbegin(), v.rend());
+                for (auto& x : v)
+                    std::fprintf(stderr, "      host %-36s %7.3f ms/step\n", x.second.c_str(), x.first);
+                hr_sums.clear();
+            }
+            enq_ms = wait_ms = 0; nst = nrows = 0;
+        }
+    }
     if (next_tokens && pp_enabled() && !pp_sync_tokens(*next_tokens)) {
         std::fprintf(stderr, "PP rank %d: verified-token sync failed\n", pp_rank);
         if(pf_free) for(void* z:mem) if(z) sycl::free(z,q);

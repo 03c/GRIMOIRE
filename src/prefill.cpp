@@ -1024,6 +1024,43 @@ sycl::event launch_causal_conv1d_split_prefill(
         }});});
 }
 
+// Batched decode, kernel width 4: launch_causal_conv1d_split_prefill's
+// kernel-4 path with tokens = 1, for every row in one launch.  Row r's
+// history is its own ring (ring_base + slot[r] * ring_stride); the work-item
+// that reads a ring entry is the one that shifts it, so the separate ring
+// kernel is not needed.  Same fma order, same SiLU: bit-identical per row.
+bool causal_conv1d_rows_ok(int kernel){
+    static const bool old_conv = std::getenv("GRIMOIRE_CONV_OLD") != nullptr;
+    return kernel==4 && !old_conv;
+}
+sycl::event launch_causal_conv1d_split_rows(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, const RowSlots& rs,
+    int rows, int channels, int kernel, float* qv, float* kv, float* vv, int qk_size,
+    int v_size, const std::vector<sycl::event>& deps){
+    if(kernel!=4) throw std::runtime_error("launch_causal_conv1d_split_rows: kernel width 4 only");
+    return q.submit([&](sycl::handler& hd){hd.depends_on(deps);
+      const RowSlots slots=rs;
+      hd.parallel_for(sycl::range<2>(size_t(rows),size_t(channels)),[=](sycl::id<2>id){
+        const int r=int(id[0]),c=int(id[1]),ch=channels;
+        const bf16_t*w=weight+int64_t(c)*4;
+        const float w0=bf16_to_f32(w[0]),w1=bf16_to_f32(w[1]),
+                    w2=bf16_to_f32(w[2]),w3=bf16_to_f32(w[3]);
+        float*ring=ring_base+int64_t(slots.slot[r])*ring_stride+int64_t(c)*3;
+        const float h0=ring[0],h1=ring[1],h2=ring[2];
+        const float xt=x[int64_t(r)*ch+c];
+        float acc=0.0f;
+        acc=sycl::fma(h0,w0,acc);
+        acc=sycl::fma(h1,w1,acc);
+        acc=sycl::fma(h2,w2,acc);
+        acc=sycl::fma(xt,w3,acc);
+        const float y=acc/(1.0f+sycl::exp(-acc));
+        if(c<qk_size)qv[int64_t(r)*qk_size+c]=y;
+        else if(c<2*qk_size)kv[int64_t(r)*qk_size+c-qk_size]=y;
+        else vv[int64_t(r)*v_size+c-2*qk_size]=y;
+        ring[0]=h1;ring[1]=h2;ring[2]=xt;
+      });});
+}
+
 sycl::event launch_causal_conv1d_split_bf16_prefill(sycl::queue& q,
     const sycl_bf16* x,const bf16_t* weight,float* ring,int channels,int kernel,
     int tokens,sycl_bf16* qv,sycl_bf16* kv,sycl_bf16* vv,int qk_size,int v_size,

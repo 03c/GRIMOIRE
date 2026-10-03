@@ -451,6 +451,19 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
     const int32_t* tile_mb, const int32_t* off, const int32_t* cnt, int T,
     const std::vector<sycl::event>& deps = {}, const float* rowscale = nullptr,
     bool out_bf16 = false);   // !swiglu ESIMD path only: bf16 [rows][Ne] output
+// gemm_fast.cpp: small-M (1..16 rows) MXFP4 GEMM on DPAS, the weight read
+// once for all rows: Y[M][N] (fp32) = X[M][K] (bf16) * W^T.  Batched decode.
+// launch only when mxfp4_smallm_ok (format, shape, 64-byte alignment).
+bool mxfp4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
+sycl::event launch_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
+// The grouped MoE form for M <= 16 tokens (each expert <= M rows): the
+// launch_moe_mxfp4_grouped contract without tile_mb (one tile per expert).
+bool moe_mxfp4_smallm_ok(const QuantWeight& w, int Ne, bool swiglu, int M,
+    const void* A, const void* out);
+sycl::event launch_moe_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, int Ne, bool swiglu,
+    const sycl_bf16* A, void* out, const int32_t* tile_e, const int32_t* off,
+    const int32_t* cnt, int T, int M, const std::vector<sycl::event>& deps = {});
 // Same contract, but every tile holds <= 32 rows (verify / draft batches):
 // a per-thread-dequant ESIMD kernel without the SLM staging and barriers.
 sycl::event launch_moe_mxfp4_grouped_small(sycl::queue& q, const QuantWeight& w, int Ne,
@@ -874,6 +887,26 @@ void launch_moe_remap_bf16_top8(sycl::queue& q, const sycl_bf16* hidden,
 
 sycl::event launch_deltanet_step(sycl::queue& q, const DeltaNetParams& p,
                                  const std::vector<sycl::event>& deps = {});
+// Batched decode: row r of one launch is one token of the conversation in
+// sequence slot slot[r].  Passed BY VALUE as a kernel argument: no upload,
+// no host sync.  Batches above kMaxRowSlots keep the per-row loops.
+constexpr int kMaxRowSlots = 16;
+struct RowSlots { int32_t slot[kMaxRowSlots]; };
+// launch_deltanet_step for `rows` rows in one launch.  p.q/k/v/a/beta/out
+// point at row 0 (row strides: n_k_heads*k_dim, n_heads*v_dim, n_heads);
+// row r reads and writes state p.state + slot[r] * state_stride.  The same
+// kernel per row as launch_deltanet_step: bit-identical.
+sycl::event launch_deltanet_step_rows(sycl::queue& q, const DeltaNetParams& p, int rows,
+                                      const RowSlots& rs, int64_t state_stride,
+                                      const std::vector<sycl::event>& deps = {});
+// launch_causal_conv1d_split_prefill(tokens = 1) for `rows` rows in one
+// launch, kernel width 4 only: row r convolves x[r] over its own ring
+// (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.
+bool causal_conv1d_rows_ok(int kernel);
+sycl::event launch_causal_conv1d_split_rows(sycl::queue& q, const float* x,
+    const bf16_t* weight, float* ring_base, int64_t ring_stride, const RowSlots& rs,
+    int rows, int channels, int kernel, float* qv, float* kv, float* vv, int qk_size,
+    int v_size, const std::vector<sycl::event>& deps = {});
 sycl::event launch_causal_conv1d(sycl::queue& q, const ConvParams& p,
                                  const std::vector<sycl::event>& deps = {});
 sycl::event launch_causal_conv1d_l2norm(sycl::queue& q, const ConvParams& p,

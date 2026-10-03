@@ -232,6 +232,115 @@ sycl::event launch_deltanet_step(sycl::queue& q_, const DeltaNetParams& p,
     return deltanet_step_rowwise(q_, p, deps);
 }
 
+// dn_step_sg over `rows` rows of a batched decode in ONE launch: the work-
+// groups of row r are dn_step_sg's work-groups for that row's pointers and
+// state slot.  Every line of arithmetic is dn_step_sg's, so each row is
+// bit-identical to its own launch_deltanet_step.  One launch per DeltaNet
+// layer instead of one per row (8 rows x 30 layers = 240 launches a step).
+template <int PL>
+static sycl::event dn_step_sg_rows(sycl::queue& q_, const DeltaNetParams& p, int rows,
+                                   const RowSlots& rs, int64_t state_stride,
+                                   const std::vector<sycl::event>& deps) {
+    const int KD = p.k_dim, VD = p.v_dim;
+    const int wg_threads   = kDnRowsPerWG * SG_SIZE;
+    const int wgs_per_head = VD / kDnRowsPerWG;
+    const int per_row      = p.n_heads * wgs_per_head;
+
+    return q_.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const DeltaNetParams pp = p;
+        const RowSlots slots = rs;
+        const int64_t sst = state_stride;
+        sycl::local_accessor<float, 1> qs(KD, h);
+        sycl::local_accessor<float, 1> ks(KD, h);
+        const int wgt = wg_threads, wph = wgs_per_head, prow = per_row;
+
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(per_row) * size_t(rows) * size_t(wg_threads), size_t(wg_threads)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg   = it.get_sub_group();
+                const int  lane = int(sg.get_local_id()[0]);
+                const int  sgid = int(sg.get_group_id()[0]);
+                const int  lid  = int(it.get_local_id(0));
+                const int  r    = int(it.get_group(0)) / prow;
+                const int  gid  = int(it.get_group(0)) % prow;
+                const int  head = gid / wph;
+                const int  row  = (gid % wph) * kDnRowsPerWG + sgid;
+
+                float* qsp = qs.template get_multi_ptr<sycl::access::decorated::no>().get();
+                float* ksp = ks.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const int nk    = pp.n_k_heads ? pp.n_k_heads : pp.n_heads;
+                const int khead = (nk == pp.n_heads) ? head
+                                : head / (pp.n_heads / nk);
+                const float* qr = pp.q + int64_t(r) * nk * KD;
+                const float* kr = pp.k + int64_t(r) * nk * KD;
+                for (int j = lid; j < KD; j += wgt) {
+                    qsp[j] = qr[int64_t(khead) * KD + j];
+                    ksp[j] = kr[int64_t(khead) * KD + j];
+                }
+                sycl::group_barrier(it.get_group());
+
+                const float av = pp.a[int64_t(r) * pp.n_heads + head];
+                const float bv = pp.beta[int64_t(r) * pp.n_heads + head];
+                const float vi = pp.v[(int64_t(r) * pp.n_heads + head) * VD + row];
+                float* S = pp.state + int64_t(slots.slot[r]) * sst + (int64_t(head) * VD + row) * KD;
+
+                float sv[PL], kv[PL];
+                float w = 0.0f;
+                #pragma unroll
+                for (int u = 0; u < PL; ++u) {
+                    const int j = u * SG_SIZE + lane;
+                    sv[u] = S[j];
+                    kv[u] = ksp[j];
+                    w = sycl::fma(sv[u], kv[u], w);
+                }
+                w = sycl::reduce_over_group(sg, w, sycl::plus<float>());
+
+                const float corr = bv * (vi - av * w);
+                float o = 0.0f;
+                #pragma unroll
+                for (int u = 0; u < PL; ++u) {
+                    const int j = u * SG_SIZE + lane;
+                    const float sN = sycl::fma(av, sv[u], corr * kv[u]);
+                    S[j] = sN;
+                    o = sycl::fma(sN, qsp[j], o);
+                }
+                o = sycl::reduce_over_group(sg, o, sycl::plus<float>());
+                if (lane == 0)
+                    pp.out[(int64_t(r) * pp.n_heads + head) * VD + row] = o * sycl::rsqrt(float(KD));
+            });
+    });
+}
+
+sycl::event launch_deltanet_step_rows(sycl::queue& q_, const DeltaNetParams& p, int rows,
+                                      const RowSlots& rs, int64_t state_stride,
+                                      const std::vector<sycl::event>& deps) {
+    const int KD = p.k_dim, VD = p.v_dim;
+    if (dn_step_fast() && KD % SG_SIZE == 0 && VD % kDnRowsPerWG == 0 && rows <= kMaxRowSlots) {
+        switch (KD / SG_SIZE) {
+            case 4:  return dn_step_sg_rows<4> (q_, p, rows, rs, state_stride, deps);
+            case 8:  return dn_step_sg_rows<8> (q_, p, rows, rs, state_stride, deps);
+            case 16: return dn_step_sg_rows<16>(q_, p, rows, rs, state_stride, deps);
+            default: break;
+        }
+    }
+    // any other shape: one launch per row, exactly as before
+    const int nk = p.n_k_heads ? p.n_k_heads : p.n_heads;
+    sycl::event e;
+    for (int r = 0; r < rows; ++r) {
+        DeltaNetParams sp = p;
+        sp.q = p.q + int64_t(r) * nk * KD;
+        sp.k = p.k + int64_t(r) * nk * KD;
+        sp.v = p.v + int64_t(r) * p.n_heads * VD;
+        sp.a = p.a + int64_t(r) * p.n_heads;
+        sp.beta = p.beta + int64_t(r) * p.n_heads;
+        sp.out = p.out + int64_t(r) * p.n_heads * VD;
+        sp.state = p.state + int64_t(rs.slot[r]) * state_stride;
+        e = launch_deltanet_step(q_, sp, r ? std::vector<sycl::event>{} : deps);
+    }
+    return e;
+}
+
 // ---------------------------------------------------------------------
 // Causal depthwise conv1d over the packed qkv projection, kernel width 4.
 // The ring buffer holds the last (K-1) tokens per channel; at decode
