@@ -434,3 +434,45 @@ and Agnes (tools/bench/texts8.py).
 2. **Shared expert** (1.09 ms) as one more tile of the routed launch.
 3. **Dense projections** (3.4 ms) on the AW layout.
 4. **fp16 operands** for the MoE, to cut decode ALU (~5 of ~19 instructions per 16 lanes).
+
+## PAUSED 2026-10-03 ~20:00 by Ian ("lets pause... backup everything and we resume tomorrow")
+
+Ian's verdict on v1.3 is that c2/c4/c8 are "absolutely trash compared to vllm".
+
+**The defect to fix first:** at c2 the server's total throughput (146) is BELOW our own
+single-user speed (193). A second user makes the server slower. vLLM scales 72 → 125 → 211 → 332.
+
+**Diagnosis:**
+- A lone request runs the graph-replayed decode path, ~5.1 ms per token.
+- With two or more requests in flight, every step runs through `prefill()`, the prompt path.
+- That path costs **9.75 ms of device time at M=1** (GRIMOIRE_PROFILE_PREFILL, this
+  evening). That is ~2x the decode graph before batching shares a single byte.
+- So an M=2 step costs about as much as 2–3 solo steps, and batching only wins from M≥4.
+- Decode is GPU-bound at every M, and the scheduler costs nothing (section 8).
+
+**Tomorrow, in order:**
+1. **Measure M=1/2/4/8 per region on the batched path** (interrupted tonight, nothing ran).
+   First stop GRIMOIRE-ORNITH gracefully, with no connections on :6889:
+   ```
+   cd /mnt/storage/isos/grimoire-runs/bench-1003 && SRV_MODE=hostbin SRV_WAIT=1200 \
+   SRV_ENV=$'GRIMOIRE_SEQ_SLOTS=8\nGRIMOIRE_SCHED_SOLO=0\nGRIMOIRE_PROFILE_PREFILL=1' \
+   bash srv.sh up ab-dprofM gpu0 6990 Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE mxfp4 && \
+   python3 prof_batch.py 6990 Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE ab-dprofM wall; \
+   bash srv.sh down ab-dprofM 6990; \
+   python3 tools/bench/dprof_table.py /mnt/storage/isos/grimoire-runs/bench/logs/ab-dprofM.log
+   ```
+   Compare it per kernel with the decode graph (GRIMOIRE_TIMELINE=1).
+2. **Batched decode on the DECODE path instead of prefill(), with one graph per batch size.**
+   - M-row versions of the decode kernels: row-streaming GEMVs with M accumulators for M ≤ 4,
+     small-M DPAS above that.
+   - The decode MoE kernels over (token, expert) pairs.
+   - DN / conv / attention rows kernels reading slot and pos from device arrays (today the
+     slots are baked by value as RowSlots).
+   - Targets: M=2 step ≤ ~7 ms (c2 ~280+), M=8 ~14 ms (c8 ~550).
+3. **Batched prompt admission:** all waiting prompts in one forward.
+
+**State at pause:**
+- main = this commit. Release v1.3 is published.
+- GRIMOIRE-ORNITH runs v1.3 (aab687ac3fad) with GRIMOIRE_SEQ_SLOTS=8 on renderD128, port 6889.
+  It was restarted at ~20:00 after the interrupted profile had stopped it gracefully.
+- gpu1 (0b:00.0) still needs Ian's reboot.
