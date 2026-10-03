@@ -32,7 +32,7 @@ set -u
 NODE="${1:?render node, e.g. renderD130}"; shift
 LIMIT="${1:?time limit in seconds}";       shift
 NAME="${1:?short run name}";               shift
-IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+IMAGE="${GRIM_IMAGE:-grimoire-b70:latest}"
 
 if [ ! -e "/dev/dri/$NODE" ]; then echo "no such render node: $NODE" >&2; exit 2; fi
 

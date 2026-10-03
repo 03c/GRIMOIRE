@@ -75,7 +75,7 @@ else
 # they are not built, and no launcher mounts src/.  icpx and ocloc are not on
 # the Unraid host, so the compile runs in a container used ONLY as a
 # compiler: no GPU attached, nothing from the image is linked into bin/.
-BUILD_IMAGE="${GRIM_BUILD_IMAGE:-my-vllm-xpu:latest}"
+BUILD_IMAGE="${GRIM_BUILD_IMAGE:-grimoire-dev:latest}"
 echo "   compiler image : $BUILD_IMAGE"
 
 if ! stage "engine + gates (compiled in $BUILD_IMAGE)" \
@@ -99,7 +99,7 @@ done
 # them -- checked with ldd INSIDE that image, since the host has neither the
 # libraries nor objdump.
 say "2. pure: binaries need no torch or vLLM"
-RUN_IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+RUN_IMAGE="${GRIM_IMAGE:-grimoire-b70:latest}"
 for b in bin/grimoire bin/grimoire-server; do
   [[ -x "$b" ]] || continue
   deps=$(docker run --rm --entrypoint bash -v "$REPO/bin:/grimoire/bin:ro" \
@@ -209,7 +209,7 @@ run_multigpu_gate() {
       --tmpfs /opt/grimoire/lib \
       -e ZE_AFFINITY_MASK=0,1 \
       -e ONEAPI_DEVICE_SELECTOR=level_zero:gpu \
-      --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-my-vllm-xpu:latest}" \
+      --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-grimoire-b70:latest}" \
       --signal=TERM --kill-after=60 900 \
       "/grimoire/${bin}" "$@" 2>>"$log")
   if [[ -z "$cid" ]]; then

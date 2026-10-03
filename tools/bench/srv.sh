@@ -1,7 +1,7 @@
 #!/bin/bash
 # srv.sh up NAME GPU PORT MODEL PROJ  -- start grimoire-server, wait for /health
 # srv.sh down NAME [PORT]             -- wait until idle, stop gracefully, keep log
-# env: SRV_MODE=hostbin (default: my-vllm-xpu + /mnt/.../bin mounted ro, plug-ins hidden,
+# env: SRV_MODE=hostbin (default: grimoire-b70 runtime + /mnt/.../bin mounted ro,
 #      exactly how the CLI baselines run) | image (SRV_IMAGE's own binary, e.g. grimoire-b70)
 #      SRV_ENV=newline-separated K=V, SRV_CTX (8192), SRV_WAIT (secs, 900),
 #      SRV_BIN=host bin/ dir to mount (default: the grimoire-fuse checkout's bin/)
@@ -28,7 +28,7 @@ up)
     docker run -d --name "$NAME" --network host -w /grimoire --init --stop-timeout 300 --device /dev/dri/$NODE \
       -v ${SRV_BIN:-/mnt/storage/isos/grimoire-fuse/bin}:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro \
       --tmpfs /opt/grimoire/lib -v /mnt/storage/Models:/models "${ENVARGS[@]}" \
-      --entrypoint /grimoire/bin/grimoire-server "${SRV_IMAGE:-my-vllm-xpu:latest}" \
+      --entrypoint /grimoire/bin/grimoire-server "${SRV_IMAGE:-grimoire-b70:latest}" \
       --model /models/$MODEL --proj $PROJ --ctx ${SRV_CTX:-8192} --host 0.0.0.0 --port $PORT >/dev/null || exit 4
   fi
   W=${SRV_WAIT:-900}

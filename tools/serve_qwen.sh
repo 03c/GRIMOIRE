@@ -7,7 +7,7 @@ set -u
 MODEL="${MODEL:-/models/Qwen3.8-27B-MXFP4-GRIMOIRE}"
 PORT="${PORT:-8099}"
 GPU="${GPU:-gpu0}"
-IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+IMAGE="${GRIM_IMAGE:-grimoire-b70:latest}"
 CNAME="${CNAME:-grim-server}"
 cd /mnt/storage/isos/grimoire-fuse
 NODE=$(bash tools/gpunode.sh "$GPU") || exit 2

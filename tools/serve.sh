@@ -9,7 +9,7 @@ set -u
 MODEL="${1:?model dir, e.g. /models/Qwen3.8-27B-MXFP4-GRIMOIRE}"
 PORT="${2:-8099}"
 GPU="${3:-gpu0}"
-IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+IMAGE="${GRIM_IMAGE:-grimoire-b70:latest}"
 CNAME="${CNAME:-grim-server}"
 
 cd /mnt/storage/isos/grimoire-fuse

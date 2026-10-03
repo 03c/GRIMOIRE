@@ -33,7 +33,7 @@ set -u
 MODEL="${1:?model dir, e.g. /models/Ornith-1.5-35B-A3B}"
 PORT="${2:-8099}"
 SPLIT="${3:-${GRIMOIRE_PP_SPLIT:-24}}"
-IMAGE="${GRIM_IMAGE:-my-vllm-xpu:latest}"
+IMAGE="${GRIM_IMAGE:-grimoire-b70:latest}"
 CNAME="${CNAME:-grim-server-pp2}"
 PROJ="${PROJ:-fp8}"
 CTX="${CTX:-8192}"

@@ -44,7 +44,7 @@ CID=$(docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
     -v /dev/dri/by-path:/dev/dri/by-path \
     -v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib \
     -v /mnt/storage/Models:/models \
-    "${ENVARGS[@]}" --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-my-vllm-xpu:latest}" \
+    "${ENVARGS[@]}" --entrypoint /usr/bin/timeout "${GRIM_IMAGE:-grimoire-b70:latest}" \
     --signal=TERM --kill-after=60 "$LIMIT" \
     /grimoire/tools/pp2worker.sh "$@")
 
