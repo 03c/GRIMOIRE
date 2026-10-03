@@ -1279,6 +1279,80 @@ sycl::event launch_kv_append_batched(
     });
 }
 
+// Batched decode: launch_qk_norm_rope_batched with row t at ITS OWN position
+// rs.pos[t] (rows are different conversations).  Same arithmetic per row.
+sycl::event launch_qk_norm_rope_rows(sycl::queue& q, float* qv, float* kv, const bf16_t* qw,
+    const bf16_t* kw, int rows, int q_heads, int k_heads, int dim, const RowSlots& rs,
+    float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps,
+    float weight_offset) {
+    const int rot = int(dim * partial_factor) & ~1;
+    const int heads_per_token = q_heads + k_heads;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const RowSlots slots = rs;
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(rows) * heads_per_token * SG_SIZE, SG_SIZE),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const auto sg = it.get_sub_group();
+                const int lane = int(sg.get_local_id()[0]);
+                const int gh = int(it.get_group(0));
+                const int t = gh / heads_per_token;
+                const int h0 = gh % heads_per_token;
+                const bool isq = h0 < q_heads;
+                const int hi = isq ? h0 : h0 - q_heads;
+                float* p = isq ? qv + (int64_t(t) * q_heads + hi) * dim
+                               : kv + (int64_t(t) * k_heads + hi) * dim;
+                const bf16_t* w = isq ? qw : kw;
+                if (w) {    // null weight = no q/k norm (K2-Horizon): RoPE only
+                    float ss = 0.0f;
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        ss = sycl::fma(p[d], p[d], ss);
+                    ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+                    const float scale = sycl::rsqrt(ss / float(dim) + eps);
+                    for (int d = lane; d < dim; d += SG_SIZE)
+                        p[d] *= scale * (weight_offset + bf16_to_f32(w[d]));
+                }
+                sycl::group_barrier(sg);
+                const int pos = slots.pos[t];
+                for (int j = lane; j < rot / 2; j += SG_SIZE) {
+                    const float inv = sycl::exp(-float(2 * j) / float(rot) * sycl::log(theta));
+                    const float ang = float(pos) * inv;
+                    const float cs = sycl::cos(ang), sn = sycl::sin(ang);
+                    const float a = p[j], b = p[j + rot / 2];
+                    p[j] = a * cs - b * sn;
+                    p[j + rot / 2] = a * sn + b * cs;
+                }
+            });
+    });
+}
+
+// Batched decode: launch_kv_append_batched with row t written to ITS OWN
+// cache (slot rs.slot[t]) at ITS OWN position rs.pos[t].
+sycl::event launch_kv_append_rows(sycl::queue& q, const float* k, const float* v,
+    uint8_t* k_base, uint8_t* v_base, int64_t kv_stride, const RowSlots& rs, int rows,
+    int n_kv_heads, int head_dim, int seq_cap, const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const RowSlots slots = rs;
+        h.parallel_for(sycl::range<1>(size_t(rows) * n_kv_heads * head_dim),
+            [=](sycl::id<1> id) {
+                const int64_t z = int64_t(id[0]);
+                const int d = int(z % head_dim);
+                const int64_t th = z / head_dim;
+                const int kh = int(th % n_kv_heads), t = int(th / n_kv_heads);
+                const int pos = slots.pos[t];
+                if (pos >= seq_cap) return;
+                uint8_t* k_cache = k_base + int64_t(slots.slot[t]) * kv_stride;
+                uint8_t* v_cache = v_base + int64_t(slots.slot[t]) * kv_stride;
+                const int64_t src = (int64_t(t) * n_kv_heads + kh) * head_dim + d;
+                k_cache[(int64_t(kh) * head_dim + d) * seq_cap + pos] =
+                    f32_to_e4m3(k[src]);
+                v_cache[(int64_t(kh) * seq_cap + pos) * head_dim + d] =
+                    f32_to_e4m3(v[src]);
+            });
+    });
+}
+
 sycl::event launch_f32_to_f16(sycl::queue& q, const float* src,
     sycl::half* dst, size_t count, const std::vector<sycl::event>& deps) {
     return q.submit([&](sycl::handler& h) {

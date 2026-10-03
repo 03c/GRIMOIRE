@@ -891,7 +891,7 @@ sycl::event launch_deltanet_step(sycl::queue& q, const DeltaNetParams& p,
 // sequence slot slot[r].  Passed BY VALUE as a kernel argument: no upload,
 // no host sync.  Batches above kMaxRowSlots keep the per-row loops.
 constexpr int kMaxRowSlots = 16;
-struct RowSlots { int32_t slot[kMaxRowSlots]; };
+struct RowSlots { int32_t slot[kMaxRowSlots]; int32_t pos[kMaxRowSlots]; };
 // launch_deltanet_step for `rows` rows in one launch.  p.q/k/v/a/beta/out
 // point at row 0 (row strides: n_k_heads*k_dim, n_heads*v_dim, n_heads);
 // row r reads and writes state p.state + slot[r] * state_stride.  The same
@@ -903,6 +903,29 @@ sycl::event launch_deltanet_step_rows(sycl::queue& q, const DeltaNetParams& p, i
 // launch, kernel width 4 only: row r convolves x[r] over its own ring
 // (ring_base + slot[r] * ring_stride) and shifts it.  Bit-identical per row.
 bool causal_conv1d_rows_ok(int kernel);
+// Batched decode attention, one launch each for every row (prefill.cpp,
+// attention.cpp).  Row r sits at position pos[r] of the conversation in slot
+// slot[r]; its KV cache is k/v_base + slot[r] * kv_stride.  Each is the
+// per-row kernel's arithmetic with the row's own position, length and split
+// count: bit-identical to the per-row calls.
+sycl::event launch_qk_norm_rope_rows(sycl::queue& q, float* qv, float* kv, const bf16_t* qw,
+    const bf16_t* kw, int rows, int q_heads, int k_heads, int dim, const RowSlots& rs,
+    float theta, float partial_factor, float eps, const std::vector<sycl::event>& deps = {},
+    float weight_offset = 1.0f);
+sycl::event launch_kv_append_rows(sycl::queue& q, const float* k, const float* v,
+    uint8_t* k_base, uint8_t* v_base, int64_t kv_stride, const RowSlots& rs, int rows,
+    int n_kv_heads, int head_dim, int seq_cap, const std::vector<sycl::event>& deps = {});
+// p: row 0's q/out (row stride num_heads*head_dim), k/v_cache = the slot-0
+// bases, partials/part_m/part_l with room for rows * num_heads * splits_max,
+// splits = the floor (GRAPH_SPLITS).  splits_max = the widest row's
+// flash_rows_splits(len).  d_lens[r] = row r's length (pos + 1).
+bool flash_decode_rows_ok(const AttnParams& p);
+int flash_rows_splits(int seq_len, int min_splits);
+sycl::event launch_flash_decode_rows(sycl::queue& q, const AttnParams& p, int rows,
+    const RowSlots& rs, int64_t kv_stride, const int32_t* d_lens, int splits_max,
+    const std::vector<sycl::event>& deps = {});
+sycl::event launch_flash_merge_rows(sycl::queue& q, const AttnParams& p, int rows,
+    const int32_t* d_lens, int splits_max, const std::vector<sycl::event>& deps = {});
 sycl::event launch_causal_conv1d_split_rows(sycl::queue& q, const float* x,
     const bf16_t* weight, float* ring_base, int64_t ring_stride, const RowSlots& rs,
     int rows, int channels, int kernel, float* qv, float* kv, float* vv, int qk_size,

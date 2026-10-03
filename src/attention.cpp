@@ -754,6 +754,203 @@ sycl::event launch_flash_merge(sycl::queue& q, const AttnParams& p,
 }
 
 // ---------------------------------------------------------------------
+// Batched decode: `rows` rows of DIFFERENT conversations in one launch.
+// Row r reads q/out at row r (stride num_heads * head_dim), its own cache
+// (k/v_cache + slot[r] * kv_stride) and length d_lens[r], and splits it the
+// way direct submission splits that length (splits_for), so each row's
+// partials and merge are bit-identical to its own launch_flash_decode +
+// launch_flash_merge.  Row r's partials start at r * num_heads * splits_max.
+// At batched-decode depths a single row's launch is 64 ESIMD threads on a
+// 256-EU card; 8 rows x 2 launches x 10 attention layers was 1.45 ms of
+// device time per Ornith step at c8 (GRIMOIRE_PROFILE_PREFILL, 2026-10-03).
+// ---------------------------------------------------------------------
+bool flash_decode_rows_ok(const AttnParams& p) {
+    return flash_esimd_on() && p.head_dim == 256 && p.num_kv_heads > 0 &&
+           p.num_heads % p.num_kv_heads == 0 && (p.num_heads / p.num_kv_heads) % 2 == 0 &&
+           p.window_left <= 0 && !p.qbits && (p.seq_cap % 16) == 0;
+}
+int flash_rows_splits(int seq_len, int min_splits) {
+    return splits_for(seq_len, min_splits, keys_per_split(), MAX_SPLITS);
+}
+
+namespace {
+template <int GH>
+sycl::event flash_decode_esimd256_rows(sycl::queue& q, const AttnParams& p, int rows,
+                                       const RowSlots& rs, int64_t kv_stride,
+                                       const int32_t* d_lens, int splits_max,
+                                       const std::vector<sycl::event>& deps) {
+    constexpr int HD = 256, NK = 16;
+    const int splits = splits_max;
+    const int kps = keys_per_split();
+    const int G = p.num_heads / p.num_kv_heads;
+    const int hgroups = G / GH;
+    const int per_row = p.num_kv_heads * hgroups * splits;
+    const AttnParams pp = p;
+    const RowSlots slots = rs;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * per_row, 1),
+            [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            const int row = int(it.get_group(0)) / per_row;
+            const int gid = int(it.get_group(0)) % per_row;
+            const int part = gid % splits;
+            const int rest = gid / splits;
+            const int hg = rest % hgroups;
+            const int kvh = rest / hgroups;
+            const int h0 = kvh * G + hg * GH;
+            const int seq = d_lens[row];
+            // splits_for(seq, pp.splits, kps, MAX_SPLITS), written out
+            int nsp = (seq + kps - 1) / kps;
+            if (nsp < pp.splits) nsp = pp.splits;
+            if (nsp > MAX_SPLITS) nsp = MAX_SPLITS;
+            if (nsp > splits) nsp = splits;
+            if (nsp < 1) nsp = 1;
+            if (part >= nsp) return;
+            int per = (seq + nsp - 1) / nsp;
+            per = (per + NK - 1) / NK * NK;
+            const int s_beg = part * per;
+            const int s_end = s_beg + per < seq ? s_beg + per : seq;
+            const float NEG = -std::numeric_limits<float>::infinity();
+            float* part_m = pp.part_m + int64_t(row) * pp.num_heads * splits;
+            float* part_l = pp.part_l + int64_t(row) * pp.num_heads * splits;
+            float* partials = pp.partials + int64_t(row) * pp.num_heads * splits * HD;
+            if (s_beg >= s_end) {
+                for (int g = 0; g < GH; ++g) {
+                    const int64_t pidx = int64_t(h0 + g) * splits + part;
+                    part_m[pidx] = NEG;
+                    part_l[pidx] = 0.0f;
+                }
+                return;
+            }
+            const int64_t cbase = int64_t(slots.slot[row]) * kv_stride;
+            const uint8_t* kh = pp.k_cache + cbase + int64_t(kvh) * HD * pp.seq_cap;
+            const uint8_t* vh = pp.v_cache + cbase + int64_t(kvh) * pp.seq_cap * HD;
+            const uint32_t* kh32 = reinterpret_cast<const uint32_t*>(kh);
+            const unsigned SW = unsigned(pp.seq_cap) - 1;
+            const float qs = pp.softmax_scale * 256.0f;      // undo K's 2^-8
+            const float* qrow = pp.q + int64_t(row) * pp.num_heads * HD;
+            es::simd<float, HD> qv[GH];
+            es::simd<float, HD> acc[GH];
+            float m[GH], l[GH];
+            #pragma unroll
+            for (int g = 0; g < GH; ++g) {
+                qv[g] = es::block_load<float, HD>(qrow + int64_t(h0 + g) * HD) * qs;
+                acc[g] = 0.0f;
+                m[g] = NEG;
+                l[g] = 0.0f;
+            }
+            es::simd<int, NK> lane(0, 1);
+            for (int s0 = s_beg; s0 < s_end; s0 += NK) {
+                const int nk = s_end - s0 < NK ? s_end - s0 : NK;
+                es::simd<uint32_t, 128> kt[HD / 32];
+                #pragma unroll
+                for (int c = 0; c < HD / 32; ++c)
+                    kt[c] = es::load_2d<uint32_t, 4, 32>(kh32, SW, HD - 1, SW, s0 / 4, 32 * c);
+                es::simd<uint8_t, HD> vb[NK];
+                #pragma unroll
+                for (int j = 0; j < NK; ++j)
+                    vb[j] = es::block_load<uint8_t, HD>(vh + int64_t(s0 + j) * HD);
+                es::simd<float, NK> sc[GH];
+                #pragma unroll
+                for (int g = 0; g < GH; ++g) sc[g] = 0.0f;
+                #pragma unroll
+                for (int c = 0; c < HD / 32; ++c) {
+                    es::simd<uint8_t, 512> kb = kt[c].template bit_cast_view<uint8_t>();
+                    es::simd<float, 512> kf = e4m3x2m8<512>(kb);
+                    es::simd<float, 32> qc[GH];
+                    #pragma unroll
+                    for (int g = 0; g < GH; ++g) qc[g] = qv[g].template select<32, 1>(32 * c);
+                    #pragma unroll
+                    for (int r = 0; r < 32; ++r) {
+                        #pragma unroll
+                        for (int g = 0; g < GH; ++g)
+                            sc[g] += float(qc[g][r]) * kf.template select<16, 1>(16 * r);
+                    }
+                }
+                es::simd_mask<NK> valid = lane < nk;
+                es::simd<float, NK> pr[GH];
+                #pragma unroll
+                for (int g = 0; g < GH; ++g) {
+                    es::simd<float, NK> sv = es::merge(sc[g], es::simd<float, NK>(NEG), valid);
+                    const float mb = es::hmax<float>(sv);
+                    const float mn = m[g] > mb ? m[g] : mb;
+                    const float corr = (m[g] == NEG) ? 0.0f : sycl::exp(m[g] - mn);
+                    es::simd<float, NK> e = es::exp(sv - mn);
+                    pr[g] = es::merge(e, es::simd<float, NK>(0.0f), valid);
+                    l[g] = l[g] * corr + es::reduce<float>(pr[g], std::plus<>());
+                    acc[g] *= corr;
+                    m[g] = mn;
+                }
+                #pragma unroll
+                for (int j = 0; j < NK; ++j) {
+                    es::simd<float, HD> vf = e4m3x2m8<HD>(vb[j]);
+                    #pragma unroll
+                    for (int g = 0; g < GH; ++g) acc[g] += float(pr[g][j]) * vf;
+                }
+            }
+            #pragma unroll
+            for (int g = 0; g < GH; ++g) {
+                const int64_t pidx = int64_t(h0 + g) * splits + part;
+                es::block_store<float, HD>(partials + pidx * HD, acc[g] * 256.0f);   // undo V's 2^-8
+                part_m[pidx] = m[g];
+                part_l[pidx] = l[g];
+            }
+        });
+    });
+}
+} // namespace
+
+sycl::event launch_flash_decode_rows(sycl::queue& q, const AttnParams& p, int rows,
+                                     const RowSlots& rs, int64_t kv_stride,
+                                     const int32_t* d_lens, int splits_max,
+                                     const std::vector<sycl::event>& deps) {
+    return flash_decode_esimd256_rows<2>(q, p, rows, rs, kv_stride, d_lens, splits_max, deps);
+}
+
+sycl::event launch_flash_merge_rows(sycl::queue& q, const AttnParams& p, int rows,
+                                    const int32_t* d_lens, int splits_max,
+                                    const std::vector<sycl::event>& deps) {
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        const AttnParams pp = p;
+        const int kps = keys_per_split();
+        const int smax = splits_max;
+        const int dtiles = (pp.head_dim + SG_SIZE - 1) / SG_SIZE;
+        const int per_row = pp.num_heads * dtiles;
+        h.parallel_for(
+            sycl::nd_range<1>(size_t(rows) * size_t(per_row) * SG_SIZE, size_t(SG_SIZE)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+                const int lane = int(it.get_sub_group().get_local_id()[0]);
+                const int row  = int(it.get_group(0)) / per_row;
+                const int gid  = int(it.get_group(0)) % per_row;
+                const int head = gid / dtiles;
+                const int tile = gid % dtiles;
+                const int seq = d_lens[row];
+                int splits = splits_for(seq, pp.splits, kps, MAX_SPLITS);
+                if (splits > smax) splits = smax;
+                const int d = tile * SG_SIZE + lane;
+                if (d >= pp.head_dim) return;
+                const int64_t hb = int64_t(row) * pp.num_heads + head;
+                const float* pm = pp.part_m + hb * smax;
+                const float* pl = pp.part_l + hb * smax;
+                float m = -std::numeric_limits<float>::infinity();
+                for (int i = 0; i < splits; ++i)
+                    m = sycl::fmax(m, pm[i]);
+                float l = 0.0f, a = 0.0f;
+                for (int i = 0; i < splits; ++i) {
+                    const float mi = pm[i];
+                    if (sycl::isinf(mi)) continue;
+                    const float e = sycl::exp(mi - m);
+                    l += pl[i] * e;
+                    a += pp.partials[(hb * smax + i) * pp.head_dim + d] * e;
+                }
+                const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+                pp.out[hb * pp.head_dim + d] = a * inv;
+            });
+    });
+}
+
+// ---------------------------------------------------------------------
 // Small-batch FlashDecoding for speculative verification.  A work-group owns
 // one (query head, sequence split), and one subgroup owns each query row.  The
 // subgroups share K/V staged in SLM, so M queries stream the cache once rather

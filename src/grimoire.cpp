@@ -13069,7 +13069,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     const auto t_pf0 = std::chrono::steady_clock::now();
     RowSlots rslots{};
     const bool rows_ok = seqb && rows_batch && M <= kMaxRowSlots;
-    if (rows_ok) for (int r = 0; r < M; ++r) rslots.slot[r] = seqb->slot[r];
+    if (rows_ok) for (int r = 0; r < M; ++r) { rslots.slot[r] = seqb->slot[r]; rslots.pos[r] = seqb->pos[r]; }
     // Each row's attention length (pos + 1), uploaded once per step from a
     // pinned staging buffer (in-order queue; the previous step's copy is
     // waited on before the staging buffer is rewritten).
@@ -14397,6 +14397,34 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // router, the head -- stays batched, and that is where
                 // the weights are read.
                 const int QH=cfg.n_heads*d.head_dim, KH=d.kv_heads*d.head_dim;
+                if(rows_ok && !d.rope_proportional){
+                    // every row in one launch each, at its own position and
+                    // into its own cache (bit-identical to the loop below)
+                    static const bool rope_verify = std::getenv("GRIMOIRE_ROWS_VERIFY") != nullptr;
+                    float *vq=nullptr, *vk=nullptr;
+                    if(rope_verify){
+                        vq=sycl::malloc_device<float>(size_t(M)*QH,q); vk=sycl::malloc_device<float>(size_t(M)*KH,q);
+                        q.memcpy(vq,qv,size_t(M)*QH*4); q.memcpy(vk,t3,size_t(M)*KH*4);
+                        for(int r=0;r<M;++r)
+                            launch_qk_norm_rope_batched(q,vq+int64_t(r)*QH,vk+int64_t(r)*KH,d.q_norm,d.k_norm,1,
+                                cfg.n_heads,d.kv_heads,d.head_dim,seqb->pos[r],d.rope_theta,
+                                d.partial_rope,cfg.rms_eps);
+                    }
+                    launch_qk_norm_rope_rows(q,qv,t3,d.q_norm,d.k_norm,M,cfg.n_heads,
+                        d.kv_heads,d.head_dim,rslots,d.rope_theta,d.partial_rope,cfg.rms_eps);
+                    if(rope_verify){
+                        std::vector<float> a(size_t(M)*(QH+KH)), b(a.size());
+                        q.memcpy(a.data(),qv,size_t(M)*QH*4); q.memcpy(a.data()+size_t(M)*QH,t3,size_t(M)*KH*4);
+                        q.memcpy(b.data(),vq,size_t(M)*QH*4); q.memcpy(b.data()+size_t(M)*QH,vk,size_t(M)*KH*4);
+                        q.wait();
+                        size_t ndiff=0;
+                        for(size_t i=0;i<a.size();++i) if(std::memcmp(&a[i],&b[i],4)) ++ndiff;
+                        std::fprintf(stderr,"    rows verify rope layer %d M=%d: %zu of %zu differ\n",li,M,ndiff,a.size());
+                        sycl::free(vq,q); sycl::free(vk,q);
+                    }
+                    launch_kv_append_rows(q,t3,t4,d.k_base,d.v_base,int64_t(d.kv_slot),rslots,M,
+                        d.kv_heads,d.head_dim,max_seq);
+                }else
                 for(int r=0;r<M;++r){
                     const int P=seqb->pos[r];
                     uint8_t* kc=d.k_base+size_t(seqb->slot[r])*d.kv_slot;
@@ -14463,6 +14491,42 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     q.memcpy(dtok,lens.data(),size_t(M)*sizeof(int32_t)).wait();
                     d_lens=dtok;
                 }
+                AttnParams apr{};
+                apr.q=qv; apr.k_cache=d.k_base; apr.v_cache=d.v_base; apr.out=t3;
+                apr.seq_len=1; apr.seq_cap=max_seq;
+                apr.head_dim=d.head_dim; apr.num_heads=cfg.n_heads; apr.num_kv_heads=d.kv_heads;
+                apr.softmax_scale=cfg.attn_softmax_scale(d.head_dim);
+                apr.partials=s.part; apr.part_m=s.pm; apr.part_l=s.pl; apr.splits=GRAPH_SPLITS;
+                if(rows_ok && d_lens==rows_len_dev && M<=kSpecBatch && flash_decode_rows_ok(apr)){
+                    // every row in one launch (attention.cpp): each row's own
+                    // cache, length and split count -- bit-identical per row
+                    int smax=1;
+                    for(int r=0;r<M;++r) smax=std::max(smax,flash_rows_splits(seqb->pos[r]+1,GRAPH_SPLITS));
+                    launch_flash_decode_rows(q,apr,M,rslots,int64_t(d.kv_slot),d_lens,smax);
+                    launch_flash_merge_rows(q,apr,M,d_lens,smax);
+                    // GRIMOIRE_ROWS_VERIFY=1 (debug, syncs): the per-row calls
+                    // into a scratch output, compared bit for bit.
+                    static const bool rows_verify = std::getenv("GRIMOIRE_ROWS_VERIFY") != nullptr;
+                    if(rows_verify){
+                        float* ref=sycl::malloc_device<float>(size_t(M)*QH,q);
+                        for(int r=0;r<M;++r){
+                            AttnParams ap=apr;
+                            ap.q=qv+int64_t(r)*QH; ap.out=ref+int64_t(r)*QH;
+                            ap.k_cache=d.k_base+size_t(seqb->slot[r])*d.kv_slot;
+                            ap.v_cache=d.v_base+size_t(seqb->slot[r])*d.kv_slot;
+                            ap.seq_len=seqb->pos[r]+1; ap.d_seq_len=d_lens+r;
+                            launch_flash_decode(q,ap,{});
+                            launch_flash_merge(q,ap,{});
+                        }
+                        std::vector<float> a(size_t(M)*QH), b(size_t(M)*QH);
+                        q.memcpy(a.data(),t3,a.size()*4); q.memcpy(b.data(),ref,b.size()*4); q.wait();
+                        size_t ndiff=0;
+                        for(size_t i=0;i<a.size();++i) if(std::memcmp(&a[i],&b[i],4)) ++ndiff;
+                        std::fprintf(stderr,"    rows verify attention layer %d M=%d splits<=%d: %zu of %zu differ\n",
+                                     li,M,smax,ndiff,a.size());
+                        sycl::free(ref,q);
+                    }
+                }else
                 for(int r=0;r<M;++r){
                     AttnParams ap{};
                     ap.q=qv+int64_t(r)*QH;
