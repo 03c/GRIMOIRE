@@ -11,7 +11,10 @@ template forced the legacy Level Zero adapter.  **Never set
 `SYCL_UR_USE_LEVEL_ZERO_V2=0`.**  gpu1 (0b:00.0) dropped off the PCIe bus
 under load on 10-03 (RxErr on root port 00:06.2, a hardware link problem).
 Use gpu0 only until that slot is fixed.  The concurrency 1/2/4/8 and
-prefix-cache results for every model are in the same handoff.
+prefix-cache results for every model are in the same handoff.  Batching
+(`GRIMOIRE_SEQ_SLOTS>=2`) works on every model but scales poorly, and the
+prefix cache never hits for HTTP clients.  Those two are the next serving
+targets (handoff sections 3-5).  Release v1.2 = b745052.
 
 **2026-09-25: READ `HANDOFF-2026-09-25-PURE-B70.md` FIRST.** GRIMOIRE runs
 PURE on the B70 -- no plug-ins: the optional src/libgrimoire_xe2_*.so /

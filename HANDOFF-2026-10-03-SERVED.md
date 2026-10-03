@@ -255,3 +255,25 @@ decode graph. decode_batch() re-records the graph after any multi-row step.
 
 Ornith at depth, solo build, SEQ_SLOTS=8: tg256 196.3 / 184.5 / 173.2 at depth ~0 / 2K / 4K, the
 same as the one-at-a-time server. Turning concurrency on no longer costs single-user speed.
+
+## Release v1.2, published 2026-10-03 15:55 (CEST). State at end of day
+
+https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.2 (pre-release, target b745052):
+`grimoire-b70-v1.2.tar.gz`, 640,343,202 bytes, sha256 `8a3a2c760d77672a57f89a8d27fa2b3e040b45882b13ba84f83630d03e84a7db`.
+Validated before upload (bench-1003/validate_image_v12.txt), Ornith on gpu0:
+- Default: coherence PASSED, tg256 195.6 / 183.5 / 172.4 at depth ~0 / 2K / 4K (same as v1.1).
+- `GRIMOIRE_SEQ_SLOTS=8`: tg64 c1 193.4 (v1.1: 132.7), c2 95.2, c4 132.6, c8 174.2.
+
+Docker images on the Tower: `grimoire-b70:latest` = v1.2 (48df3e7c6b26), `:v1.1` (322cb487f99c), `:v1` (9270d65a31c3).
+
+**GRIMOIRE-ORNITH** was recreated on v1.2: port 6889, `--device /dev/dri/renderD128` (gpu0),
+no `SYCL_UR_USE_LEVEL_ZERO_V2`, one request at a time (best single-user speed). Healthy.
+
+**Open, for Ian:**
+1. Reboot the Tower to bring gpu1 (0b:00.0) back. Container `z6912` is stuck on the dead card
+   and goes away with the reboot. Before loading gpu1 again, force its slot (root port 00:06.2)
+   to Gen3 in the BIOS or reseat it.
+2. After any reboot, check `ls -l /dev/dri/by-path/`. Render nodes renumber, and the Unraid
+   templates pin `renderD128`.
+3. QWEN/MUSE/DUAL templates still use the old `grimoire:b70-native` image (it needs `V2=0`).
+   Move them to `grimoire-b70:latest` and drop `V2=0` together.
