@@ -311,3 +311,40 @@ Reading:
 
 **State at pause:** GRIMOIRE-ORNITH is STOPPED (stopped for this profile). Start it again
 from the Unraid template (fixed: renderD128, v1.2 image), or ask Claude to. No GPU work running.
+
+## 7. Reference: how vLLM batches on XPU (read from its source), and its measured c1–c8
+
+vLLM 0.30.1.dev27 + vllm-xpu-kernels 0.1.15.4, read in its own container. GRIMOIRE uses
+none of it. This is the method to re-implement in GRIMOIRE's own SYCL/ESIMD code.
+
+1. **Scheduler:** a token budget per step. Every running sequence adds 1 decode token, and
+   new prompts are chunked into the rest of the budget IN THE SAME forward pass, so decode
+   never stalls behind an admission.
+2. **One kernel per layer over the flattened token batch [N, H]:**
+   - linear layers: `int4_gemm_w4a16` / `fp4_gemm` / `fp8_gemm` on the systolic array (DPAS).
+     8 rows cost what 1 row costs, and each weight is read once.
+   - MoE: `remap_hidden_states` (sort token x top-k by expert, `rows_per_expert`), ONE
+     grouped GEMM for gate_up over all touched experts, one act, one grouped GEMM for down,
+     one `moe_gather`. ~5 launches per layer, each touched expert read once.
+   - DeltaNet: ONE fused `_xpu_C.gdn_attention` per layer, covering conv update, gating and
+     delta-rule recurrence for all sequences, with per-sequence state indices.
+   - attention: one varlen flash-attention call over the paged KV for all sequences.
+3. **Graphs per batch size** (`VLLM_XPU_ENABLE_XPU_GRAPH=1`, experimental on XPU, padded to
+   capture sizes); the GDN op runs eagerly between graph pieces.
+
+**Measured** (bench-1003/vllm, gpu0, Ornith-1.5-35B-A3B-GPTQ-Int4, XPU graphs, fp8 KV,
+max-num-seqs 8, no MTP). llama-benchy pp512/tg64, total tok/s (per request):
+
+| | c1 | c2 | c4 | c8 | tg256 @ 0 / 2K / 4K |
+|---|---:|---:|---:|---:|---|
+| vLLM (GPTQ int4) | 72.6 | 125.2 (65.7) | 210.6 (58.6) | **332.0** (50.8) | 73.3 / 72.0 / 71.3 |
+| GRIMOIRE v1.2 (MXFP4) | **193** | 95 (50) | 133 (37) | 176 (26) | **195.6 / 183.5 / 172.4** |
+
+vLLM's 8-row step costs 1.75x its 1-row step; GRIMOIRE's costs ~9x. GRIMOIRE leads single-stream
+by 2.7x and trails at c8 by 1.9x.
+
+Note on the competitor image: my-vllm-xpu (both the 10-03 15:37 build and the 09-24 one) has an
+unresolved merge-conflict marker in vllm/model_executor/models/qwen3_dflash.py:715
+(`<<<<<<< HEAD` / `>>>>>>> v0.30.0`). On XPU, get_quantization_config() imports it for every
+quantized model, so vLLM dies with a SyntaxError. The reference run mounted a resolved copy of
+that one file (HEAD side kept); the image was not changed.
