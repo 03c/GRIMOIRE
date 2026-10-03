@@ -277,3 +277,37 @@ no `SYCL_UR_USE_LEVEL_ZERO_V2`, one request at a time (best single-user speed). 
    templates pin `renderD128`.
 3. QWEN/MUSE/DUAL templates still use the old `grimoire:b70-native` image (it needs `V2=0`).
    Move them to `grimoire-b70:latest` and drop `V2=0` together.
+
+## 6. Profile of one batched decode step (Ornith, gpu0, 2026-10-03 ~15:10 CEST). PAUSED here
+
+`GRIMOIRE_SEQ_SLOTS=8 GRIMOIRE_SCHED_SOLO=0 GRIMOIRE_TIME_LAYER=all`, M short concurrent
+requests. Each region is synced, so absolute times are inflated; compare the ratios.
+Driver: bench-1003/prof_batch.py.
+
+| region (ms per step) | M=1 | M=2 | M=4 | M=8 |
+|---|---:|---:|---:|---:|
+| routed MoE | 2.16 | 7.21 | 11.11 | **16.46** |
+| post norm + route | 1.50 | 1.70 | 2.02 | 2.63 |
+| DN qkv / z / gate / out projections | 2.21 | 5.28 | 5.49 | 5.86 |
+| shared expert FFN + shared expert | 1.08 | 2.34 | 2.60 | 3.10 |
+| attn q / kv projections | 0.42 | 1.28 | 1.29 | 1.29 |
+| final norm + logits | 0.49 | 1.23 | 1.25 | 1.28 |
+| DN recurrence + conv + attn flash + rope/kv (per-row loops) | 1.28 | 1.99 | 3.13 | 5.57 |
+| TOTAL (timed) | 10.21 | 22.42 | 28.51 | 37.76 |
+
+Uninstrumented wall time (solo on): M=2 23 ms, M=4 32 ms, M=8 48.5 ms per step, including
+the short prefills. The solo graph step is ~5.2 ms.
+
+Reading:
+- **Routed MoE is 44% of the M=8 step** and grows ~7x from M=1, the same factor as the
+  distinct-expert bytes (8 tokens x top-8 hits ~57 distinct experts/layer). It runs at about
+  the same ~40% of bandwidth as at M=1. Lever: a grouped MoE kernel at ~80% of bandwidth
+  (16.5 -> ~8 ms).
+- **The projections jump 2.5x from M=1 to M=2 and then stay flat** (weights read once, but
+  a slower small-M GEMM path than the M=1 ESIMD GEMV). Lever: an M-row ESIMD GEMV (~14 -> ~6 ms).
+- **The per-row loops grow linearly** (1.3 -> 5.6 ms). Lever: one launch over all rows.
+- Plus graph replay per batch size (launch overhead). Estimated M=8 step ~14–16 ms ->
+  **~500–570 tok/s at c8**. 800 needs ~10 ms per step, i.e. MoE near the bandwidth roofline.
+
+**State at pause:** GRIMOIRE-ORNITH is STOPPED (stopped for this profile). Start it again
+from the Unraid template (fixed: renderD128, v1.2 image), or ask Claude to. No GPU work running.
