@@ -3148,6 +3148,218 @@ sycl::event mxfp4_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_b
 
 bool aligned64(const void* p) { return (reinterpret_cast<uintptr_t>(p) & 63) == 0; }
 
+// BF16 weights, the same small-M contract and thread design without any
+// decode: a transposed 2-D load of the weight's dwords (two consecutive K
+// of one output row each) IS the DPAS B operand in VNNI order.  For the
+// BF16-critical tensors (MoE router, DeltaNet gate projections), which the
+// batched step ran through launch_gemv_batch (weights re-read per 4 rows,
+// SIMT FMAs): "post norm + route" was 2.3 ms of a 21.8 ms Ornith c8 step.
+template <int RBN>
+sycl::event bf16_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                             float* Y, int M, const std::vector<sycl::event>& deps) {
+    constexpr int CT = 16;
+    const int N = w.N, K = w.K;
+    const SmallmPlan p = smallm_plan(N, K);
+    const int KS = p.KS, kc = p.kc, TPT = p.TPT;
+    const int tiles = N / CT;
+    const int groups = (tiles + TPT - 1) / TPT;
+    const uint32_t* payw = reinterpret_cast<const uint32_t*>(w.payload);
+    const unsigned PW = unsigned(K) * 2 - 1, PH = unsigned(N) - 1, PP = unsigned(w.row_bytes) - 1;
+    const unsigned XW = unsigned(K) * 2 - 1, XH = unsigned(M) - 1;
+    const unsigned YW = unsigned(N) * 4 - 1;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(groups) * TPT * KS, size_t(TPT) * KS),
+                       [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            es::slm_init<32 * RBN * 128 * 4>();
+            const int lid = int(it.get_local_id(0));
+            const int tw = lid / KS, ks = lid % KS;
+            const int tile = int(it.get_group(0)) * TPT + tw;
+            const bool live = tile < tiles;
+            const int n0 = (live ? tile : 0) * CT;
+            const int kb = ks * kc;
+            const int ke = kb + kc < K ? kb + kc : K;
+            constexpr auto PFH = sycl::ext::oneapi::experimental::properties{
+                es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+            es::simd<float, RBN * 128> acc = 0.0f;
+            if (live) {
+                for (int k = kb; k < ke; k += 32) {
+                    if (k + 64 < ke)
+                        es::prefetch_2d<uint32_t, 16, CT>(payw, PW, PH, PP, (k + 64) / 2, n0, PFH);
+                    es::simd<uint32_t, 128> b0 =
+                        es::load_2d<uint32_t, 8, CT, 1, true, false>(payw, PW, PH, PP, k / 2, n0);
+                    es::simd<uint32_t, 128> b1 =
+                        es::load_2d<uint32_t, 8, CT, 1, true, false>(payw, PW, PH, PP, k / 2 + 8, n0);
+                    #pragma unroll
+                    for (int rb = 0; rb < RBN; ++rb) {
+                        es::simd<sycl_bf16, 128> a0 = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, k, rb * 8);
+                        es::simd<sycl_bf16, 128> a1 = es::load_2d<sycl_bf16, 16, 8>(X, XW, XH, XW, k + 16, rb * 8);
+                        es::simd<float, 128> c = acc.template select<128, 1>(rb * 128);
+                        c = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                            c, b0.template bit_cast_view<sycl_bf16>().read(), a0);
+                        c = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                            c, b1.template bit_cast_view<sycl_bf16>().read(), a1);
+                        acc.template select<128, 1>(rb * 128) = c;
+                    }
+                }
+            }
+            if (KS > 1) {
+                es::slm_block_store<float, RBN * 128>(lid * RBN * 128 * 4, acc);
+                es::barrier();
+                if (ks != 0 || !live) return;
+                for (int i = 1; i < KS; ++i)
+                    acc += es::slm_block_load<float, RBN * 128>((tw * KS + i) * RBN * 128 * 4);
+            } else if (!live) {
+                return;
+            }
+            #pragma unroll
+            for (int rb = 0; rb < RBN; ++rb)
+                es::store_2d<float, 16, 8>(Y, YW, XH, YW, n0, rb * 8,
+                    es::simd<float, 128>(acc.template select<128, 1>(rb * 128)));
+        });
+    });
+}
+
+// Grouped SwiGLU gate_up with the weights as the DPAS A operand ("AW"): a
+// thread owns 8 h columns of one expert, i.e. 8 gate rows + the matching 8
+// up rows, read as 64-byte-wide 2-D tiles (8 rows x 128 K); the expert's
+// routed rows are the B operand (transposed 2-D loads give VNNI
+// [8 k-pairs][16 tokens], tokens >= rows read as zero).  C = [8 features]
+// [16 tokens], so one DPAS covers every routed row of the expert (<= 16).
+// MEASURED 2026-10-03, tools/moe_smallm_probe.cpp, Ornith gate_up from
+// DRAM, 8 tokens x top-8 (~57 experts): 215 -> 168 us (297 -> 380 GB/s);
+// 16 tokens 392 -> 287 us.  The 16-columns-per-thread kernel stays faster
+// for down (K = 512), so this is gate_up only.  At ~1.3 ALU instructions
+// per weight byte the E2M1 decode is now the limit (an SLM lookup table
+// was slower: 219 us).
+sycl::event moe_mxfp4_smallm_aw_gate_up(sycl::queue& q, const QuantWeight& w, int Ne,
+                                        const sycl_bf16* A, sycl_bf16* out, const int32_t* tile_e,
+                                        const int32_t* off, const int32_t* cnt, int T,
+                                        const std::vector<sycl::event>& deps) {
+    constexpr int NB = 2;                    // gate block + up block
+    constexpr int ACC = NB * 128;
+    constexpr int WGMAX = 16;
+    const int K = w.K;
+    const int cols = Ne / 2;
+    const int ctiles = cols / 8;
+    int KS = 1;
+    while (KS < 16 && T * ctiles * KS < 4096 && K / (KS * 2) >= 128 && KS * 2 <= WGMAX) KS *= 2;
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= WGMAX && TPT * 2 <= ctiles) TPT *= 2;
+    const int CG = (ctiles + TPT - 1) / TPT;
+    const uint32_t* payw = reinterpret_cast<const uint32_t*>(w.payload);
+    const uint32_t* sclw = static_cast<const uint32_t*>(w.scales);
+    const unsigned PW = unsigned(K) / 2 - 1, PH = unsigned(w.N) - 1, PP = unsigned(w.row_bytes) - 1;
+    const unsigned SW = unsigned(K) / 32 - 1, SP = unsigned(w.row_scales) - 1;
+    const unsigned XW = unsigned(K) * 2 - 1;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * CG * TPT * KS, size_t(TPT) * KS),
+                       [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            namespace es = sycl::ext::intel::esimd;
+            namespace xmx = sycl::ext::intel::esimd::xmx;
+            es::slm_init<WGMAX * ACC * 4>();
+            const int lid = int(it.get_local_id(0));
+            const int tw = lid / KS, ks = lid % KS;
+            const int g0 = int(it.get_group(0));
+            const int t = g0 / CG, ct = (g0 % CG) * TPT + tw;
+            const int e = tile_e[t];
+            if (e < 0) return;                        // whole work-group: same t
+            const int rows = cnt[e];
+            if (rows <= 0) return;
+            const bool live = ct < ctiles;
+            const int c0 = (live ? ct : 0) * 8;
+            const uint32_t* Aw = reinterpret_cast<const uint32_t*>(A + size_t(off[e]) * K);
+            const unsigned XH = unsigned(rows) - 1;
+            const int wr[NB] = {e * Ne + c0, e * Ne + cols + c0};
+            const int kb = ks * kc;
+            const int ke = kb + kc < K ? kb + kc : K;
+            constexpr auto PFH = sycl::ext::oneapi::experimental::properties{
+                es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+            const es::simd<uint32_t, 16> shv = (es::simd<uint32_t, 16>(0, 1) & 3u) << 3;
+            es::simd<float, ACC> acc = 0.0f;
+            if (live) {
+                for (int k = kb; k < ke; k += 128) {
+                    es::simd<uint32_t, 128> wt[NB];       // [8 rows][16 dwords = 128 K]
+                    es::simd<uint32_t, 8> sw[NB];         // [8 rows] 4 E8M0 bytes
+                    #pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        if (k + 128 < ke)
+                            es::prefetch_2d<uint32_t, 16, 8>(payw, PW, PH, PP, (k + 128) / 8, wr[b], PFH);
+                        wt[b] = es::load_2d<uint32_t, 16, 8>(payw, PW, PH, PP, k / 8, wr[b]);
+                        sw[b] = es::load_2d<uint32_t, 1, 8>(sclw, SW, PH, SP, k / 128, wr[b]);
+                    }
+                    #pragma unroll
+                    for (int g = 0; g < 4; ++g) {             // 32-K blocks
+                        es::simd<uint32_t, 128> bt0 = es::load_2d<uint32_t, 8, 16, 1, true, false>(
+                            Aw, XW, XH, XW, (k + 32 * g) / 2, 0);
+                        es::simd<uint32_t, 128> bt1 = es::load_2d<uint32_t, 8, 16, 1, true, false>(
+                            Aw, XW, XH, XW, (k + 32 * g) / 2 + 8, 0);
+                        #pragma unroll
+                        for (int b = 0; b < NB; ++b) {
+                            es::simd<uint32_t, 64> a0, a1;   // A tiles [8 rows][8 dwords]
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r) {
+                                es::simd<uint32_t, 16> rep =
+                                    wt[b].template replicate_vs_w_hs<4, 1, 4, 0>(r * 16 + 4 * g);
+                                es::simd<uint32_t, 16> tb = rep >> shv;
+                                es::simd<uint32_t, 16> u = (tb & 0x0Fu) | ((tb & 0xF0u) << 12);
+                                es::simd<uint32_t, 16> hb = ((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12);
+                                es::simd<sycl::half, 32> hv = hb.template bit_cast_view<sycl::half>().read();
+                                es::simd<float, 32> fv = hv;
+                                es::simd<uint32_t, 32> fb = fv.template bit_cast_view<uint32_t>().read();
+                                es::simd<uint16_t, 32> bb = fb >> 16;
+                                es::simd<uint32_t, 16> pr = bb.template bit_cast_view<uint32_t>().read();
+                                a0.template select<8, 1>(r * 8) = pr.template select<8, 1>(0);
+                                a1.template select<8, 1>(r * 8) = pr.template select<8, 1>(8);
+                            }
+                            es::simd<float, 128> tmp = 0.0f;
+                            tmp = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                                tmp, bt0.template bit_cast_view<sycl_bf16>().read(),
+                                a0.template bit_cast_view<sycl_bf16>().read());
+                            tmp = xmx::dpas<8, 8, float, float, sycl_bf16, sycl_bf16>(
+                                tmp, bt1.template bit_cast_view<sycl_bf16>().read(),
+                                a1.template bit_cast_view<sycl_bf16>().read());
+                            es::simd<uint32_t, 8> ev = (sw[b] >> (8 * g)) & 0xFFu;
+                            es::simd<uint32_t, 8> sbits = (ev + 14u) << 23;
+                            es::simd<float, 8> sc8 = sbits.template bit_cast_view<float>().read();
+                            #pragma unroll
+                            for (int r = 0; r < 8; ++r)
+                                acc.template select<16, 1>(b * 128 + 16 * r) +=
+                                    tmp.template select<16, 1>(16 * r) * sc8[r];
+                        }
+                    }
+                }
+            }
+            if (KS > 1) {
+                es::slm_block_store<float, ACC>(lid * ACC * 4, acc);
+                es::barrier();
+                if (ks != 0 || !live) return;
+                for (int i = 1; i < KS; ++i)
+                    acc += es::slm_block_load<float, ACC>((tw * KS + i) * ACC * 4);
+            } else if (!live) {
+                return;
+            }
+            uint16_t* He = reinterpret_cast<uint16_t*>(out + size_t(off[e]) * cols);
+            const int nr = rows < 16 ? rows : 16;
+            for (int n = 0; n < nr; ++n) {
+                es::simd<float, 8> gt = acc.template select<8, 16>(n);
+                es::simd<float, 8> up = acc.template select<8, 16>(128 + n);
+                es::simd<float, 8> hv = gt * es::inv(1.0f + es::exp2(gt * -1.4426950408889634f)) * up;
+                es::simd<uint32_t, 8> u = hv.template bit_cast_view<uint32_t>().read();
+                es::simd<uint32_t, 8> r = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+                es::simd<uint32_t, 4> pk = r.template select<4, 2>(0) | (r.template select<4, 2>(1) << 16);
+                es::block_store<uint32_t, 4>(reinterpret_cast<uint32_t*>(He + size_t(n) * cols + c0), pk);
+            }
+        });
+    });
+}
+
 // The same thread design over a grouped MoE layer: one work-group = one
 // (expert tile, TPT column tiles) pair and its K slices.  At batched-decode
 // sizes every touched expert has 1..16 routed rows (top-k experts are
@@ -3331,6 +3543,18 @@ sycl::event launch_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, const sycl
                   : mxfp4_smallm_impl<2>(q, w, X, Y, M, deps);
 }
 
+bool bf16_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y) {
+    return w.fmt == Fmt::BF16 && w.payload && M >= 1 && M <= 16 && w.K % 128 == 0 &&
+           w.N % 16 == 0 && w.row_bytes >= int64_t(w.K) * 2 && w.row_bytes % 16 == 0 &&
+           aligned64(w.payload) && aligned64(X) && aligned64(Y);
+}
+
+sycl::event launch_bf16_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                               float* Y, int M, const std::vector<sycl::event>& deps) {
+    return M <= 8 ? bf16_smallm_impl<1>(q, w, X, Y, M, deps)
+                  : bf16_smallm_impl<2>(q, w, X, Y, M, deps);
+}
+
 // Grouped: every row offset must keep the 2-D bases 64-byte aligned, i.e.
 // K bf16, Ne fp32 and Ne/2 bf16 per row are multiples of 64 bytes.
 bool moe_mxfp4_smallm_ok(const QuantWeight& w, int Ne, bool swiglu, int M,
@@ -3347,6 +3571,10 @@ sycl::event launch_moe_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, int Ne
                                     const sycl_bf16* A, void* out, const int32_t* tile_e,
                                     const int32_t* off, const int32_t* cnt, int T, int M,
                                     const std::vector<sycl::event>& deps) {
+    static const bool aw = [] { const char* e = std::getenv("GRIMOIRE_MOE_AW"); return !(e && *e == '0'); }();
+    if (swiglu && aw && (Ne / 2) % 8 == 0)
+        return moe_mxfp4_smallm_aw_gate_up(q, w, Ne, A, static_cast<sycl_bf16*>(out), tile_e, off,
+                                           cnt, T, deps);
     if (swiglu)
         return M <= 8 ? moe_mxfp4_smallm_impl<1, 1>(q, w, Ne, A, out, tile_e, off, cnt, T, deps)
                       : moe_mxfp4_smallm_impl<1, 2>(q, w, Ne, A, out, tile_e, off, cnt, T, deps);

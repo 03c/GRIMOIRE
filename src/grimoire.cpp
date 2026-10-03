@@ -13569,8 +13569,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     };
     auto mm=[&](const DevQuant& w,const float* x,float* y){
         if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
-        const bool dpas_ok = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
-                             !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y);
+        const bool dpas_bf = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && bf16_smallm_ok(w.w,M,nullptr,y);
+        const bool dpas_ok = dpas_bf || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
             const size_t need=size_t(M)*size_t(w.w.K);
@@ -13582,14 +13584,15 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(smallm_bf){
                 launch_f32_to_bf16(q,x,smallm_bf,need);
                 if(dpas_ok){
-                    launch_mxfp4_smallm(q,w.w,smallm_bf,y,M);
+                    if(dpas_bf) launch_bf16_smallm(q,w.w,smallm_bf,y,M);
+                    else launch_mxfp4_smallm(q,w.w,smallm_bf,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
                     if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
                         // reference: the decode GEMV, fp32 activations, row by row
                         float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
                         for(int r=0;r<M;++r)
                             launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
-                        smallm_report("dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
+                        smallm_report(dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
                         sycl::free(ref,q);
                     }
                     return;

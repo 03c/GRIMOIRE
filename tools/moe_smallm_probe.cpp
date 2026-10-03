@@ -225,6 +225,156 @@ sycl::event moe_kernel(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, i
     });
 }
 
+// "AW" design: weights are the DPAS A operand (row-major, 8 output features x
+// 16 K per DPAS), so each thread reads its weight rows as 64-byte-wide 2-D
+// tiles (8 rows x 128 K per load); activations are the B operand, loaded
+// with transposed 2-D loads as VNNI [8 k-pairs][16 tokens] (tokens >= rows
+// read as zero).  C = [8 features][16 tokens].  RBW row-blocks of 8 features
+// per thread (EPI 1: RBW gate blocks + the matching RBW up blocks).
+template <int EPI, int RBW, bool LUT = false>
+sycl::event moe_kernel_aw(sycl::queue& q, const uint8_t* pay, const uint8_t* scl, int Wrows, int K,
+                          int Ne, const bf16* A, void* out, const int32_t* tile_e,
+                          const int32_t* off, const int32_t* cnt, int T, int KSmax,
+                          const uint32_t* lut = nullptr) {
+    constexpr int NB = EPI == 1 ? 2 * RBW : RBW;        // row-blocks of 8 weight rows
+    constexpr int ACC = NB * 128;
+    constexpr int WGMAX = 16;
+    const int cols = EPI == 1 ? Ne / 2 : Ne;
+    const int ctiles = cols / (8 * RBW);
+    int KS = 1;
+    while (KS < KSmax && T * ctiles * KS < 4096 && K / (KS * 2) >= 128 && KS * 2 <= WGMAX) KS *= 2;
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= WGMAX && TPT * 2 <= ctiles) TPT *= 2;
+    const int CG = (ctiles + TPT - 1) / TPT;
+    const uint32_t* payw = reinterpret_cast<const uint32_t*>(pay);
+    const uint32_t* sclw = reinterpret_cast<const uint32_t*>(scl);
+    const unsigned PW = unsigned(K) / 2 - 1, PH = unsigned(Wrows) - 1, PP = unsigned(K) / 2 - 1;
+    const unsigned SW = unsigned(K) / 32 - 1, SP = unsigned(K) / 32 - 1;
+    const unsigned XW = unsigned(K) * 2 - 1;
+    return q.parallel_for(sycl::nd_range<1>(size_t(T) * CG * TPT * KS, size_t(TPT) * KS),
+                          [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        constexpr unsigned LUTOFF = WGMAX * ACC * 4;
+        es::slm_init<WGMAX * ACC * 4 + (LUT ? 1024 : 0)>();
+        const int lid = int(it.get_local_id(0));
+        const int tw = lid / KS, ks = lid % KS;
+        const int g0 = int(it.get_group(0));
+        const int t = g0 / CG, ct = (g0 % CG) * TPT + tw;
+        const int e = tile_e[t];
+        if (e < 0) return;
+        const int rows = cnt[e];
+        if (rows <= 0) return;
+        if constexpr (LUT) {
+            for (int i = lid; i < 8; i += TPT * KS)
+                es::slm_block_store<uint32_t, 32>(LUTOFF + i * 128, es::block_load<uint32_t, 32>(lut + i * 32));
+            es::barrier();
+        }
+        const bool live = ct < ctiles;
+        const int c0 = (live ? ct : 0) * 8 * RBW;
+        const uint32_t* Aw = reinterpret_cast<const uint32_t*>(A + size_t(off[e]) * K);
+        const unsigned XH = unsigned(rows) - 1;
+        int wr[NB];
+        #pragma unroll
+        for (int b = 0; b < NB; ++b)
+            wr[b] = e * Ne + (EPI == 1 && b >= RBW ? cols : 0) + c0 + 8 * (b % RBW);
+        const int kb = ks * kc;
+        const int ke = kb + kc < K ? kb + kc : K;
+        constexpr auto PFH = sycl::ext::oneapi::experimental::properties{
+            es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+        const es::simd<uint32_t, 16> shv = (es::simd<uint32_t, 16>(0, 1) & 3u) << 3;
+        es::simd<float, ACC> acc = 0.0f;
+        if (live) {
+            for (int k = kb; k < ke; k += 128) {
+                es::simd<uint32_t, 128> wt[NB];       // [8 rows][16 dwords = 128 K]
+                es::simd<uint32_t, 8> sw[NB];         // [8 rows] 4 E8M0 bytes = 128 K
+                #pragma unroll
+                for (int b = 0; b < NB; ++b) {
+                    if (k + 128 < ke)
+                        es::prefetch_2d<uint32_t, 16, 8>(payw, PW, PH, PP, (k + 128) / 8, wr[b], PFH);
+                    wt[b] = es::load_2d<uint32_t, 16, 8>(payw, PW, PH, PP, k / 8, wr[b]);
+                    sw[b] = es::load_2d<uint32_t, 1, 8>(sclw, SW, PH, SP, k / 128, wr[b]);
+                }
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) {             // 32-K blocks
+                    es::simd<uint32_t, 128> bt0 = es::load_2d<uint32_t, 8, 16, 1, true, false>(Aw, XW, XH, XW, (k + 32 * g) / 2, 0);
+                    es::simd<uint32_t, 128> bt1 = es::load_2d<uint32_t, 8, 16, 1, true, false>(Aw, XW, XH, XW, (k + 32 * g) / 2 + 8, 0);
+                    #pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        es::simd<uint32_t, 64> a0, a1;       // A tiles [8 rows][8 dwords]
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r) {
+                            es::simd<uint32_t, 16> rep = wt[b].template replicate_vs_w_hs<4, 1, 4, 0>(r * 16 + 4 * g);
+                            es::simd<uint32_t, 16> pr;
+                            if constexpr (LUT) {
+                                es::simd<uint32_t, 16> addr = (((rep >> shv) & 0xFFu) << 2) + LUTOFF;
+                                pr = es::slm_gather<uint32_t, 16>(addr);
+                            } else {
+                            es::simd<uint32_t, 16> tb = rep >> shv;
+                            es::simd<uint32_t, 16> u = (tb & 0x0Fu) | ((tb & 0xF0u) << 12);
+                            es::simd<uint32_t, 16> hb = ((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12);
+                            es::simd<sycl::half, 32> hv = hb.template bit_cast_view<sycl::half>().read();
+                            es::simd<float, 32> fv = hv;
+                            es::simd<uint32_t, 32> fb = fv.template bit_cast_view<uint32_t>().read();
+                            es::simd<uint16_t, 32> bb = fb >> 16;
+                            pr = bb.template bit_cast_view<uint32_t>().read();
+                            }
+                            a0.template select<8, 1>(r * 8) = pr.template select<8, 1>(0);
+                            a1.template select<8, 1>(r * 8) = pr.template select<8, 1>(8);
+                        }
+                        es::simd<float, 128> tmp = 0.0f;
+                        tmp = xmx::dpas<8, 8, float, float, bf16, bf16>(
+                            tmp, bt0.template bit_cast_view<bf16>().read(), a0.template bit_cast_view<bf16>().read());
+                        tmp = xmx::dpas<8, 8, float, float, bf16, bf16>(
+                            tmp, bt1.template bit_cast_view<bf16>().read(), a1.template bit_cast_view<bf16>().read());
+                        es::simd<uint32_t, 8> ev = (sw[b] >> (8 * g)) & 0xFFu;
+                        es::simd<uint32_t, 8> sbits = LUT ? (ev << 23) : ((ev + 14u) << 23);
+                        es::simd<float, 8> sc8 = sbits.template bit_cast_view<float>().read();
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r)
+                            acc.template select<16, 1>(b * 128 + 16 * r) += tmp.template select<16, 1>(16 * r) * sc8[r];
+                    }
+                }
+            }
+        }
+        if (KS > 1) {
+            es::slm_block_store<float, ACC>(lid * ACC * 4, acc);
+            es::barrier();
+            if (ks != 0 || !live) return;
+            for (int i = 1; i < KS; ++i)
+                acc += es::slm_block_load<float, ACC>((tw * KS + i) * ACC * 4);
+        } else if (!live) {
+            return;
+        }
+        const int nr = rows < 16 ? rows : 16;
+        if constexpr (EPI == 0) {
+            float* Oe = static_cast<float*>(out) + size_t(off[e]) * Ne;
+            for (int n = 0; n < nr; ++n) {
+                #pragma unroll
+                for (int b = 0; b < NB; ++b) {
+                    es::simd<float, 8> col = acc.template select<8, 16>(b * 128 + n);
+                    es::block_store<float, 8>(Oe + size_t(n) * Ne + c0 + 8 * b, col);
+                }
+            }
+        } else {
+            uint16_t* He = reinterpret_cast<uint16_t*>(static_cast<bf16*>(out) + size_t(off[e]) * cols);
+            for (int n = 0; n < nr; ++n) {
+                #pragma unroll
+                for (int b = 0; b < RBW; ++b) {
+                    es::simd<float, 8> gt = acc.template select<8, 16>(b * 128 + n);
+                    es::simd<float, 8> up = acc.template select<8, 16>((RBW + b) * 128 + n);
+                    es::simd<float, 8> hv = gt * es::inv(1.0f + es::exp2(gt * -1.4426950408889634f)) * up;
+                    es::simd<uint32_t, 8> u = hv.template bit_cast_view<uint32_t>().read();
+                    es::simd<uint32_t, 8> r = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+                    es::simd<uint32_t, 4> pk = r.template select<4, 2>(0) | (r.template select<4, 2>(1) << 16);
+                    es::block_store<uint32_t, 4>(reinterpret_cast<uint32_t*>(He + size_t(n) * cols + c0 + 8 * b), pk);
+                }
+            }
+        }
+    });
+}
+
 struct Route { std::vector<int32_t> te, off, cnt; int T; int distinct; };
 
 static Route make_route(std::mt19937& rng, int M, int E, int topk) {
@@ -274,6 +424,14 @@ int main(int argc, char** argv) {
             q.memcpy(m.dp[c], m.hp.data(), pb); q.memcpy(m.ds[c], m.hs.data(), sb);
         }
     }
+    // byte -> (bf16(e2m1(hi)) << 16) | bf16(e2m1(lo)), the unscaled values (exact in bf16)
+    std::vector<uint32_t> hlut(256);
+    for (int b = 0; b < 256; ++b) {
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u >> 16; };
+        hlut[b] = bits(e2m1_f(b & 15)) | (bits(e2m1_f(b >> 4)) << 16);
+    }
+    uint32_t* dlut = sycl::malloc_device<uint32_t>(256, q);
+    q.memcpy(dlut, hlut.data(), 1024);
     q.wait();
     for (int M : {2, 4, 8, 16}) {
         const int R = M * TOPK;
@@ -306,11 +464,19 @@ int main(int argc, char** argv) {
         for (int which = 0; which < 2; ++which) {           // 0 gate_up, 1 down
             const Mat& mt = mats[which];
             const double ebytes = double(which == 0 ? 2 * I : H) * mt.K * (0.5 + 1.0 / 32);
-            for (int var = 0; var < 6; ++var) {
+            for (int var = 0; var < 10; ++var) {
                 int ci = 0;
                 auto launch = [&](int ri) {
                     const uint8_t* p = mt.dp[ci % NC]; const uint8_t* s = mt.ds[ci % NC]; ++ci;
                     const int ks = var == 5 ? 1 : 16;
+                    if (var == 6) return which == 0 ? moe_kernel_aw<1, 1>(q, p, s, mt.N, mt.K, 2 * I, dx, dh, dte[ri], doff[ri], dcnt[ri], R, ks)
+                                                    : moe_kernel_aw<0, 1>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks);
+                    if (var == 8) return which == 0 ? moe_kernel_aw<1, 1, true>(q, p, s, mt.N, mt.K, 2 * I, dx, dh, dte[ri], doff[ri], dcnt[ri], R, ks, dlut)
+                                                    : moe_kernel_aw<0, 1, true>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks, dlut);
+                    if (var == 9) return which == 0 ? moe_kernel_aw<1, 2, true>(q, p, s, mt.N, mt.K, 2 * I, dx, dh, dte[ri], doff[ri], dcnt[ri], R, ks, dlut)
+                                                    : moe_kernel_aw<0, 2, true>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks, dlut);
+                    if (var == 7) return which == 0 ? moe_kernel_aw<1, 2>(q, p, s, mt.N, mt.K, 2 * I, dx, dh, dte[ri], doff[ri], dcnt[ri], R, ks)
+                                                    : moe_kernel_aw<0, 2>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks);
                     if (which == 0) {
                         if (M <= 8) {
                             if (var == 0) return moe_kernel<1, 1, 1, false>(q, p, s, mt.N, mt.K, 2 * I, dx, dh, dte[ri], doff[ri], dcnt[ri], R, ks);
@@ -334,7 +500,8 @@ int main(int argc, char** argv) {
                     if (var == 0) return moe_kernel<0, 2, 1, false>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks);
                     return moe_kernel<0, 2, 3, true>(q, p, s, mt.N, mt.K, H, dhin, dy, dte[ri], doff[ri], dcnt[ri], R, ks);
                 };
-                if (M > 8 && var > 1) continue;
+                if (M > 8 && var > 1 && var < 6) continue;
+                if (var >= 1 && var <= 5 && M != 8) continue;
                 // correctness on routing 0, copy 0
                 ci = 0; launch(0).wait();
                 double maxrel = 0;
@@ -389,7 +556,7 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - t0).count() / iters;
                 const double gbs = avg_distinct * ebytes / (ms * 1e6);
-                static const char* names[6] = {"pf1       ", "pf2       ", "NODECODE  ", "pf1+scup  ", "pf2/3+scup", "ks1       "};
+                static const char* names[10] = {"pf1       ", "pf2       ", "NODECODE  ", "pf1+scup  ", "pf2/3+scup", "ks1       ", "AW rbw1   ", "AW rbw2   ", "AWL rbw1  ", "AWL rbw2  "};
                 std::printf("%-7s M=%2d experts~%5.1f %s %8.1f us  %6.1f GB/s  maxrel %.2e %s\n",
                             which == 0 ? "gate_up" : "down", M, avg_distinct, names[var], ms * 1000, gbs,
                             maxrel, maxrel < 5e-3 ? "ok" : "FAIL");

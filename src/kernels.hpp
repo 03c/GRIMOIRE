@@ -457,6 +457,10 @@ sycl::event launch_moe_mxfp4_grouped(sycl::queue& q, const QuantWeight& w, int N
 bool mxfp4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
 sycl::event launch_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
     float* Y, int M, const std::vector<sycl::event>& deps = {});
+// The same for BF16 weights (no decode): the MoE router, DeltaNet gates.
+bool bf16_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
+sycl::event launch_bf16_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
 // The grouped MoE form for M <= 16 tokens (each expert <= M rows): the
 // launch_moe_mxfp4_grouped contract without tile_mb (one tile per expert).
 bool moe_mxfp4_smallm_ok(const QuantWeight& w, int Ne, bool swiglu, int M,
