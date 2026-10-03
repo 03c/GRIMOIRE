@@ -1,3 +1,21 @@
+// GRIMOIRE
+// Copyright (C) 2026 Ian Ernst
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // GRIMOIRE's OWN W4A8 path (int4 weights x int8 activations, int XMX) on Qwen's FFN
 // shapes.  This is vLLM's recipe implemented in pure C++/SYCL and already present in
 // gemm_xmx.cpp -- but nothing in the engine calls it.  Target: BesTLA's 148.5 TFLOP/s.

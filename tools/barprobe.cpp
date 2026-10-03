@@ -1,3 +1,21 @@
+// GRIMOIRE
+// Copyright (C) 2026 Ian Ernst
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // How much can a single process actually allocate on each B70?
 // If the USB4-attached card caps at ~256MB, that's the Thunderbolt BAR limit
 // and single-process pipeline is blocked until OCuLink.

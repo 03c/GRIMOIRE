@@ -1,3 +1,21 @@
+// GRIMOIRE
+// Copyright (C) 2026 Ian Ernst
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // moe_esimd_probe.cpp -- grouped MoE MXFP4 GEMM on the B70's matrix unit in
 // ESIMD, standalone: correctness against a CPU reference + TFLOP/s on the
 // shapes of Ornith's routed experts (256 experts, top-8, ~187 rows each on a
