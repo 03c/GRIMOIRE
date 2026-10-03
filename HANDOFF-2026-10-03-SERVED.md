@@ -256,7 +256,7 @@ decode graph. decode_batch() re-records the graph after any multi-row step.
 Ornith at depth, solo build, SEQ_SLOTS=8: tg256 196.3 / 184.5 / 173.2 at depth ~0 / 2K / 4K, the
 same as the one-at-a-time server. Turning concurrency on no longer costs single-user speed.
 
-## Release v1.2, published 2026-10-03 15:55 (CEST). State at end of day
+## Release v1.2, published 2026-10-03 14:55 (CEST). State at end of day
 
 https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.2 (pre-release, target b745052):
 `grimoire-b70-v1.2.tar.gz`, 640,343,202 bytes, sha256 `8a3a2c760d77672a57f89a8d27fa2b3e040b45882b13ba84f83630d03e84a7db`.
