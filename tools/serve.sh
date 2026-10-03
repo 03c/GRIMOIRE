@@ -21,6 +21,11 @@ if docker ps --format "{{.Names}}" | grep -q "^${CNAME}$"; then
   docker stop --time 120 "$CNAME" >/dev/null 2>&1 || true
 fi
 docker rm "$CNAME" >/dev/null 2>&1 || true
+# 2026-10-03: W4A8 and the three Ornith-only knobs below used to be FORCED on
+# (=1) for every model.  W4A8 is the path that can drop a B70 off the bus, and
+# --bf16-qkv/--defer-moe-gather give degenerate output on dense models (see
+# grimoire-server --help), so they now pass through like everything else:
+# unset on the host = off.  PROJ / CTX override --proj mxfp4 / --ctx 8192.
 # Serving knobs pass through from the host ONLY IF SET there: `-e NAME` with
 # no value copies the host's value and adds nothing when it is unset, so
 # the default launch is unchanged.  Without these the batching, prefix-
@@ -31,10 +36,10 @@ docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -v /mnt/storage/isos/grimoire-fuse/bin:/grimoire/bin:ro -v /mnt/storage/isos/grimoire-fuse/tools:/grimoire/tools:ro --tmpfs /opt/grimoire/lib \
   -v /mnt/storage/Models:/models \
   -e ONEAPI_DEVICE_SELECTOR=level_zero:0 \
-  -e GRIMOIRE_W4A8=1 \
-  -e GRIMOIRE_DEFER_MOE_GATHER=1 \
-  -e GRIMOIRE_BF16_QKV=1 \
-  -e GRIMOIRE_BF16_DN_QKV=1 \
+  -e GRIMOIRE_W4A8 \
+  -e GRIMOIRE_DEFER_MOE_GATHER \
+  -e GRIMOIRE_BF16_QKV \
+  -e GRIMOIRE_BF16_DN_QKV \
   -e GRIMOIRE_SEQ_SLOTS \
   -e GRIMOIRE_MAX_BATCH \
   -e GRIMOIRE_PREFIX_CACHE \
@@ -47,7 +52,7 @@ docker run -d --name "$CNAME" -w /grimoire --init --stop-timeout 300 \
   -e GRIMOIRE_DECODE_GRAPH \
   --entrypoint /grimoire/bin/grimoire-server \
   "$IMAGE" \
-  --model "$MODEL" --proj mxfp4 --ctx 8192 --host 0.0.0.0 --port "$PORT"
+  --model "$MODEL" --proj "${PROJ:-mxfp4}" --ctx "${CTX:-8192}" --host 0.0.0.0 --port "$PORT"
 
 echo "waiting for ready ..."
 for i in $(seq 1 60); do

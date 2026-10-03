@@ -3285,6 +3285,11 @@ struct Grimoire {
                       const std::vector<int>& slots,
                       const std::vector<int>& poss,
                       std::vector<int32_t>& out);
+    // Step ONE resident sequence by one token the way a single-request
+    // server does: M=1 kernels, recorded decode graph.  Returns the next
+    // token.  solo_ok() says whether the scheduler may use it.
+    int  decode_solo(int32_t tok, int slot, int position);
+    bool solo_ok() const;
     static constexpr int kMaxBatchRows = kSpecBatch;
     bool prefill_muse(const std::vector<int32_t>& tokens,
                       std::vector<int32_t>* next_tokens = nullptr,
@@ -7011,6 +7016,15 @@ std::string Grimoire::batch_unsupported_reason() const {
         return "distributed speculative batching is not implemented";
     if (n_seq_slots < 2)
         return "only one sequence slot -- set GRIMOIRE_SEQ_SLOTS";
+    // A file-backed per-layer-embedding table (GRIMOIRE_PLE_FILE) keeps ONE
+    // token history on the host, so prefill() refuses SeqBatch rows on it.
+    // Not saying so here made the scheduler advertise batching and then fail
+    // every step -- MEASURED 2026-10-03, Qwen3.8-Flash-Next-NVFP4 with
+    // GRIMOIRE_SEQ_SLOTS=8: HTTP 500 "batched decode step failed" on every
+    // request, single ones included.  One at a time it serves fine.
+    for (const auto& d : L)
+        if (d.ple && d.ple_ssd)
+            return "the per-layer embedding table is file-backed (GRIMOIRE_PLE_FILE)";
     if (!device_can_matrix(q) && !std::getenv("GRIMOIRE_BATCHED_PREFILL_NOXMX"))
         return "this device has no matrix hardware "
                "(GRIMOIRE_BATCHED_PREFILL_NOXMX=1 runs it slowly, for checking)";
@@ -7026,7 +7040,43 @@ bool Grimoire::decode_batch(const std::vector<int32_t>& toks,
     if (toks.size() != slots.size() || toks.size() != poss.size())
         throw std::invalid_argument("batch row arrays disagree in length");
     SeqBatch b{slots.data(), poss.data()};
+    // A batched step moves the bound slot and the cursor under the decode
+    // graph's feet; re-record before the next solo step rather than trust
+    // that nothing it baked was touched.  One capture per return to M=1.
+    graph_ok = false;
     return prefill(toks, &out, &b);
+}
+
+// One live sequence: step it like the one-at-a-time server.
+//
+// With GRIMOIRE_SEQ_SLOTS >= 2 every request used to go through
+// decode_batch(), and at M=1 that is the prompt path on one row with no
+// graph.  MEASURED 2026-10-03, Ornith-1.5-35B-A3B-MXFP4 on gpu0, llama-benchy
+// pp512/tg64: a lone request decoded at 132.7 tok/s against 195 on the
+// one-at-a-time path -- turning concurrency on cost single-user speed a
+// third.  Here the slot is bound, the cursor and the token are put on the
+// device (the graph reads both from there, see forward()), and the
+// recorded step is replayed.  A slot change drops the graph because it
+// bakes the slot's cache pointers (bind_seq_slot), so a different
+// conversation re-records once.  GRIMOIRE_SCHED_SOLO=0 = batched path.
+bool Grimoire::solo_ok() const {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_SCHED_SOLO");
+        return !(e && *e == '0'); }();
+    return on && !pp_enabled() && !tp_enabled() && !dag && !cfg.is_qwen4_exp &&
+           !mtp.ok && !dflash2.ok;
+}
+
+int Grimoire::decode_solo(int32_t tok, int slot, int position) {
+    sync();
+    bind_seq_slot(slot);
+    pos = position;
+    check_token(tok);
+    set_cursor(pos);
+    int32_t* dt = s.d_tok;
+    q.single_task([=] { *dt = tok; });
+    if (!graph_ok) build_graph();
+    if (!(graph_ok ? step() : forward(tok))) return -1;
+    return argmax_token();
 }
 
 // The drafter's KV cache is NOT in the snapshot, so a resumed request
@@ -15728,6 +15778,10 @@ void GrimoireScheduler::run() {
                         remaining.push_back(job->budget-int(job->ready.size()));
                     }
                     e.decode_spec_batch(toks,slots,poss,remaining,blocks,consumed);
+                } else if(toks.size()==1 && e.solo_ok()) {
+                    const int t=e.decode_solo(toks[0],slots[0],poss[0]);
+                    if(t<0) { failed=true; err="decode step failed"; }
+                    else blocks.push_back({t});
                 } else {
                     if(!e.decode_batch(toks,slots,poss,got) || got.size()!=toks.size()) {
                         failed=true; err="batched decode step failed";
