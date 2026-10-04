@@ -16103,6 +16103,28 @@ void GrimoireScheduler::run() {
                 taking.push_back(pending.front());
                 pending.pop_front();
             }
+            // A burst on an idle server (>= 2 requests at once): wait up to
+            // GRIMOIRE_ADMIT_HOLD_MS (default 8; 0 = never) for the rest of it,
+            // so it is admitted as ONE batch.  MEASURED 2026-10-04: llama-benchy's
+            // 8 simultaneous requests reached the scheduler as 6 + 2 or 3 + 3 + 2
+            // (c8 total 348-392 run to run).  A lone request is never held, and
+            // nothing is held while rows are decoding.
+            static const int hold_ms = [] {
+                const char* v = std::getenv("GRIMOIRE_ADMIT_HOLD_MS");
+                return v && *v ? std::max(0, std::atoi(v)) : 8; }();
+            if (hold_ms > 0 && batchable && active.empty() && taking.size() >= 2 &&
+                int(taking.size()) < width) {
+                const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
+                while (int(taking.size()) < width && !stopping) {
+                    if (pending.empty() &&
+                        !cv.wait_until(l, until, [&]{ return stopping || !pending.empty(); }))
+                        break;
+                    while (int(taking.size()) < width && !pending.empty()) {
+                        taking.push_back(pending.front());
+                        pending.pop_front();
+                    }
+                }
+            }
         }
         // Batched admission (Grimoire::admit_batch): every fresh prompt taken
         // this round in one prefill, up to GRIMOIRE_ADMIT_BATCH_TOKENS (default
