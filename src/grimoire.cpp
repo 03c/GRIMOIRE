@@ -14782,7 +14782,61 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // Unreachable today (TP only batches decode rows, M <= 16); this
             // keeps it unreachable when TP prompt prefill arrives.
             bool bn_bf_from_route=false, sh_gate_done=false;
-            if(d.tiered){
+            // Batched decode, M <= GRIMOIRE_MOE_ROWS_MAX (default 8): the decode
+            // step's ESIMD MoE pair (shared expert fused as slot top_k) over all
+            // M tokens -- launch_moe_shared_rows, per token bit-identical to a
+            // decode step's MoE.  MEASURED 2026-10-04 (GRIMOIRE_PROFILE_PREFILL,
+            // Ornith): the grouped small-M kernels ran the touched experts at
+            // ~220 GB/s at M=2 (routed MoE 4.53 ms + shared 0.71 ms per step);
+            // the decode kernels stream an expert at ~380 GB/s.  0 = off.
+            static const int moe_rows_max = [] {
+                const char* e = std::getenv("GRIMOIRE_MOE_ROWS_MAX"); return e ? std::atoi(e) : 8; }();
+            bool moe_rows_done=false;
+            const bool moe_rows = !d.tiered && seqb && !seqb->verify && M <= moe_rows_max &&
+                !tp_enabled() && !exact_verify && !capture_spec && !shared_aux &&
+                d.sh_gu.w.payload && d.sh_down.w.payload && !d.sh_gu.has_i4() && !d.sh_down.has_i4() &&
+                d.sh_gu.w.fmt == d.moe.gate_up.fmt && d.sh_down.w.fmt == d.moe.down.fmt &&
+                d.sh_gu.output_rows() / 2 == d.moe.cfg.inter && d.sh_gu.w.K == H &&
+                d.sh_down.w.N == H && d.sh_down.w.K == d.moe.cfg.inter &&
+                (!d.has_sh_gate || (d.sh_gate_q.w.fmt == Fmt::BF16 && d.sh_gate_q.w.payload &&
+                                    d.sh_gate_q.w.N == 1 && d.sh_gate_q.w.K == H)) &&
+                moe_shared_rows_ok(d.moe, d.sh_gu.w, d.sh_down.w);
+            if(moe_rows){
+                static float* mr_h = nullptr; static float* mr_g = nullptr; static size_t mr_cap = 0;
+                const size_t need = size_t(M) * size_t(cfg.top_k + 1) * size_t(d.moe.cfg.inter);
+                if(need > mr_cap){
+                    if(mr_h){ q.wait(); sycl::free(mr_h,q); sycl::free(mr_g,q); }
+                    mr_h = sycl::malloc_device<float>(need,q);
+                    mr_g = sycl::malloc_device<float>(64,q);
+                    mr_cap = (mr_h && mr_g) ? need : 0;
+                }
+                if(!mr_cap) throw std::runtime_error("batched decode MoE scratch allocation failed");
+                const uint16_t* gw = d.has_sh_gate
+                    ? reinterpret_cast<const uint16_t*>(d.sh_gate_q.w.payload) : nullptr;
+                launch_moe_shared_rows(q,d.moe,d.sh_gu.w,d.sh_down.w,gw,rex,rwt,bn,mr_h,mr_g,r0,M);
+                moe_rows_done = true;
+                // GRIMOIRE_ROWS_VERIFY=1 (debug, syncs): the decode step's MoE
+                // pair per token into a scratch output, compared bit for bit.
+                static const bool moe_rows_verify = std::getenv("GRIMOIRE_ROWS_VERIFY") != nullptr;
+                if(moe_rows_verify){
+                    float* ref=sycl::malloc_device<float>(size_t(M)*H,q);
+                    float* hh=sycl::malloc_device<float>(size_t(cfg.top_k+1)*d.moe.cfg.inter,q);
+                    float* gg=sycl::malloc_device<float>(16,q);
+                    for(int m=0;m<M;++m){
+                        launch_moe_gate_up_shared(q,d.moe,d.sh_gu.w,gw,rex+size_t(m)*cfg.top_k,
+                                                  bn+size_t(m)*H,hh,gg,{});
+                        launch_moe_down_shared(q,d.moe,d.sh_down.w,rex+size_t(m)*cfg.top_k,
+                                               rwt+size_t(m)*cfg.top_k,gw?gg:nullptr,hh,
+                                               ref+size_t(m)*H,{});
+                    }
+                    std::vector<float> a(size_t(M)*H), b(size_t(M)*H);
+                    q.memcpy(a.data(),r0,a.size()*4); q.memcpy(b.data(),ref,b.size()*4); q.wait();
+                    size_t ndiff=0;
+                    for(size_t i=0;i<a.size();++i) if(std::memcmp(&a[i],&b[i],4)) ++ndiff;
+                    std::fprintf(stderr,"    rows verify moe layer %d M=%d: %zu of %zu differ\n",li,M,ndiff,a.size());
+                    sycl::free(ref,q); sycl::free(hh,q); sycl::free(gg,q);
+                }
+            }else if(d.tiered){
                 if(M>=32 && device_can_matrix(q)){
                     if(!tiered_moe_prefill(d,bn,rex,rwt,r0,M))
                         throw std::runtime_error("tiered MoE prefill failed");
@@ -15064,7 +15118,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             if(tp_enabled() && !tp_allreduce_sum(r0,M*H))
                 throw std::runtime_error("TP batched MoE reduction failed");
             pp_mark("routed MoE");
-            if(shared_aux) wait_on(q,shared_ready);
+            if(moe_rows_done) q.memset(r1,0,size_t(M)*H*sizeof(float));   // shared expert is in r0
+            else if(shared_aux) wait_on(q,shared_ready);
             else {
                 if(!mlp_bf16(d.sh_gu,d.sh_down,r1,li)){
                     const int SI=d.sh_gu.output_rows()/2;
@@ -15944,7 +15999,14 @@ void GrimoireScheduler::run() {
                     finish(j, r);
                     continue;
                 }
+                static const bool adm_timing = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
+                const auto adm_t0 = std::chrono::steady_clock::now();
                 slot = e.admit_sequence(j->prompt, slot_busy);
+                if (adm_timing)
+                    std::fprintf(stderr, "    scheduler admit: slot %d, %zu prompt tokens, %.2f ms, %zu active\n",
+                                 slot, j->prompt.size(),
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - adm_t0).count(),
+                                 active.size());
                 j->slot = slot;
                 j->pos  = e.pos;
                 j->next = e.argmax_token();

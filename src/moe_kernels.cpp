@@ -780,6 +780,159 @@ sycl::event moe_dn_esimd(sycl::queue& q, const QuantWeight& w, const QuantWeight
     });
 }
 
+// Batched decode: moe_gu_esimd / moe_dn_esimd for M tokens in one launch --
+// the decode kernels with a token index in front of every work-group.  Token
+// m reads x[m], its own top-k experts d_expert[m*TK..] and writes h[m] (TK+1
+// slots, the shared expert last) / y[m]; every line of arithmetic is the
+// decode kernel's, so each token's MoE output is bit-identical to a decode
+// step's.  Each (token, expert) pair streams that expert once: at M <= 4 two
+// tokens rarely share one of 8-of-256 experts, so this reads what a grouped
+// kernel would, at the decode kernels' ~380 GB/s (the grouped small-M kernels
+// ran at ~220-300 GB/s, handoff 10-04).  The shared expert is re-read per
+// token (1.5 MB per token per layer).
+template <int R, int KS, int H>
+sycl::event moe_gu_esimd_rows(sycl::queue& q, const QuantWeight& w, const QuantWeight& ws,
+                              const uint16_t* gate_w, const int32_t* d_expert, const float* x,
+                              float* h, float* gate_out, int I, int TK, int M,
+                              const std::vector<sycl::event>& deps) {
+    constexpr int KP = H / KS;
+    static_assert(KP % 128 == 0, "K slice must be whole 128-element steps");
+    const int rg = I / R;
+    const int per_tok = (TK + 1) * rg + (gate_w ? 1 : 0);
+    const uint8_t* wp = w.payload; const uint8_t* wsc = static_cast<const uint8_t*>(w.scales);
+    const uint8_t* sp = ws.payload; const uint8_t* ssc = static_cast<const uint8_t*>(ws.scales);
+    const int64_t wrb = w.row_bytes, wrs = w.row_scales, srb = ws.row_bytes, srs = ws.row_scales;
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(deps);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(M) * per_tok * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<(KS * R * 2 * 4 > KS * 16 ? KS * R * 2 * 4 : KS * 16)>();
+            const int t = int(it.get_local_id(0));
+            const int m = int(it.get_group(0)) / per_tok;
+            const int g = int(it.get_group(0)) % per_tok;
+            const int kb = t * KP;
+            const float* xm = x + int64_t(m) * H;
+            if (g == (TK + 1) * rg) {                           // shared-expert gate
+                es::simd<float, 16> a = 0.0f;
+                for (int k = kb; k < kb + KP; k += 16) {
+                    es::simd<uint16_t, 16> gb = es::block_load<uint16_t, 16>(gate_w + k);
+                    es::simd<uint32_t, 16> gu = es::convert<uint32_t>(gb) << 16;
+                    es::simd<float, 16> gf = gu.template bit_cast_view<float>();
+                    a += gf * es::block_load<float, 16>(xm + k);
+                }
+                es::simd<float, 4> av = 0.0f;
+                av[0] = es::reduce<float>(a, std::plus<>());
+                es::slm_block_store<float, 4>(t * 16, av);
+                es::barrier();
+                if (t == 0) {
+                    float sum = 0.0f;
+                    es::simd<float, 4 * KS> pv = es::slm_block_load<float, 4 * KS>(0);
+                    #pragma unroll
+                    for (int j = 0; j < KS; ++j) sum += pv[4 * j];
+                    gate_out[m] = 1.0f / (1.0f + sycl::exp(-sum));
+                }
+                return;
+            }
+            const int slot = g / rg, i0 = (g % rg) * R;
+            const bool sh = slot == TK;
+            const uint8_t* pay = sh ? sp : wp;
+            const uint8_t* scl = sh ? ssc : wsc;
+            const int64_t rb = sh ? srb : wrb, rs = sh ? srs : wrs;
+            int e = sh ? 0 : d_expert[int64_t(m) * TK + slot];
+            if (e < 0) e = 0;              // unrouted slot: down weights it 0
+            const int64_t row0 = sh ? int64_t(i0) : int64_t(e) * 2 * I + i0;
+            es::simd<float, KP> xs = es::block_load<float, KP>(xm + kb);
+            es::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+            es::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+            es::simd<float, 16> ga[R], ua[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) { ga[r] = 0.0f; ua[r] = 0.0f; }
+            #pragma unroll 1
+            for (int st = 0; st < KP / 128; ++st) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int64_t gr = row0 + r, ur = row0 + I + r;
+                    mx4_row_step<KP>(pay + gr * rb + kb / 2, scl + gr * rs + kb / 32, st, xe, xo, ga[r]);
+                    mx4_row_step<KP>(pay + ur * rb + kb / 2, scl + ur * rs + kb / 32, st, xe, xo, ua[r]);
+                }
+            }
+            es::simd<float, 2 * R> red;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                red[2 * r] = es::reduce<float>(ga[r], std::plus<>());
+                red[2 * r + 1] = es::reduce<float>(ua[r], std::plus<>());
+            }
+            if constexpr (KS > 1) {
+                es::slm_block_store<float, 2 * R>(t * 2 * R * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, 2 * R>(j * 2 * R * 4);
+            }
+            float* hm = h + int64_t(m) * (TK + 1) * I;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float gv = red[2 * r], uv = red[2 * r + 1];
+                hm[int64_t(slot) * I + i0 + r] = gv / (1.0f + sycl::exp(-gv)) * uv;
+            }
+        });
+    });
+}
+
+template <int R, int I>
+sycl::event moe_dn_esimd_rows(sycl::queue& q, const QuantWeight& w, const QuantWeight& wd,
+                              const int32_t* d_expert, const float* d_weight, const float* gate_in,
+                              const float* h, float* y, int H, int TK, int M,
+                              const std::vector<sycl::event>& deps) {
+    static_assert(I % 128 == 0, "");
+    constexpr int RP = R < 4 ? 4 : R;
+    const uint8_t* wp = w.payload; const uint8_t* wsc = static_cast<const uint8_t*>(w.scales);
+    const uint8_t* sp = wd.payload; const uint8_t* ssc = static_cast<const uint8_t*>(wd.scales);
+    const int64_t wrb = w.row_bytes, wrs = w.row_scales, srb = wd.row_bytes, srs = wd.row_scales;
+    const int S = TK + 1;
+    const int per_tok = H / R;
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(deps);
+        cgh.parallel_for(sycl::nd_range<1>(size_t(M) * per_tok * S, S), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<16 * RP * 4>();
+            const int s = int(it.get_local_id(0));
+            const int m = int(it.get_group(0)) / per_tok;
+            const int o0 = (int(it.get_group(0)) % per_tok) * R;
+            const bool sh = s == TK;
+            const uint8_t* pay = sh ? sp : wp;
+            const uint8_t* scl = sh ? ssc : wsc;
+            const int64_t rb = sh ? srb : wrb, rs = sh ? srs : wrs;
+            int e = sh ? 0 : d_expert[int64_t(m) * TK + s];
+            float wt = sh ? (gate_in ? gate_in[m] : 1.0f) : d_weight[int64_t(m) * TK + s];
+            if (e < 0) { e = 0; wt = 0.0f; }
+            const int64_t row0 = sh ? int64_t(o0) : int64_t(e) * H + o0;
+            es::simd<float, I> hs = es::block_load<float, I>(h + (int64_t(m) * S + s) * I);
+            es::simd<float, I / 2> he = hs.template select<I / 2, 2>(0);
+            es::simd<float, I / 2> ho = hs.template select<I / 2, 2>(1);
+            es::simd<float, 16> acc[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+            #pragma unroll
+            for (int st = 0; st < I / 128; ++st) {
+                #pragma unroll
+                for (int r = 0; r < R; ++r)
+                    mx4_row_step<I>(pay + (row0 + r) * rb, scl + (row0 + r) * rs, st, he, ho, acc[r]);
+            }
+            es::simd<float, RP> part = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) part[r] = es::reduce<float>(acc[r], std::plus<>()) * wt;
+            es::slm_block_store<float, RP>(s * RP * 4, part);
+            es::barrier();
+            if (s != 0) return;
+            es::simd<float, RP> tot = 0.0f;
+            for (int j = 0; j < S; ++j) tot += es::slm_block_load<float, RP>(j * RP * 4);
+            float* ym = y + int64_t(m) * H;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) ym[o0 + r] = tot[r];
+        });
+    });
+}
+
 bool moe_esimd_decode_on() {
     static const bool v = [] { const char* e = std::getenv("GRIMOIRE_MOE_ESIMD_DECODE");
         return !(e && *e == '0'); }();
@@ -854,6 +1007,23 @@ sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const Quan
         case Fmt::BF16:     return moe_down_sh<Fmt::BF16>(q, L, wd, d_expert, d_weight, gate_in, h, y, deps);
     }
     return {};
+}
+
+// Batched decode (M tokens): the ESIMD decode MoE pair over every token in two
+// launches.  rex/rwt [M][top_k], x [M][H], h scratch [M][(top_k+1)*I],
+// gate_out [M] (when gate_w), y [M][H] = routed + (gated) shared expert.
+bool moe_shared_rows_ok(const MoeLayer& L, const QuantWeight& ws, const QuantWeight& wd) {
+    return moe_esimd_gu_ok(L, ws) && moe_esimd_dn_ok(L, wd);
+}
+sycl::event launch_moe_shared_rows(sycl::queue& q, const MoeLayer& L, const QuantWeight& ws,
+                                   const QuantWeight& wd, const uint16_t* gate_w,
+                                   const int32_t* rex, const float* rwt, const float* x,
+                                   float* h, float* gate_out, float* y, int M,
+                                   const std::vector<sycl::event>& deps) {
+    sycl::event e = moe_gu_esimd_rows<2, 8, 2048>(q, L.gate_up, ws, gate_w, rex, x, h, gate_out,
+                                                  L.cfg.inter, L.cfg.top_k, M, deps);
+    return moe_dn_esimd_rows<2, 512>(q, L.down, wd, rex, rwt, gate_w ? gate_out : nullptr, h, y,
+                                     L.cfg.hidden, L.cfg.top_k, M, {e});
 }
 
 sycl::event launch_mova_value_decode(sycl::queue& q, const QuantWeight& w,

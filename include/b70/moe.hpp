@@ -150,6 +150,15 @@ sycl::event launch_moe_down_shared(sycl::queue& q, const MoeLayer& L, const Quan
                                    const int32_t* d_expert, const float* d_weight,
                                    const float* gate_in, const float* h, float* y,
                                    const std::vector<sycl::event>& deps = {});
+// moe_kernels.cpp: batched decode MoE -- the ESIMD decode pair (shared expert
+// fused as slot top_k) for M tokens: rex/rwt [M][top_k], x [M][H], h scratch
+// [M][(top_k+1)*inter], gate_out [M] (when gate_w), y [M][H].  Per token
+// bit-identical to the decode step's MoE.
+bool moe_shared_rows_ok(const MoeLayer& L, const QuantWeight& ws, const QuantWeight& wd);
+sycl::event launch_moe_shared_rows(sycl::queue& q, const MoeLayer& L, const QuantWeight& ws,
+    const QuantWeight& wd, const uint16_t* gate_w, const int32_t* rex, const float* rwt,
+    const float* x, float* h, float* gate_out, float* y, int M,
+    const std::vector<sycl::event>& deps = {});
 sycl::event launch_moe_gate_up_batched(
     sycl::queue& q, const MoeLayer& L, const int32_t* d_expert,
     const float* x, float* h, int tokens,
