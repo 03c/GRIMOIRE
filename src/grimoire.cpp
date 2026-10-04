@@ -2515,6 +2515,11 @@ struct Grimoire {
     bool restore_prefix_upto(int n);
     bool save_prefix(const std::vector<int32_t>& tokens, bool output_valid = true);
     int admit_sequence(const std::vector<int32_t>& prompt, const std::vector<bool>& busy);
+    // Several fresh prompts in ONE prefill (see the definition).  false =
+    // nothing admitted; the caller admits them one at a time.
+    bool admit_batch(const std::vector<const std::vector<int32_t>*>& prompts,
+                     const std::vector<bool>& busy, std::vector<int>& slots,
+                     std::vector<int32_t>& first);
     void cache_sequence(int slot, int position, const std::vector<int32_t>& prompt,
                         const std::vector<int32_t>& reply);
     // What generate_tokens() calls at the end of a request, covering the
@@ -3249,7 +3254,10 @@ struct Grimoire {
     // slot[r] names the sequence's KV rows (see bind_seq_slot) and
     // pos[r] its position in that sequence.  Both are HOST arrays: this
     // path never records a command graph, so there is nothing to bake.
-    struct SeqBatch { const int* slot; const int* pos; bool verify=false; };
+    // spans: rows come in runs of consecutive tokens of one sequence each (a
+    // batched admission of several prompts, admit_batch); verify: one run of
+    // speculative candidates.  Neither: one token per sequence (decode).
+    struct SeqBatch { const int* slot; const int* pos; bool verify=false; bool spans=false; };
     // allow_exact_restore: whether an exact-match cache hit may REBIND
     // the live slot out from under the caller (external audit,
     // 2026-09-21).  The serial single-conversation path
@@ -7376,6 +7384,53 @@ bool Grimoire::restore_prefix_upto(int n) {
 
 // Admission owns the choice of physical slot. Cache lookup excludes every
 // live request, including live requests with an identical system prompt.
+// Batched admission: several fresh prompts (no prefix to reuse) in ONE
+// prefill.  The rows are the prompts back to back, a run per prompt in its
+// own slot from position 0 (SeqBatch::spans): projections, MoE, norms and the
+// head read their weights once for all prompts; conv, DeltaNet and attention
+// run per prompt.  A 512-token prompt alone touches all 256 of Ornith's
+// experts -- ~17 GB of weights for 512 tokens.  MEASURED 2026-10-04: eight
+// 512-token prompts admitted one by one took ~110 ms each, ~970 ms of a
+// llama-benchy c8 round; the same 4096 tokens as one prompt prefill at
+// ~9,900 tok/s.  Each prompt's first token comes from its own last row.
+bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& prompts,
+                           const std::vector<bool>& busy, std::vector<int>& slots,
+                           std::vector<int32_t>& first) {
+    slots.clear(); first.clear();
+    if (prompts.size() < 2 || busy.size() != size_t(n_seq_slots)) return false;
+    if (pp_enabled() || tp_enabled() || mtp.ok || dflash2.ok || prefix_cache_usable() ||
+        !batch_unsupported_reason().empty())
+        return false;
+    std::vector<int> pick;
+    for (int i = 0; i < n_seq_slots && pick.size() < prompts.size(); ++i)
+        if (!busy[size_t(i)]) pick.push_back(i);
+    if (pick.size() < prompts.size()) return false;
+    std::vector<int32_t> toks; std::vector<int> rs, rp;
+    for (size_t k = 0; k < prompts.size(); ++k) {
+        const auto& pr = *prompts[k];
+        if (pr.empty() || pr.size() > size_t(max_seq)) return false;
+        for (size_t i = 0; i < pr.size(); ++i) {
+            check_token(pr[i]);
+            toks.push_back(pr[i]); rs.push_back(pick[k]); rp.push_back(int(i));
+        }
+    }
+    sync();
+    for (int sl : pick) clear_seq_slot(sl);
+    SeqBatch b{rs.data(), rp.data()};
+    b.spans = true;
+    std::vector<int32_t> out;
+    bool ok = false;
+    try { ok = prefill(toks, &out, &b); } catch (...) { ok = false; }
+    if (!ok || out.size() != prompts.size()) {
+        sync();
+        for (int sl : pick) clear_seq_slot(sl);
+        return false;
+    }
+    graph_ok = false;
+    slots = pick; first = out;
+    return true;
+}
+
 int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
                             const std::vector<bool>& busy) {
     if (busy.size() != size_t(n_seq_slots))
@@ -12894,7 +12949,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // A batch does not have ONE position, so the engine's cursor says
         // nothing about whether it fits.  Every row is checked against
         // its own sequence instead.
-        if(tokens.empty()||int(tokens.size())>kMaxBatchRows)
+        if(tokens.empty()||(!seqb->spans && int(tokens.size())>kMaxBatchRows))
             throw std::invalid_argument("batch is empty or wider than the engine allows");
         for(size_t r=0;r<tokens.size();++r){
             if(seqb->slot[r]<0||seqb->slot[r]>=n_seq_slots)
@@ -12905,6 +12960,21 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         // Two rows in one slot would append two keys to the same
         // position and then both read the survivor.  Fluent, wrong, and
         // impossible to see in the output.
+        if(seqb->spans){
+            // runs: each slot appears in ONE run of consecutive positions
+            std::vector<char> seen(size_t(n_seq_slots),0);
+            for(size_t r=0;r<tokens.size();++r){
+                const bool cont = r>0 && seqb->slot[r]==seqb->slot[r-1];
+                if(cont){
+                    if(seqb->pos[r]!=seqb->pos[r-1]+1)
+                        throw std::invalid_argument("batch span is not a contiguous run of positions");
+                }else{
+                    if(seen[size_t(seqb->slot[r])])
+                        throw std::invalid_argument("batch spans share a slot");
+                    seen[size_t(seqb->slot[r])]=1;
+                }
+            }
+        }else
         for(size_t a=0;a+1<tokens.size();++a)
             for(size_t b=a+1;b<tokens.size();++b)
                 if(seqb->slot[a]==seqb->slot[b]) {
@@ -13068,7 +13138,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     static const bool host_split = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
     const auto t_pf0 = std::chrono::steady_clock::now();
     RowSlots rslots{};
-    const bool rows_ok = seqb && rows_batch && M <= kMaxRowSlots;
+    // One launch for all rows assumes every row is a DIFFERENT sequence: a
+    // verify block or a prompt span is consecutive tokens of one sequence,
+    // which a parallel DeltaNet/conv update would race on.
+    const bool rows_ok = seqb && !seqb->verify && !seqb->spans && rows_batch && M <= kMaxRowSlots;
+    // Batched admission (seqb->spans): the runs of rows that are one prompt
+    // each.  Conv, DeltaNet and attention run per run with the prompt kernels;
+    // everything row-wise (projections, MoE, norms) runs once over all rows.
+    struct SpanRun { int slot, row0, count, pos0; };
+    std::vector<SpanRun> runs;
+    const bool spans_mode = seqb && seqb->spans;
+    if (spans_mode) {
+        for (int r = 0; r < M; ++r) {
+            if (r == 0 || seqb->slot[r] != seqb->slot[r - 1])
+                runs.push_back({seqb->slot[r], r, 1, seqb->pos[r]});
+            else ++runs.back().count;
+        }
+        // configurations the per-run code below does not cover: the caller
+        // admits one prompt at a time instead
+        bool unsupported = pp_enabled() || tp_enabled() || mtp.ok || dflash2.ok ||
+                           cfg.is_qwen4_exp || dflash2.target_aux;
+        for (const auto& d : L) unsupported = unsupported || d.k2_sparse || d.ple || d.tiered;
+        if (unsupported) return false;
+    }
     if (rows_ok) for (int r = 0; r < M; ++r) { rslots.slot[r] = seqb->slot[r]; rslots.pos[r] = seqb->pos[r]; }
     // Each row's attention length (pos + 1), uploaded once per step from a
     // pinned staging buffer (in-order queue; the previous step's copy is
@@ -13077,7 +13169,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     static int32_t* rows_len_host = nullptr;
     static sycl::event rows_len_ev;
     int32_t* rows_len_dev = nullptr;
-    if (seqb && rows_batch && M <= 1024) {
+    if (seqb && !seqb->spans && rows_batch && M <= 1024) {
         if (!rows_len_buf) {
             rows_len_buf = sycl::malloc_device<int32_t>(1024, q);
             rows_len_host = sycl::malloc_host<int32_t>(1024, q);
@@ -13127,8 +13219,9 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     int8_t* a8  = w4a8_enabled()?static_cast<int8_t*>(pf_alloc(size_t(size_t(M)*std::max(H,W))*sizeof(int8_t),false)):nullptr;
     float*  a8s = w4a8_enabled()?static_cast<float*>(pf_alloc(size_t(size_t(M))*sizeof(float),false)):nullptr;
     int32_t* dtok=static_cast<int32_t*>(pf_alloc(size_t(M)*sizeof(int32_t),false));
+    // spans: logits only for the last token of each prompt
     float* batch_logits = next_tokens
-        ? static_cast<float*>(pf_alloc(size_t(size_t(M) * cfg.vocab)*sizeof(float),false)) : nullptr;
+        ? static_cast<float*>(pf_alloc(size_t(size_t(spans_mode ? int(runs.size()) : M) * cfg.vocab)*sizeof(float),false)) : nullptr;
     // Dense checkpoints legitimately have top_k == 0.  USM zero-byte
     // allocation returns null and used to make their prefill fail before the
     // first kernel, even though these placeholders are never consumed.
@@ -14074,7 +14167,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             // verification with it drifts into repetition. Exact speculative
             // verification must consume the same weights as decode.
             const bool fused_in=!exact_verify&&d.la_all.payload&&d.la_all.w.N==12352;
-            const bool native_rec=(xe2_gdn_raw||xe2_gdn)&&pos==0&&M>=64&&
+            const bool native_rec=!spans_mode&&(xe2_gdn_raw||xe2_gdn)&&pos==0&&M>=64&&
                 (!xe2_gdn_raw||li<raw_gdn_layer_limit);
             const bool bf_dn_qkv=std::getenv("GRIMOIRE_BF16_DN_QKV")&&
                 native_rec&&!fused_in&&xe2_dense_mxfp4&&
@@ -14128,6 +14221,17 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // the two from drifting apart.  rows_ok: the same kernel-4
                 // arithmetic for every row in one launch, each row on its
                 // own ring (launch_causal_conv1d_split_rows).
+                if(spans_mode){
+                    // one prompt per run: the prompt conv over its rows and ring
+                    for(const auto& sr:runs){
+                        ConvParams cp{t0+int64_t(sr.row0)*ch,d.la_conv,
+                                      d.conv_base+size_t(sr.slot)*d.conv_slot,nullptr,
+                                      ch,cfg.conv_kernel};
+                        launch_causal_conv1d_split_prefill(q,cp,sr.count,
+                            t1+int64_t(sr.row0)*qs,t2+int64_t(sr.row0)*qs,t3+int64_t(sr.row0)*vs,
+                            nullptr,qs,vs);
+                    }
+                }else
                 if(rows_ok && !capture_spec && causal_conv1d_rows_ok(cfg.conv_kernel))
                     launch_causal_conv1d_split_rows(q,t0,d.la_conv,d.conv_base,
                         int64_t(d.conv_slot),rslots,M,ch,cfg.conv_kernel,t1,t2,t3,qs,vs);
@@ -14194,7 +14298,29 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // the token dimension anyway, so at small M just run the decode
                 // kernel once per token: 4 tokens = 1.7 ms instead of 7.2.
                 // This is what makes an MTP verify batch affordable.
-                if(rows_ok && !capture_spec){
+                if(spans_mode){
+                    // one prompt per run, on its own state: the chunked prefill
+                    // recurrence, or decode steps for a short prompt (as below)
+                    for(const auto& sr:runs){
+                        float* st=d.dn_base+size_t(sr.slot)*d.dn_slot;
+                        if(sr.count<=16){
+                            for(int t=sr.row0;t<sr.row0+sr.count;++t){
+                                DeltaNetParams sp{};
+                                sp.q=t1+size_t(t)*Hk*Dk; sp.k=t2+size_t(t)*Hk*Dk;
+                                sp.v=t3+size_t(t)*Hv*Dv; sp.a=alpha+size_t(t)*Hv;
+                                sp.beta=beta+size_t(t)*Hv; sp.state=st;
+                                sp.out=t0+size_t(t)*Hv*Dv;
+                                sp.n_heads=Hv; sp.k_dim=Dk; sp.v_dim=Dv; sp.n_k_heads=Hk;
+                                launch_deltanet_step(q,sp,{});
+                            }
+                        }else{
+                            const size_t r0=size_t(sr.row0);
+                            DeltaNetPrefillParams dp{t1+r0*Hk*Dk,t2+r0*Hk*Dk,t3+r0*Hv*Dv,
+                                alpha+r0*Hv,beta+r0*Hv,st,t0+r0*Hv*Dv,Hv,Dk,Dv,sr.count,Hk};
+                            launch_deltanet_prefill(q,dp);
+                        }
+                    }
+                }else if(rows_ok && !capture_spec){
                     // batched decode: every row's step in one launch, each on
                     // its own state slot (launch_deltanet_step_rows)
                     DeltaNetParams sp{};
@@ -14400,6 +14526,27 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // router, the head -- stays batched, and that is where
                 // the weights are read.
                 const int QH=cfg.n_heads*d.head_dim, KH=d.kv_heads*d.head_dim;
+                if(spans_mode){
+                    // one prompt per run: its rows at positions pos0.. into its cache
+                    for(const auto& sr:runs){
+                        float* qr=qv+int64_t(sr.row0)*QH;
+                        float* kr=t3+int64_t(sr.row0)*KH;
+                        float* vr=t4+int64_t(sr.row0)*KH;
+                        uint8_t* kc=d.k_base+size_t(sr.slot)*d.kv_slot;
+                        uint8_t* vc=d.v_base+size_t(sr.slot)*d.kv_slot;
+                        if(d.rope_proportional)
+                            launch_qk_norm_rope_proportional_batched(q,qr,kr,d.q_norm,
+                                d.k_norm,sr.count,cfg.n_heads,d.kv_heads,d.head_dim,sr.pos0,
+                                d.rope_theta,d.partial_rope,cfg.rms_eps,{},1.0f,
+                                d.rope_factor);
+                        else
+                            launch_qk_norm_rope_batched(q,qr,kr,d.q_norm,d.k_norm,sr.count,
+                                cfg.n_heads,d.kv_heads,d.head_dim,sr.pos0,d.rope_theta,
+                                d.partial_rope,cfg.rms_eps);
+                        launch_kv_append_batched(q,kr,vr,kc,vc,sr.count,sr.pos0,d.kv_heads,
+                            d.head_dim,max_seq);
+                    }
+                }else
                 if(rows_ok && !d.rope_proportional){
                     // every row in one launch each, at its own position and
                     // into its own cache (bit-identical to the loop below)
@@ -14464,6 +14611,16 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             }
             pp_mark("attn rope + kv append");
             const sycl_bf16* attention_bf=nullptr;
+            if(spans_mode){
+                // one prompt per run: causal prefill attention over its cache
+                for(const auto& sr:runs){
+                    const int QH=cfg.n_heads*d.head_dim;
+                    launch_flash_prefill(q,qv+int64_t(sr.row0)*QH,
+                        d.k_base+size_t(sr.slot)*d.kv_slot,d.v_base+size_t(sr.slot)*d.kv_slot,
+                        t3+int64_t(sr.row0)*QH,sr.count,sr.pos0,cfg.n_heads,
+                        d.kv_heads,d.head_dim,max_seq,cfg.attn_softmax_scale(d.head_dim));
+                }
+            }else
             if(seqb){
                 // Each row attends to ITS OWN conversation and to nothing
                 // else.  This is the one place a batched decode differs
@@ -15214,7 +15371,26 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
       else launch_rmsnorm_residual_batched(q,bh,r0_in_h?nullptr:r0,r1,fnorm,bn,M,H,cfg.rms_eps);
       if(prefill_host_progress){q.wait_and_throw();
           std::fprintf(stderr,"    prefill stage: final norm done\n");std::fflush(stderr);}
-      if (next_tokens) {
+      if (next_tokens && spans_mode) {
+        // batched admission: each prompt's first token, from its last row
+        for (size_t r = 0; r < runs.size(); ++r) {
+            const int last = runs[r].row0 + runs[r].count - 1;
+            float* row = batch_logits + int64_t(r) * cfg.vocab;
+            gemv_any(lm_head, bn + int64_t(last) * H, row, {});
+            launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
+            q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));
+            static const bool adm_dbg = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
+            if (adm_dbg) {
+                std::vector<float> lg(size_t(cfg.vocab));
+                q.memcpy(lg.data(), row, lg.size() * 4).wait();
+                int a = 0, b = -1;
+                for (int i = 1; i < cfg.vocab; ++i) if (lg[size_t(i)] > lg[size_t(a)]) a = i;
+                for (int i = 0; i < cfg.vocab; ++i) if (i != a && (b < 0 || lg[size_t(i)] > lg[size_t(b)])) b = i;
+                std::fprintf(stderr, "    admit debug (batched) run %zu, %d tokens: top1 %d %.4f top2 %d %.4f\n",
+                             r, runs[r].count, a, lg[size_t(a)], b, lg[size_t(b)]);
+            }
+        }
+      } else if (next_tokens) {
         // Verification needs the main-model choice after every candidate,
         // not only after the last row. Keep the reductions and copies on the
         // in-order queue, then return all token ids in one host transfer.
@@ -15289,12 +15465,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         pos+=M; set_cursor(pos);
     }
     if (next_tokens) {
-        next_tokens->resize(M);
+        next_tokens->resize(spans_mode ? runs.size() : size_t(M));
         // dtok is only computed where the head runs.  Under PP that is
         // the last stage; the earlier stages leave the buffer alone and
         // take the answer from the backward hop below.
         if (!pp_enabled() || pp_rank == pp_world - 1)
-            q.memcpy(next_tokens->data(), dtok, size_t(M) * sizeof(int32_t));
+            q.memcpy(next_tokens->data(), dtok, next_tokens->size() * sizeof(int32_t));
     }
     const auto t_enq = std::chrono::steady_clock::now();
     q.wait();
@@ -15928,6 +16104,59 @@ void GrimoireScheduler::run() {
                 pending.pop_front();
             }
         }
+        // Batched admission (Grimoire::admit_batch): every fresh prompt taken
+        // this round in one prefill, up to GRIMOIRE_ADMIT_BATCH_TOKENS (default
+        // 8192) tokens; 0 = one prompt at a time.  Whatever it does not take
+        // goes through the per-prompt loop below.
+        static const int admit_batch_tokens = [] {
+            const char* v = std::getenv("GRIMOIRE_ADMIT_BATCH_TOKENS");
+            return v && *v ? std::max(0, std::atoi(v)) : 8192; }();
+        if (batchable && admit_batch_tokens > 0 && taking.size() >= 2) {
+            std::vector<std::shared_ptr<SchedJob>> group;
+            std::vector<const std::vector<int32_t>*> prompts;
+            size_t tot = 0;
+            const size_t free_slots = size_t(std::count(slot_busy.begin(), slot_busy.end(), false));
+            for (auto& j : taking) {
+                if (cancelled(j) || group.size() >= free_slots) continue;
+                if (tot + j->prompt.size() > size_t(admit_batch_tokens)) continue;
+                group.push_back(j); prompts.push_back(&j->prompt); tot += j->prompt.size();
+            }
+            std::vector<int> bslots; std::vector<int32_t> bfirst;
+            static const bool adm_timing_b = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
+            const auto bt0 = std::chrono::steady_clock::now();
+            bool batched = false;
+            if (group.size() >= 2) {
+                try { batched = e.admit_batch(prompts, slot_busy, bslots, bfirst); }
+                catch (const std::exception& ex) {
+                    std::fprintf(stderr, "    batched admission skipped: %s\n", ex.what());
+                    batched = false;
+                }
+            }
+            if (batched) {
+                if (adm_timing_b)
+                    std::fprintf(stderr, "    scheduler admit batch: %zu prompts, %zu tokens, %.2f ms, %zu active\n",
+                                 group.size(), tot,
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bt0).count(),
+                                 active.size());
+                for (size_t k = 0; k < group.size(); ++k) {
+                    auto& j = group[k];
+                    j->slot = bslots[k];
+                    j->pos  = int(j->prompt.size());
+                    j->next = bfirst[k];
+                    slot_busy[size_t(j->slot)] = true;
+                    const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                                      (j->eot >= 0 && j->next == j->eot);
+                    if (stop) retire(j, FinishReason::Stop);
+                    else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
+                    else if (j->budget <= 1) retire(j, FinishReason::Length);
+                    else active.push_back(j);
+                }
+                std::vector<std::shared_ptr<SchedJob>> rest;
+                for (auto& j : taking)
+                    if (std::find(group.begin(), group.end(), j) == group.end()) rest.push_back(j);
+                taking.swap(rest);
+            }
+        }
         for (auto& j : taking) {
             if (cancelled(j)) { finish(j, FinishReason::Cancelled); continue; }
             int slot = -1;
@@ -16010,6 +16239,16 @@ void GrimoireScheduler::run() {
                 j->slot = slot;
                 j->pos  = e.pos;
                 j->next = e.argmax_token();
+                static const bool adm_dbg1 = std::getenv("GRIMOIRE_ADMIT_DEBUG") != nullptr;
+                if (adm_dbg1) {
+                    std::vector<float> lg(size_t(e.cfg.vocab));
+                    e.q.memcpy(lg.data(), e.s.logits, lg.size() * 4).wait();
+                    int a = 0, b = -1;
+                    for (int i = 1; i < e.cfg.vocab; ++i) if (lg[size_t(i)] > lg[size_t(a)]) a = i;
+                    for (int i = 0; i < e.cfg.vocab; ++i) if (i != a && (b < 0 || lg[size_t(i)] > lg[size_t(b)])) b = i;
+                    std::fprintf(stderr, "    admit debug (single) %zu tokens: top1 %d %.4f top2 %d %.4f\n",
+                                 j->prompt.size(), a, lg[size_t(a)], b, lg[size_t(b)]);
+                }
                 slot_busy[size_t(slot)] = true;
                 const bool stop = (j->eos >= 0 && j->next == j->eos) ||
                                   (j->eot >= 0 && j->next == j->eot);
