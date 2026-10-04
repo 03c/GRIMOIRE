@@ -16071,6 +16071,9 @@ struct GrimoireScheduler {
           j->reason = r; j->error = std::move(err); j->done = true; }
         j->cv.notify_all();
     }
+    // busy-period concurrency, for the admission hold (see run())
+    int busy_peak = 0, prev_peak = 0;
+    std::chrono::steady_clock::time_point idle_since{};
     static bool cancelled(const std::shared_ptr<SchedJob>& j) {
         std::lock_guard<std::mutex> l(j->mu);
         return j->cancelled;
@@ -16107,6 +16110,11 @@ void GrimoireScheduler::run() {
         {
             std::unique_lock<std::mutex> l(m);
             if (active.empty() && pending.empty()) {
+                // end of a busy period: remember how concurrent it was
+                if (busy_peak > 0) {
+                    prev_peak = busy_peak; busy_peak = 0;
+                    idle_since = std::chrono::steady_clock::now();
+                }
                 if (stopping) return;
                 cv.wait(l, [&]{ return stopping || !pending.empty(); });
                 if (stopping && pending.empty()) return;
@@ -16124,8 +16132,15 @@ void GrimoireScheduler::run() {
             static const int hold_ms = [] {
                 const char* v = std::getenv("GRIMOIRE_ADMIT_HOLD_MS");
                 return v && *v ? std::max(0, std::atoi(v)) : 8; }();
-            if (hold_ms > 0 && batchable && active.empty() && taking.size() >= 2 &&
-                int(taking.size()) < width) {
+            // A lone request is held too, but ONLY when the previous busy
+            // period served concurrent requests and ended < 10 s ago: a burst
+            // whose first request ran ahead (llama-benchy c4 was admitted as
+            // 1 + 3 in two of five rounds, c4 257 vs 328 tok/s).  A plain
+            // single-user chat never waits.
+            const bool lone_burst = taking.size() == 1 && prev_peak >= 2 &&
+                std::chrono::steady_clock::now() - idle_since < std::chrono::seconds(10);
+            if (hold_ms > 0 && batchable && active.empty() &&
+                (taking.size() >= 2 || lone_burst) && int(taking.size()) < width) {
                 const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
                 while (int(taking.size()) < width && !stopping) {
                     if (pending.empty() &&
@@ -16299,6 +16314,7 @@ void GrimoireScheduler::run() {
                 retire(j, FinishReason::Length, false, ex.what());
             }
         }
+        if (int(active.size()) > busy_peak) busy_peak = int(active.size());
         if (active.empty()) continue;
 
         // ---- step every live request together ------------------------
