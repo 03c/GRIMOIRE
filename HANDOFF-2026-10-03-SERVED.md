@@ -536,3 +536,47 @@ and spans rows, which are consecutive tokens of one sequence.
   - the shared expert read once per step, not once per token.
 - Optionally hold admission a few ms when requests arrive together: llama-benchy's 8 arrive
   as 6 + 2.
+
+## 10. 2026-10-04 afternoon: consistent batching, top-k, release v1.5 (main 286ad6e)
+
+**Changes:**
+- **a97da18 + 286ad6e: burst admission hold.** An idle server waits up to
+  GRIMOIRE_ADMIT_HOLD_MS (default 8) for the rest of a burst, so the burst is admitted as ONE
+  batched prefill. A lone request is held only if the previous busy period was concurrent and
+  ended < 10 s ago, so a single-user chat never waits.
+- **Why:** Ian asked "so now c4 is slower". The engine was not slower; the 4-row step had gone
+  11.42 → 10.71 ms. llama-benchy's c4 rounds were being admitted as 1 + 3 in 2 of 5 rounds
+  (257 vs 328 tok/s).
+- **8744f17: batched router top-k** on the decode step's ESIMD kernel, one thread per token,
+  bit-identical. The sub-group batched kernel cost ~21 µs per layer, 0.84 ms per step, at every
+  M.
+- **8744f17: norm bf16 rows reused** (bn_bf_sync): small-M GEMMs read the norm's bf16 rows
+  directly.
+- **8744f17: wider K-split for the BF16 router GEMM.**
+
+**Device time per batched step:** M=1 5.65, M=2 7.91, M=4 10.71, M=8 16.27 ms.
+
+**v1.5 image** (c88c16bb8e01, sha256 1aa2237d…), llama-benchy (coherence PASSED):
+
+| | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| total tok/s | 193.6 | 237.8 | 354.8 | 464.2 |
+| vLLM | 72.6 | 125.2 | 210.6 | 332.0 |
+
+- pp512 at c8: 9,547 tok/s.
+- Single user, unchanged: 195.7 / 183.4 / 172.2 tok/s at 0 / 2K / 4K.
+
+**Tried and dropped:**
+- **Dense weights-as-A GEMM:** la_qkv at M=8 ran at 78 vs 127 GB/s.
+- **MoE rows per work-group** (R = 2/4/8): no change.
+- **Shared expert read once per step** (one work-group set looping all tokens + a separate
+  down launch): slower, MoE M=8 9.82 → 10.90 ms, because the shared work-groups become
+  stragglers. Removing the shared slot entirely saves only 0.86 ms at M=8, including its
+  per-token arithmetic.
+
+**State:** GRIMOIRE-ORNITH runs v1.5 on renderD129, port 6889, GRIMOIRE_SEQ_SLOTS=8.
+
+**Next, if Ian wants more:**
+- A decode-graph path for M rows; the batched step still pays the prefill machinery's extra
+  kernels.
+- Dedupe of routed experts shared by two tokens at M=8.
