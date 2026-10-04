@@ -16153,14 +16153,20 @@ void GrimoireScheduler::run() {
                 }
             }
         }
-        // Batched admission (Grimoire::admit_batch): every fresh prompt taken
-        // this round in one prefill, up to GRIMOIRE_ADMIT_BATCH_TOKENS (default
-        // 8192) tokens; 0 = one prompt at a time.  Whatever it does not take
-        // goes through the per-prompt loop below.
+        // Batched admission (Grimoire::admit_batch): the fresh prompts taken
+        // this round go through as FEW prefills as possible -- batches of up to
+        // GRIMOIRE_ADMIT_BATCH_TOKENS (default 32768) tokens, one after another;
+        // 0 = one prompt at a time.  A prompt left alone goes through the
+        // per-prompt loop below.  MEASURED 2026-10-04, llama-benchy pp4096/tg32
+        // (8 x 4096 prompt tokens): with an 8192-token cap two prompts were
+        // batched and six admitted one by one, the first requests' tokens then
+        // waited ~2.5 s for the rest -- c8 tg 74 tok/s total; all eight in one
+        // 32768-token prefill (3.25 s, fits next to the model): c8 tg 390.
         static const int admit_batch_tokens = [] {
             const char* v = std::getenv("GRIMOIRE_ADMIT_BATCH_TOKENS");
-            return v && *v ? std::max(0, std::atoi(v)) : 8192; }();
-        if (batchable && admit_batch_tokens > 0 && taking.size() >= 2) {
+            return v && *v ? std::max(0, std::atoi(v)) : 32768; }();
+        static const bool adm_timing_b = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
+        while (batchable && admit_batch_tokens > 0 && taking.size() >= 2) {
             std::vector<std::shared_ptr<SchedJob>> group;
             std::vector<const std::vector<int32_t>*> prompts;
             size_t tot = 0;
@@ -16170,41 +16176,38 @@ void GrimoireScheduler::run() {
                 if (tot + j->prompt.size() > size_t(admit_batch_tokens)) continue;
                 group.push_back(j); prompts.push_back(&j->prompt); tot += j->prompt.size();
             }
+            if (group.size() < 2) break;
             std::vector<int> bslots; std::vector<int32_t> bfirst;
-            static const bool adm_timing_b = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
             const auto bt0 = std::chrono::steady_clock::now();
             bool batched = false;
-            if (group.size() >= 2) {
-                try { batched = e.admit_batch(prompts, slot_busy, bslots, bfirst); }
-                catch (const std::exception& ex) {
-                    std::fprintf(stderr, "    batched admission skipped: %s\n", ex.what());
-                    batched = false;
-                }
+            try { batched = e.admit_batch(prompts, slot_busy, bslots, bfirst); }
+            catch (const std::exception& ex) {
+                std::fprintf(stderr, "    batched admission skipped: %s\n", ex.what());
+                batched = false;
             }
-            if (batched) {
-                if (adm_timing_b)
-                    std::fprintf(stderr, "    scheduler admit batch: %zu prompts, %zu tokens, %.2f ms, %zu active\n",
-                                 group.size(), tot,
-                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bt0).count(),
-                                 active.size());
-                for (size_t k = 0; k < group.size(); ++k) {
-                    auto& j = group[k];
-                    j->slot = bslots[k];
-                    j->pos  = int(j->prompt.size());
-                    j->next = bfirst[k];
-                    slot_busy[size_t(j->slot)] = true;
-                    const bool stop = (j->eos >= 0 && j->next == j->eos) ||
-                                      (j->eot >= 0 && j->next == j->eot);
-                    if (stop) retire(j, FinishReason::Stop);
-                    else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
-                    else if (j->budget <= 1) retire(j, FinishReason::Length);
-                    else active.push_back(j);
-                }
-                std::vector<std::shared_ptr<SchedJob>> rest;
-                for (auto& j : taking)
-                    if (std::find(group.begin(), group.end(), j) == group.end()) rest.push_back(j);
-                taking.swap(rest);
+            if (!batched) break;
+            if (adm_timing_b)
+                std::fprintf(stderr, "    scheduler admit batch: %zu prompts, %zu tokens, %.2f ms, %zu active\n",
+                             group.size(), tot,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - bt0).count(),
+                             active.size());
+            for (size_t k = 0; k < group.size(); ++k) {
+                auto& j = group[k];
+                j->slot = bslots[k];
+                j->pos  = int(j->prompt.size());
+                j->next = bfirst[k];
+                slot_busy[size_t(j->slot)] = true;
+                const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                                  (j->eot >= 0 && j->next == j->eot);
+                if (stop) retire(j, FinishReason::Stop);
+                else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
+                else if (j->budget <= 1) retire(j, FinishReason::Length);
+                else active.push_back(j);
             }
+            std::vector<std::shared_ptr<SchedJob>> rest;
+            for (auto& j : taking)
+                if (std::find(group.begin(), group.end(), j) == group.end()) rest.push_back(j);
+            taking.swap(rest);
         }
         for (auto& j : taking) {
             if (cancelled(j)) { finish(j, FinishReason::Cancelled); continue; }
