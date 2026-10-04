@@ -476,3 +476,63 @@ single-user speed (193). A second user makes the server slower. vLLM scales 72 �
 - GRIMOIRE-ORNITH runs v1.3 (aab687ac3fad) with GRIMOIRE_SEQ_SLOTS=8 on renderD128, port 6889.
   It was restarted at ~20:00 after the interrupted profile had stopped it gracefully.
 - gpu1 (0b:00.0) still needs Ian's reboot.
+
+## 9. 2026-10-04: resumed. c2–c8 now beat vLLM (main bd8b066, e449b7c)
+
+**Tower after the reboot.**
+- **Render nodes renumbered:** gpu0 (03:00.0) is now **renderD129**; renderD128 is the iGPU.
+  The GRIMOIRE-ORNITH template and container were moved to renderD129 (backup:
+  templates-backup/*.before-renderD129). Docker's `--device` cannot take the by-path name
+  (it splits on the `:` in the PCI address), so this must be checked after every reboot.
+- **AER correctable errors:** they come from the B580's switch (05:00.0 under 00:06.0) and
+  once from gpu1's switch. gpu0's path (00:01.0) is clean.
+
+**1. Measured the batched step per region, M=1/2/4/8** (tools/bench/dprof_table.py).
+- Device ms per step: M=1 7.00, M=2 11.17, M=4 14.45, M=8 19.28. The decode graph does one
+  token in ~5.1 ms.
+- The decode timeline (GRIMOIRE_TIMELINE=1 GRIMOIRE_DECODE_GRAPH=0) puts a DeltaNet layer at
+  ~109 µs, of which MoE gate_up+shared is 24.4 µs and down 11.9 µs, i.e. ~380 GB/s. The
+  grouped small-M MoE kernels ran at ~220 GB/s at M=2.
+
+**2. bd8b066: the decode step's ESIMD MoE over M tokens** (`launch_moe_shared_rows`).
+- The shared expert is fused, as in decode. Per token it is bit-identical to a decode step:
+  1,560 checks, 0 differences.
+- Device ms per step: M=1 6.34, M=2 8.74, M=4 11.51, M=8 17.01.
+- Steady state at M≈7.5 is 17.0 ms per step (~450 tok/s).
+- llama-benchy c2 / c4 / c8 = 180.8 / 228.6 / 264.9.
+
+**3. e449b7c: batched admission** (SeqBatch::spans, Grimoire::admit_batch).
+- Every prompt taken in one scheduler round goes through one prefill.
+- **Why it was slow:** a 512-token prompt touches all 256 experts, about 17 GB of weights,
+  and took ~110 ms on its own. Eight prompts one at a time cost ~970 ms per c8 round.
+- **Now:** six 512-token prompts take one 340 ms prefill.
+
+| llama-benchy pp512/tg64, total tok/s | c1 | c2 | c4 | c8 |
+|---|---:|---:|---:|---:|
+| v1.3 | 193.4 | 145.8 | 198.3 | 255.2 |
+| bd8b066 (MoE over M tokens) | 193.7 | 180.8 | 228.6 | 264.9 |
+| **e449b7c (batched admission)** | **193.5** | **214.4** | **264.1** | **391.8** (peak 414) |
+| vLLM GPTQ-int4, same card | 72.6 | 125.2 | 210.6 | 332.0 |
+
+pp512 at c8: 7,979 tok/s (was 4,552; vLLM 10,294). Coherence PASSED.
+
+Batched admission falls back to one prompt at a time for PP/TP, MTP/DFlash, Qwen4-exp, MoVA
+(K2), PLE, tiered experts, the native GDN bridge, and when the prefix cache is on.
+
+Checked on:
+- Ornith: long mixed prompts are identical; short prompts differ only at near-ties (0.09
+  top-2 margin).
+- Qwen3.8-27B and Agnes: coherent.
+- K2: falls back.
+
+Fixed along the way: the one-launch DeltaNet/conv row kernels (4706273) now exclude verify
+and spans rows, which are consecutive tokens of one sequence.
+
+**Next:**
+- Release v1.4 (building now).
+- Decode step at M=8 (17 ms):
+  - router region 1.3 ms;
+  - M-row dense GEMVs;
+  - the shared expert read once per step, not once per token.
+- Optionally hold admission a few ms when requests arrive together: llama-benchy's 8 arrive
+  as 6 + 2.
