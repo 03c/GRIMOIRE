@@ -1088,6 +1088,53 @@ sycl::event router_topk_esimd(sycl::queue& q, const float* logits, int top_k,
         });
     });
 }
+// router_topk_esimd for `tokens` rows in one launch, one thread per token:
+// the same operations per token (bit-identical).  MEASURED 2026-10-04: the
+// sub-group batched kernel cost ~21 us per layer at every batch size --
+// 0.84 ms of an Ornith batched decode step.
+template <int E>
+sycl::event router_topk_esimd_rows(sycl::queue& q, const float* logits, int tokens, int top_k,
+                                   int32_t* out_e, float* out_w, bool normalize,
+                                   const std::vector<sycl::event>& deps) {
+    namespace es = sycl::ext::intel::esimd;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(tokens), 1), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            const int t = int(it.get_group(0));
+            int32_t* oe = out_e + int64_t(t) * top_k;
+            float* ow = out_w + int64_t(t) * top_k;
+            es::simd<float, E> v = es::block_load<float, E>(logits + int64_t(t) * E);
+            es::simd<int, E> idx(0, 1);
+            es::simd_mask<E> live = 1;
+            es::simd<float, 16> sv = 0.0f;
+            es::simd<int, 16> se = 0;
+            const float NEG = -std::numeric_limits<float>::infinity();
+            for (int s = 0; s < top_k; ++s) {
+                es::simd<float, E> vv = es::merge(v, es::simd<float, E>(NEG), live);
+                const float m = es::hmax<float>(vv);
+                es::simd<int, E> cand = es::merge(idx, es::simd<int, E>(0x7fffffff), live && (vv == m));
+                const int i = es::hmin<int>(cand);
+                sv.select<1, 1>(s) = m;
+                se.select<1, 1>(s) = i;
+                live.template select<1, 1>(i) = 0;
+            }
+            float mx = sv[0];
+            for (int s = 1; s < top_k; ++s) { const float c = sv.select<1, 1>(s)[0]; mx = c > mx ? c : mx; }
+            float sum = 0.0f;
+            es::simd<float, 16> ev = 0.0f;
+            for (int s = 0; s < top_k; ++s) {
+                const float e = sycl::exp(float(sv.select<1, 1>(s)[0]) - mx);
+                ev.select<1, 1>(s) = e;
+                sum += e;
+            }
+            if (normalize && sum > 0.0f) ev = ev / sum;
+            for (int s = 0; s < top_k; ++s) {
+                oe[s] = se.select<1, 1>(s)[0];
+                ow[s] = ev.select<1, 1>(s)[0];
+            }
+        });
+    });
+}
 } // namespace
 
 sycl::event launch_router_topk(sycl::queue& q, const float* logits,
@@ -1205,6 +1252,11 @@ sycl::event launch_router_topk_batched(
     sycl::queue& q, const float* logits, int tokens, int n_experts, int top_k,
     int32_t* out_expert, float* out_weight, bool normalize,
     const std::vector<sycl::event>& deps) {
+    static const bool topk_es = [] { const char* e = std::getenv("GRIMOIRE_TOPK_ESIMD");
+        return !(e && *e == '0'); }();
+    if (topk_es && n_experts == 256 && top_k >= 1 && top_k <= 16)
+        return router_topk_esimd_rows<256>(q, logits, tokens, top_k, out_expert, out_weight,
+                                           normalize, deps);
     return q.submit([&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(

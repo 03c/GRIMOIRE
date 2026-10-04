@@ -871,6 +871,111 @@ sycl::event smallm_v8(sycl::queue& q, const uint8_t* pay, const uint8_t* scl,
                     es::simd<float, 128>(acc.template select<128, 1>((rb * NCB + cb) * 128)));
     });
 }
+// "AW": weights as the DPAS A operand (8 output rows x 16 K per DPAS), read as
+// 64-byte-wide 2-D tiles (8 rows x 128 K); X as the B operand via transposed
+// 2-D loads (VNNI [8 k-pairs][16 tokens], tokens >= M read as zero).  RBW
+// row-blocks of 8 outputs per thread.  The grouped MoE gate_up went 297 -> 380
+// GB/s with this layout (moe_smallm_probe).
+template <int RBW>
+sycl::event smallm_aw(sycl::queue& q, const uint8_t* pay, const uint8_t* scl,
+                      const bf16* X, float* Y, int M, int N, int K, int KS, int kc, int TPT) {
+    constexpr int ACC = RBW * 128;
+    const int tiles = N / (8 * RBW);
+    const int groups = (tiles + TPT - 1) / TPT;
+    const uint32_t* payw = reinterpret_cast<const uint32_t*>(pay);
+    const uint32_t* sclw = reinterpret_cast<const uint32_t*>(scl);
+    const uint32_t* Xw = reinterpret_cast<const uint32_t*>(X);
+    const unsigned PW = unsigned(K) / 2 - 1, PH = unsigned(N) - 1, PP = unsigned(K) / 2 - 1;
+    const unsigned SW = unsigned(K) / 32 - 1, SP = unsigned(K) / 32 - 1;
+    const unsigned XW = unsigned(K) * 2 - 1, XH = unsigned(M) - 1;
+    return q.parallel_for(sycl::nd_range<1>(size_t(groups) * TPT * KS, size_t(TPT) * KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        es::slm_init<32 * ACC * 4>();
+        const int lid = int(it.get_local_id(0));
+        const int tw = lid / KS, ks = lid % KS;
+        const int tile = int(it.get_group(0)) * TPT + tw;
+        const bool live = tile < tiles;
+        const int c0 = (live ? tile : 0) * 8 * RBW;
+        const int kb = ks * kc;
+        const int ke = kb + kc < K ? kb + kc : K;
+        constexpr auto PFH = sycl::ext::oneapi::experimental::properties{
+            es::cache_hint_L1<es::cache_hint::cached>, es::cache_hint_L2<es::cache_hint::cached>};
+        const es::simd<uint32_t, 16> shv = (es::simd<uint32_t, 16>(0, 1) & 3u) << 3;
+        es::simd<float, ACC> acc = 0.0f;
+        if (live) {
+            for (int k = kb; k < ke; k += 128) {
+                es::simd<uint32_t, 128> wt[RBW];
+                es::simd<uint32_t, 8> sw[RBW];
+                #pragma unroll
+                for (int b = 0; b < RBW; ++b) {
+                    if (k + 128 < ke)
+                        es::prefetch_2d<uint32_t, 16, 8>(payw, PW, PH, PP, (k + 128) / 8, c0 + 8 * b, PFH);
+                    wt[b] = es::load_2d<uint32_t, 16, 8>(payw, PW, PH, PP, k / 8, c0 + 8 * b);
+                    sw[b] = es::load_2d<uint32_t, 1, 8>(sclw, SW, PH, SP, k / 128, c0 + 8 * b);
+                }
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) {
+                    es::simd<uint32_t, 128> bt0 = es::load_2d<uint32_t, 8, 16, 1, true, false>(Xw, XW, XH, XW, (k + 32 * g) / 2, 0);
+                    es::simd<uint32_t, 128> bt1 = es::load_2d<uint32_t, 8, 16, 1, true, false>(Xw, XW, XH, XW, (k + 32 * g) / 2 + 8, 0);
+                    #pragma unroll
+                    for (int b = 0; b < RBW; ++b) {
+                        es::simd<uint32_t, 64> a0, a1;
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r) {
+                            es::simd<uint32_t, 16> rep = wt[b].template replicate_vs_w_hs<4, 1, 4, 0>(r * 16 + 4 * g);
+                            es::simd<uint32_t, 16> tb = rep >> shv;
+                            es::simd<uint32_t, 16> u = (tb & 0x0Fu) | ((tb & 0xF0u) << 12);
+                            es::simd<uint32_t, 16> hb = ((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12);
+                            es::simd<sycl::half, 32> hv = hb.template bit_cast_view<sycl::half>().read();
+                            es::simd<float, 32> fv = hv;
+                            es::simd<uint32_t, 32> fb = fv.template bit_cast_view<uint32_t>().read();
+                            es::simd<uint16_t, 32> bb = fb >> 16;
+                            es::simd<uint32_t, 16> pr = bb.template bit_cast_view<uint32_t>().read();
+                            a0.template select<8, 1>(r * 8) = pr.template select<8, 1>(0);
+                            a1.template select<8, 1>(r * 8) = pr.template select<8, 1>(8);
+                        }
+                        es::simd<float, 128> tmp = 0.0f;
+                        tmp = xmx::dpas<8, 8, float, float, bf16, bf16>(tmp, bt0.template bit_cast_view<bf16>().read(), a0.template bit_cast_view<bf16>().read());
+                        tmp = xmx::dpas<8, 8, float, float, bf16, bf16>(tmp, bt1.template bit_cast_view<bf16>().read(), a1.template bit_cast_view<bf16>().read());
+                        es::simd<uint32_t, 8> ev = (sw[b] >> (8 * g)) & 0xFFu;
+                        es::simd<uint32_t, 8> sbits = (ev + 14u) << 23;
+                        es::simd<float, 8> sc8 = sbits.template bit_cast_view<float>().read();
+                        #pragma unroll
+                        for (int r = 0; r < 8; ++r)
+                            acc.template select<16, 1>(b * 128 + 16 * r) += tmp.template select<16, 1>(16 * r) * sc8[r];
+                    }
+                }
+            }
+        }
+        if (KS > 1) {
+            es::slm_block_store<float, ACC>(lid * ACC * 4, acc);
+            es::barrier();
+            if (ks != 0 || !live) return;
+            for (int i = 1; i < KS; ++i)
+                acc += es::slm_block_load<float, ACC>((tw * KS + i) * ACC * 4);
+        } else if (!live) {
+            return;
+        }
+        const int nr = M < 16 ? M : 16;
+        for (int n = 0; n < nr; ++n) {
+            #pragma unroll
+            for (int b = 0; b < RBW; ++b) {
+                es::simd<float, 8> col = acc.template select<8, 16>(b * 128 + n);
+                es::block_store<float, 8>(Y + size_t(n) * N + c0 + 8 * b, col);
+            }
+        }
+    });
+}
+struct PlanAW { int KS, kc, TPT; };
+static PlanAW plan_aw(int N, int K, int RBW) {
+    const int tiles = N / (8 * RBW);
+    int KS = 1;
+    while (KS < 16 && tiles * KS < 4096 && K / (KS * 2) >= 128) KS *= 2;
+    int kc = (K + KS - 1) / KS; kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
+    return {KS, kc, TPT};
+}
 struct Plan5 { int KS, kc, TPT; };
 static int g_target5 = 4096;
 static Plan5 plan5(int N, int K, int CT) {
@@ -949,12 +1054,16 @@ int main(int argc, char** argv) {
             const Plan pl = plan_for(N, K);
             float* part = sycl::malloc_device<float>(size_t(pl.KS) * M * N, q);
             float* dy = sycl::malloc_device<float>(size_t(M) * N, q);
-            for (int dq : {7, 12}) {
+            for (int dq : {7, 13, 14}) {
                 int ci = 0;
                 auto launch = [&]() {
                     sycl::event e;
                     float* o = pl.KS > 1 ? part : dy;
                     const uint8_t* wp = cps[ci % NC]; const uint8_t* wsc = css[ci % NC]; ++ci;
+                    if (dq == 13) { const PlanAW pa = plan_aw(N, K, 1);
+                                    return smallm_aw<1>(q, wp, wsc, dx, dy, M, N, K, pa.KS, pa.kc, pa.TPT); }
+                    if (dq == 14) { const PlanAW pa = plan_aw(N, K, 2);
+                                    return smallm_aw<2>(q, wp, wsc, dx, dy, M, N, K, pa.KS, pa.kc, pa.TPT); }
                     if (dq == 12) { const Plan5 p8 = plan5(N, K, 16);
                                     return smallm_v8<1, 16>(q, wp, wsc, dx, dy, M, N, K, p8.KS, p8.kc, p8.TPT); }
                     if (dq == 11) { const Plan5 p7 = plan5(N, K, 16);
@@ -1012,7 +1121,7 @@ int main(int argc, char** argv) {
                 const bool ok = maxrel < 2e-4;
                 all_ok = all_ok && ok;
                 std::printf("%-16s N=%6d K=%5d M=%2d %s KS=%2d  %8.3f ms  %6.1f GB/s  maxrel %.2e %s\n",
-                    sh.what, N, K, M, dq == 12 ? "v8   " : dq == 11 ? "v7   " : dq == 10 ? "v6   " : dq == 9 ? "v5c64" : dq == 8 ? "v5c32" : dq == 7 ? "v5c16" : dq == 6 ? "v4   " : "v3c16", dq == 6 ? plan4(N, K).KS : dq >= 7 ? plan5(N, K, dq == 8 ? 32 : 16).KS : pl.KS, ms, gbs, maxrel, ok ? "ok" : "FAIL");
+                    sh.what, N, K, M, dq == 14 ? "AW2  " : dq == 13 ? "AW1  " : dq == 12 ? "v8   " : dq == 11 ? "v7   " : dq == 10 ? "v6   " : dq == 9 ? "v5c64" : dq == 8 ? "v5c32" : dq == 7 ? "v5c16" : dq == 6 ? "v4   " : "v3c16", dq >= 13 ? plan_aw(N, K, dq - 12).KS : dq == 6 ? plan4(N, K).KS : dq >= 7 ? plan5(N, K, dq == 8 ? 32 : 16).KS : pl.KS, ms, gbs, maxrel, ok ? "ok" : "FAIL");
             }
             sycl::free(part, q); sycl::free(dy, q); sycl::free(dx, q);
         }

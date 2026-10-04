@@ -13636,6 +13636,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     static const bool smallm_gemv = std::getenv("GRIMOIRE_SMALLM_GEMV") != nullptr;
     static sycl_bf16* smallm_bf = nullptr;
     static size_t smallm_cap = 0;
+    // bn_bf holds bn's rows in bf16 exactly when the norm that wrote bn wrote
+    // it too (input / post norm).  The small-M GEMMs then read it directly
+    // instead of converting bn again -- once per projection, ~4 per layer.
+    bool bn_bf_sync = false;
     // launch_mxfp4_smallm: a DPAS GEMM that streams the weight once with 16
     // columns per thread (gemm_fast.cpp) instead of the grouped MoE kernel's
     // 256-row tiles.  DEFAULT for batched decode across sequences (seqb, not
@@ -13669,16 +13673,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
             const size_t need=size_t(M)*size_t(w.w.K);
-            if(need>smallm_cap){
+            const bool from_bn = x==bn && bn_bf_sync && w.w.K==H;
+            if(!from_bn && need>smallm_cap){
                 if(smallm_bf){ q.wait(); sycl::free(smallm_bf,q); }
                 smallm_bf=sycl::malloc_device<sycl_bf16>(need,q);
                 smallm_cap=smallm_bf?need:0;
             }
-            if(smallm_bf){
-                launch_f32_to_bf16(q,x,smallm_bf,need);
+            if(from_bn || smallm_bf){
+                const sycl_bf16* xin = from_bn ? bn_bf : smallm_bf;
+                if(!from_bn) launch_f32_to_bf16(q,x,smallm_bf,need);
                 if(dpas_ok){
-                    if(dpas_bf) launch_bf16_smallm(q,w.w,smallm_bf,y,M);
-                    else launch_mxfp4_smallm(q,w.w,smallm_bf,y,M);
+                    if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
+                    else launch_mxfp4_smallm(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
                     if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
                         // reference: the decode GEMV, fp32 activations, row by row
@@ -13693,10 +13699,10 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 // sh_tab with one tile: te[0]=0, tmb[0]=0, off[0]=0, cnt[0]=M
                 static const bool dense_small = std::getenv("GRIMOIRE_DENSE_SMALL_KERNEL") != nullptr;
                 if(dense_small)
-                    launch_moe_mxfp4_grouped_small(q,w.w,w.w.N,false,smallm_bf,y,
+                    launch_moe_mxfp4_grouped_small(q,w.w,w.w.N,false,xin,y,
                                                    sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
                 else
-                    launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,smallm_bf,y,
+                    launch_moe_mxfp4_grouped(q,w.w,w.w.N,false,xin,y,
                                              sh_tab,sh_tab+1,sh_tab+2,sh_tab+3,1);
                 return;
             }
@@ -14129,6 +14135,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         LayerDev& d=L[li];
         sycl::event input_bf_ready;
+        bn_bf_sync=!(defer_moe_gather&&li>prefill_layer_begin) && !exact_verify &&
+                   !(norm_bf_only||dense_pure);
         if(defer_moe_gather&&li>prefill_layer_begin)
             input_bf_ready=launch_rmsnorm_moe_residual_batched(q,bh,moe_res,pinv,
                 rwt,r1,d.in_norm,nullptr,bn_bf,M,cfg.top_k,H,cfg.rms_eps);
@@ -14820,6 +14828,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         r0_in_h=false;
         a8_cached_src=nullptr;
         a8_cached_bf=fused_ffn_quant?bn_bf:nullptr;
+        bn_bf_sync=!exact_verify && !norm_bf_only && (fused_ffn_quant || !dense_pure);
+        pp_mark("  post norm");
         if(d.moe_layer){
             sycl::event shared_ready;
             // RULE 1: as parallel_dn above -- mm_aux() reads sh_gu/sh_down's
@@ -14852,6 +14862,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                     cfg.top_k,rex,rwt,true);
             }else{
                 mm(d.router,bn,rlog);
+                pp_mark("  router gemm");
                 // K2: sigmoid scores, bias steers SELECTION ONLY, plain
                 // sum-normalise, then router_scaling_factor.  The generic
                 // kernel ranks raw logits and softmaxes the top-k -- a
@@ -15364,6 +15375,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
             return false;
         }
     } else {
+      bn_bf_sync=false;   // the final norm writes bn only
       if(defer_moe_gather)
           launch_rmsnorm_moe_residual_batched(q,bh,moe_res,pinv,rwt,r1,fnorm,bn,
               nullptr,M,cfg.top_k,H,cfg.rms_eps);

@@ -3159,9 +3159,16 @@ sycl::event bf16_smallm_impl(sycl::queue& q, const QuantWeight& w, const sycl_bf
                              float* Y, int M, const std::vector<sycl::event>& deps) {
     constexpr int CT = 16;
     const int N = w.N, K = w.K;
-    const SmallmPlan p = smallm_plan(N, K);
-    const int KS = p.KS, kc = p.kc, TPT = p.TPT;
+    // K slices of >= 64 (two 32-K steps): the BF16 GEMMs here are small (the
+    // router is N=256) and run latency-bound on too few threads otherwise
     const int tiles = N / CT;
+    int KS = 1;
+    while (KS < 16 && tiles * KS < 4096 && K / (KS * 2) >= 64) KS *= 2;
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 31) / 32 * 32;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
     const int groups = (tiles + TPT - 1) / TPT;
     const uint32_t* payw = reinterpret_cast<const uint32_t*>(w.payload);
     const unsigned PW = unsigned(K) * 2 - 1, PH = unsigned(N) - 1, PP = unsigned(w.row_bytes) - 1;
