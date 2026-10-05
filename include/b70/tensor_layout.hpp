@@ -55,9 +55,10 @@ inline std::array<TensorRef,3> resolve_expert(const Qwen35Model& m,const std::st
     std::array<TensorRef,3> r;
     if(e<0||e>=experts||inter<=0||hidden<=0)return r;
     const std::string individual=prefix+std::to_string(e)+".";
-    r[0]=tensor_ref(m,individual+"gate_proj.weight");
-    r[1]=tensor_ref(m,individual+"up_proj.weight");
-    r[2]=tensor_ref(m,individual+"down_proj.weight");
+    // linear_ref, not a raw lookup: an FP8 head's experts carry block scales
+    r[0]=m.linear_ref(individual+"gate_proj");
+    r[1]=m.linear_ref(individual+"up_proj");
+    r[2]=m.linear_ref(individual+"down_proj");
     auto gu=tensor_ref(m,prefix+"gate_up_proj");if(!gu.ok())gu=tensor_ref(m,prefix+"gate_up_proj.weight");
     auto dn=tensor_ref(m,prefix+"down_proj");if(!dn.ok())dn=tensor_ref(m,prefix+"down_proj.weight");
     if(gu.ok()&&gu.t.shape!=std::vector<int64_t>{experts,2LL*inter,hidden})return {};

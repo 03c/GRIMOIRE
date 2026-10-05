@@ -426,6 +426,9 @@ struct Qwen35Model {
     std::vector<Qwen35Layer> layers;
 
     // Open every shard, parse config, resolve all tensor names.
+    // A projection's weight with its scales attached (block FP8, NVFP4,
+    // compressed-tensors, GPTQ) -- what load() uses for every layer.
+    TensorRef linear_ref(const std::string& base) const;
     bool load(const std::string& dir, std::string& err, bool skip_vision = true,
               bool index_only = false);
     bool native_view(const TensorRef& r, QuantWeight& out, std::string& err) const;

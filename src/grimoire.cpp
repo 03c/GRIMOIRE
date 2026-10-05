@@ -5245,7 +5245,14 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
     if(mtp_enabled()&&(!pp_enabled()||pp_rank==pp_world-1)) {
         std::printf("\n  mtp head      ");
         std::fflush(stdout);
+        // Weights resolve through linear_ref: a raw index lookup dropped the
+        // block-FP8 scales of an FP8 checkpoint's head (garbage drafts).
         auto ref = [&](const char* n) -> TensorRef {
+            const std::string s(n), suf(".weight");
+            if (s.size() > suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0) {
+                TensorRef r = ck.linear_ref(s.substr(0, s.size() - suf.size()));
+                if (r.ok()) return r;
+            }
             auto it = ck.index.find(n);
             return it == ck.index.end() ? TensorRef{} : it->second;
         };
@@ -7398,7 +7405,13 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
                            std::vector<int32_t>& first) {
     slots.clear(); first.clear();
     if (prompts.size() < 2 || busy.size() != size_t(n_seq_slots)) return false;
+    // Muse / gemma-4 / Qwen4-Exp batch through their own prefill paths
+    // (prefill_sandwich, prefill_qwen4_exp), which know nothing of prompt
+    // spans: they would process the burst row by row and return a token per
+    // row -- correct after the fallback below, but every prompt ingested
+    // twice.  Admit those one prompt at a time.
     if (pp_enabled() || tp_enabled() || mtp.ok || dflash2.ok || prefix_cache_usable() ||
+        cfg.is_muse || cfg.is_gemma4 || cfg.is_qwen4_exp ||
         !batch_unsupported_reason().empty())
         return false;
     std::vector<int> pick;
@@ -11655,7 +11668,31 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     }
     WX = std::max(WX, 2 * IX);
 
-    auto df = [&](size_t n) { return sycl::malloc_device<float>(n, q); };
+    // Scratch CACHED across calls (grow-only, by allocation order), as in
+    // prefill(): batched decode calls this every step, and 15 malloc_device
+    // + free per step was pure overhead.  GRIMOIRE_PREFILL_SCRATCH_FREE=1 =
+    // allocate and free per call.
+    static const bool sw_free = std::getenv("GRIMOIRE_PREFILL_SCRATCH_FREE") != nullptr;
+    static std::vector<std::pair<void*, size_t>> sw_cache;
+    size_t sw_ci = 0;
+    auto sw_alloc = [&](size_t bytes) -> void* {
+        if (bytes == 0) bytes = 4;
+        if (sw_free) return sycl::malloc_device<uint8_t>(bytes, q);
+        if (sw_ci < sw_cache.size()) {
+            auto& e = sw_cache[sw_ci++];
+            if (e.second >= bytes) return e.first;
+            q.wait();
+            if (e.first) sycl::free(e.first, q);
+            e.first = sycl::malloc_device<uint8_t>(bytes, q);
+            e.second = e.first ? bytes : 0;
+            return e.first;
+        }
+        void* p = sycl::malloc_device<uint8_t>(bytes, q);
+        sw_cache.push_back({p, p ? bytes : 0});
+        ++sw_ci;
+        return p;
+    };
+    auto df = [&](size_t n) { return static_cast<float*>(sw_alloc(n * sizeof(float))); };
     float* h    = df(size_t(M) * H);
     float* h2   = df(size_t(M) * H);
     float* qv   = df(size_t(M) * QWX);
@@ -11672,17 +11709,18 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
     // one buffer only because M is 1 and the write is at the same index
     // as the read.
     float* ffo  = df(size_t(M) * size_t(IX ? IX : 1));
-    int32_t* dtok = sycl::malloc_device<int32_t>(size_t(M), q);
-    sycl_bf16* xb = sycl::malloc_device<sycl_bf16>(size_t(M) * WX, q);
+    int32_t* dtok = static_cast<int32_t*>(sw_alloc(size_t(M) * sizeof(int32_t)));
+    sycl_bf16* xb = static_cast<sycl_bf16*>(sw_alloc(size_t(M) * WX * sizeof(sycl_bf16)));
     // Per-row int8 activations for the W4A8 tiles, which are the fast path
     // for a converted weight and the difference between "faster than one
     // token at a time" and using the card.
-    int8_t* a8  = sycl::malloc_device<int8_t>(size_t(M) * WX, q);
+    int8_t* a8  = static_cast<int8_t*>(sw_alloc(size_t(M) * WX));
     float*  a8s = df(size_t(M));
     std::vector<void*> mem = {(void*)h, (void*)h2, (void*)qv, (void*)kv,
         (void*)vv, (void*)attn, (void*)gate, (void*)proj, (void*)sh, (void*)ff,
         (void*)ffo, (void*)dtok, (void*)xb, (void*)a8, (void*)a8s};
-    auto cleanup = [&]() { for (void* p : mem) if (p) sycl::free(p, q); };
+    // cached scratch stays allocated; only the per-call mode frees it
+    auto cleanup = [&]() { if (sw_free) for (void* p : mem) if (p) sycl::free(p, q); };
     for (void* p : mem) if (!p) { cleanup(); return false; }
 
     const std::vector<sycl::event> none{};
@@ -11738,6 +11776,27 @@ bool Grimoire::prefill_sandwich(const std::vector<int32_t>& tokens,
             for (int r = 0; r < M; ++r)
                 gemv_any(w, x + size_t(r) * w.w.K,
                          y + size_t(r) * w.w.N, none);
+            return;
+        }
+        // Batched decode (seqb rows, M <= 16): the small-M kernels the main
+        // prefill path uses.  launch_gemm_xmx at a handful of rows ran the
+        // whole weight through its large-tile GEMM every step -- MEASURED
+        // 2026-10-03 Muse-Glimmer-30B served 0.8 tok/s per row batched vs
+        // 18.9 alone.  MXFP4 / BF16: the DPAS small-M GEMM (weights read
+        // once for all rows); any other format: the decode GEMV per row.
+        static const bool sw_smallm = [] {
+            const char* e = std::getenv("GRIMOIRE_SANDWICH_SMALLM"); return !(e && *e == '0'); }();
+        if (sw_smallm && seqb && !seqb->spans && M <= 16) {
+            if (!w.has_i4() && (mxfp4_smallm_ok(w.w, M, xb, y) || bf16_smallm_ok(w.w, M, xb, y) ||
+                                int4_smallm_ok(w.w, M, xb, y))) {
+                launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
+                if (w.w.fmt == Fmt::BF16) launch_bf16_smallm(q, w.w, xb, y, M);
+                else if (w.w.fmt == Fmt::INT4) launch_int4_smallm(q, w.w, xb, y, M);
+                else launch_mxfp4_smallm(q, w.w, xb, y, M);
+                return;
+            }
+            for (int r = 0; r < M; ++r)
+                gemv_any(w, x + size_t(r) * w.w.K, y + size_t(r) * w.w.N, none);
             return;
         }
         launch_f32_to_bf16(q, x, xb, size_t(M) * w.w.K, none);
@@ -13645,12 +13704,19 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // 256-row tiles.  DEFAULT for batched decode across sequences (seqb, not
     // a verify): MEASURED 2026-10-03, Ornith served, llama-benchy pp512/tg64
     // total tok/s c2 95 -> 144, c4 133 -> 179, c8 176 -> 218 (with the
-    // grouped MoE twin below).  Speculative verify keeps the old path: its
-    // acceptance depends on rounding and was tuned on it.
+    // grouped MoE twin below).  Speculative verify kept the old path until
+    // 2026-10-05 (see below).
     // GRIMOIRE_SMALLM_DPAS=1 everywhere M is 2..16, =0 never.
     static const int smallm_dpas_env = [] {
         const char* e = std::getenv("GRIMOIRE_SMALLM_DPAS"); return e && *e ? (*e != '0' ? 1 : 0) : -1; }();
-    const bool smallm_dpas = smallm_dpas_env == 1 || (smallm_dpas_env < 0 && seqb && !seqb->verify);
+    // Speculative verify batches (MTP / DFlash, next_tokens) take it too since
+    // 2026-10-05: MEASURED on the v1.6 image, Qwen3.8-27B-MXFP4 + MTP k=3,
+    // llama-benchy tg128 at 1 user: 30.1 tok/s through the grouped one-tile
+    // kernel below, 50.8 with these GEMMs -- plain decode is 33.2.
+    // GRIMOIRE_MTP_EXACT_VERIFY=1 still keeps the GEMV (exact_verify).
+    const bool verify_rows = next_tokens != nullptr || (seqb && seqb->verify);
+    const bool smallm_dpas = smallm_dpas_env == 1 ||
+        (smallm_dpas_env < 0 && ((seqb && !seqb->verify) || verify_rows));
     // GRIMOIRE_SMALLM_VERIFY=1 (debug, synchronizes): once per shape, run the
     // reference next to the DPAS kernels and print max|diff| / max|ref|.
     static const bool smallm_verify = std::getenv("GRIMOIRE_SMALLM_VERIFY") != nullptr;
@@ -13668,7 +13734,13 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         if(tp_enabled() && w.tp_sharded()) { gemm_tp(w,x,y,M); return; }
         const bool dpas_bf = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && bf16_smallm_ok(w.w,M,nullptr,y);
-        const bool dpas_ok = dpas_bf || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+        // INT4 (GPTQ, AutoRound, GRIMOIRE's own): the w4a16 DPAS GEMM.  The
+        // only other INT4 engines here are the SIMT GEMVs, whose FMAs grow with
+        // M: Qwen3.8-27B-W4A16 served 19.9 / 18.3 / 19.5 / 19.5 tok/s at 1 / 2 /
+        // 4 / 8 users through them (2026-10-04).
+        const bool dpas_i4 = smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
+                             !w.has_i4() && int4_smallm_ok(w.w,M,nullptr,y);
+        const bool dpas_ok = dpas_bf || dpas_i4 || (smallm_dpas && M>=2 && M<=16 && !exact_verify && !smallm_gemv &&
                              !w.has_i4() && mxfp4_smallm_ok(w.w,M,nullptr,y));
         if(dpas_ok || (M>=2 && M<=16 && !exact_verify && !smallm_gemv && sh_tab && sh_tiles==1 &&
            w.w.payload && !w.has_i4() && moe_mxfp4_grouped_esimd(w.w,w.w.N,false))){
@@ -13683,7 +13755,8 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 const sycl_bf16* xin = from_bn ? bn_bf : smallm_bf;
                 if(!from_bn) launch_f32_to_bf16(q,x,smallm_bf,need);
                 if(dpas_ok){
-                    if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
+                    if(dpas_i4) launch_int4_smallm(q,w.w,xin,y,M);
+                    else if(dpas_bf) launch_bf16_smallm(q,w.w,xin,y,M);
                     else launch_mxfp4_smallm(q,w.w,xin,y,M);
                     static std::set<std::tuple<int,int,int>> checked;
                     if(smallm_verify && checked.insert({w.w.N,w.w.K,M}).second){
@@ -13691,7 +13764,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                         float* ref=sycl::malloc_device<float>(size_t(M)*w.w.N,q);
                         for(int r=0;r<M;++r)
                             launch_gemv(q,w.w,x+size_t(r)*w.w.K,ref+size_t(r)*w.w.N,{});
-                        smallm_report(dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
+                        smallm_report(dpas_i4?"int4":dpas_bf?"bf16":"dense",w.w.N,w.w.K,y,ref,size_t(M)*w.w.N);
                         sycl::free(ref,q);
                     }
                     return;

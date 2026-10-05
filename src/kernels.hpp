@@ -461,6 +461,11 @@ sycl::event launch_mxfp4_smallm(sycl::queue& q, const QuantWeight& w, const sycl
 bool bf16_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
 sycl::event launch_bf16_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
     float* Y, int M, const std::vector<sycl::event>& deps = {});
+// The same for INT4 weights (GPTQ / AutoRound / GRIMOIRE's own, groups of 64
+// or 128): the w4a16 DPAS engine for batched decode and speculative verify.
+bool int4_smallm_ok(const QuantWeight& w, int M, const void* X, const void* Y);
+sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+    float* Y, int M, const std::vector<sycl::event>& deps = {});
 // The grouped MoE form for M <= 16 tokens (each expert <= M rows): the
 // launch_moe_mxfp4_grouped contract without tile_mb (one tile per expert).
 bool moe_mxfp4_smallm_ok(const QuantWeight& w, int Ne, bool swiglu, int M,

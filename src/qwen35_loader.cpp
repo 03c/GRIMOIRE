@@ -828,93 +828,7 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
         return true;
     };
 
-    auto linear = [&](const std::string& base) {
-        TensorRef r = get(base + ".weight");
-        if (r.ok()) {
-            TensorRef sc = get(base + ".weight_scale");
-            // modelopt NVFP4 (Ornith-1.5-35B-A3B-NVFP4, Qwen3.8-Flash-Next-
-            // NVFP4): a PLAIN .weight holding U8 [N][K/2] E2M1 nibbles, an
-            // E4M3 .weight_scale [N][K/16], and an F32 .weight_scale_2 that
-            // MULTIPLIES.  Before this branch the pair fell through to the
-            // FP8 case below and the nibbles were read as FP8 values.
-            if (sc.ok() && r.t.dtype == STDtype::U8 && sc.t.dtype == STDtype::F8_E4M3 &&
-                r.t.shape.size() == 2 && sc.t.shape.size() == 2) {
-                TensorRef g2 = get(base + ".weight_scale_2");
-                const int64_t N = r.t.shape[0], K = r.t.shape[1] * 2;
-                if (g2.ok() && g2.t.numel() == 1 && sc.t.shape[0] == N &&
-                    sc.t.shape[1] * 16 == K) {
-                    r.nvfp4 = true;
-                    r.nvfp4_mul = true;
-                    r.scales_shard = sc.shard;  r.scales_t = sc.t;
-                    r.gscale_shard = g2.shard;  r.gscale_t = g2.t;
-                    r.t.shape = {N, K};
-                    return r;
-                }
-                return TensorRef{};    // U8 weight we cannot interpret: refuse
-            }
-            // compressed-tensors FP8 stores a scale beside every quantized
-            // Linear weight: per output channel ([N] or [N,1]) or, in
-            // modelopt checkpoints, ONE scalar per tensor.  Both multiply;
-            // the readers broadcast a scalar (read_row_scales).
-            if (sc.ok()) {
-                r.row_scaled = true;
-                r.scales_shard = sc.shard;
-                r.scales_t = sc.t;
-                return r;
-            }
-            // Block FP8: weight_scale_inv, one scale per 128x128 tile.
-            TensorRef si = get(base + ".weight_scale_inv");
-            if (si.ok() && si.t.shape.size() == 2 && r.t.shape.size() == 2 &&
-                (r.t.dtype == STDtype::F8_E4M3 || r.t.dtype == STDtype::F8_E5M2)) {
-                const int64_t N = r.t.shape[0], K = r.t.shape[1];
-                if (si.t.shape[0] != (N + 127) / 128 || si.t.shape[1] != (K + 127) / 128)
-                    return TensorRef{};  // not the 128x128 layout: refuse, never guess
-                r.block_scaled = true;
-                r.scales_shard = si.shard;
-                r.scales_t = si.t;
-            }
-            return r;
-        }
-        TensorRef cp = get(base + ".weight_packed");
-        TensorRef cs = get(base + ".weight_scale");
-        if (cp.ok() && cs.ok() && mark_nvfp4(cp, cs, base)) return cp;
-        if (cp.ok() && cs.ok() && cp.t.dtype == STDtype::I32 &&
-            cs.t.dtype == STDtype::BF16 && cp.t.shape.size() == 2 &&
-            cs.t.shape.size() == 2 && cp.t.shape[0] == cs.t.shape[0]) {
-            const int out = int(cp.t.shape[0]);
-            const int in = int(cp.t.shape[1]) * 8;
-            const int groups = int(cs.t.shape[1]);
-            if (groups > 0 && in % groups == 0) {
-                cp.compressed_int4 = true;
-                cp.scales_shard = cs.shard;
-                cp.scales_t = cs.t;
-                cp.gptq_group = in / groups;
-                cp.t.shape = {out, in};
-                // Asymmetric exports (symmetric: false) ship per-group zero
-                // points, packed 8 rows per int32: [N/8][groups].  Without
-                // them every weight was decoded around 8 -- the fluent-free
-                // garbage of Muse-Glimmer-30B-GPTQ-INT4.
-                TensorRef zp = get(base + ".weight_zero_point");
-                if (zp.ok()) { cp.qzeros_shard = zp.shard; cp.qzeros_t = zp.t; }
-                return cp;
-            }
-        }
-        TensorRef qw = get(base + ".qweight");
-        TensorRef qz = get(base + ".qzeros");
-        TensorRef sc = get(base + ".scales");
-        if (!qw.ok() || !qz.ok() || !sc.ok() || qw.t.shape.size() != 2 ||
-            qz.t.shape.size() != 2 || sc.t.shape.size() != 2) return TensorRef{};
-        const int in = int(qw.t.shape[0]) * 8;
-        const int out = int(qw.t.shape[1]);
-        const int groups = int(qz.t.shape[0]);
-        if (groups <= 0 || in % groups) return TensorRef{};
-        qw.gptq = true;
-        qw.qzeros_shard = qz.shard; qw.qzeros_t = qz.t;
-        qw.scales_shard = sc.shard; qw.scales_t = sc.t;
-        qw.gptq_group = in / groups;
-        qw.t.shape = {out, in};
-        return qw;
-    };
+    auto linear = [&](const std::string& base) { return linear_ref(base); };
     // compressed-tensors MXFP4: base.weight_packed [N][K/2] E2M1 nibbles +
     // base.weight_scale [N][K/32] E8M0.  This IS GRIMOIRE's MXFP4 layout, so
     // the upload path copies it straight to VRAM (see quantize_upload_t).
@@ -1370,6 +1284,124 @@ bool Qwen35Model::load(const std::string& d, std::string& err, bool skip_vision,
     }
     return true;
 }
+
+// One projection's weight with what its readers need attached: block-FP8
+// weight_scale_inv, NVFP4 / compressed-tensors scales, GPTQ qzeros and scales.
+// load() resolves every layer through this; anything that looks a weight up
+// later must too.  The MTP head did a raw index lookup, which dropped the FP8
+// block scales: Qwen3.8-27B-FP8's head drafted garbage and MTP ran at 17.6
+// tok/s against 33.1 without it (2026-10-05).
+TensorRef Qwen35Model::linear_ref(const std::string& base) const {
+    auto get = [&](const std::string& n) {
+        auto it = index.find(n);
+        return it == index.end() ? TensorRef{} : it->second;
+    };
+    auto mark_nvfp4 = [&](TensorRef& p, const TensorRef& sc,
+                          const std::string& base) -> bool {
+        TensorRef gs = get(base + ".weight_global_scale");
+        if (!gs.ok()) return false;
+        if (p.t.shape.size() != 2 || sc.t.shape.size() != 2) return false;
+        const int N = int(p.t.shape[0]);
+        const int K = int(p.t.shape[1]) * 2;
+        // One E4M3 scale per 16 elements.  If the checkpoint disagrees,
+        // this is not NVFP4 as this engine understands it and guessing
+        // would be worse than declining to recognise it.
+        if (int(sc.t.shape[0]) != N || int(sc.t.shape[1]) * 16 != K) return false;
+        p.nvfp4 = true;
+        p.scales_shard = sc.shard;
+        p.scales_t = sc.t;
+        p.gscale_shard = gs.shard;
+        p.gscale_t = gs.t;
+        p.t.shape = {N, K};
+        return true;
+    };
+
+        TensorRef r = get(base + ".weight");
+        if (r.ok()) {
+            TensorRef sc = get(base + ".weight_scale");
+            // modelopt NVFP4 (Ornith-1.5-35B-A3B-NVFP4, Qwen3.8-Flash-Next-
+            // NVFP4): a PLAIN .weight holding U8 [N][K/2] E2M1 nibbles, an
+            // E4M3 .weight_scale [N][K/16], and an F32 .weight_scale_2 that
+            // MULTIPLIES.  Before this branch the pair fell through to the
+            // FP8 case below and the nibbles were read as FP8 values.
+            if (sc.ok() && r.t.dtype == STDtype::U8 && sc.t.dtype == STDtype::F8_E4M3 &&
+                r.t.shape.size() == 2 && sc.t.shape.size() == 2) {
+                TensorRef g2 = get(base + ".weight_scale_2");
+                const int64_t N = r.t.shape[0], K = r.t.shape[1] * 2;
+                if (g2.ok() && g2.t.numel() == 1 && sc.t.shape[0] == N &&
+                    sc.t.shape[1] * 16 == K) {
+                    r.nvfp4 = true;
+                    r.nvfp4_mul = true;
+                    r.scales_shard = sc.shard;  r.scales_t = sc.t;
+                    r.gscale_shard = g2.shard;  r.gscale_t = g2.t;
+                    r.t.shape = {N, K};
+                    return r;
+                }
+                return TensorRef{};    // U8 weight we cannot interpret: refuse
+            }
+            // compressed-tensors FP8 stores a scale beside every quantized
+            // Linear weight: per output channel ([N] or [N,1]) or, in
+            // modelopt checkpoints, ONE scalar per tensor.  Both multiply;
+            // the readers broadcast a scalar (read_row_scales).
+            if (sc.ok()) {
+                r.row_scaled = true;
+                r.scales_shard = sc.shard;
+                r.scales_t = sc.t;
+                return r;
+            }
+            // Block FP8: weight_scale_inv, one scale per 128x128 tile.
+            TensorRef si = get(base + ".weight_scale_inv");
+            if (si.ok() && si.t.shape.size() == 2 && r.t.shape.size() == 2 &&
+                (r.t.dtype == STDtype::F8_E4M3 || r.t.dtype == STDtype::F8_E5M2)) {
+                const int64_t N = r.t.shape[0], K = r.t.shape[1];
+                if (si.t.shape[0] != (N + 127) / 128 || si.t.shape[1] != (K + 127) / 128)
+                    return TensorRef{};  // not the 128x128 layout: refuse, never guess
+                r.block_scaled = true;
+                r.scales_shard = si.shard;
+                r.scales_t = si.t;
+            }
+            return r;
+        }
+        TensorRef cp = get(base + ".weight_packed");
+        TensorRef cs = get(base + ".weight_scale");
+        if (cp.ok() && cs.ok() && mark_nvfp4(cp, cs, base)) return cp;
+        if (cp.ok() && cs.ok() && cp.t.dtype == STDtype::I32 &&
+            cs.t.dtype == STDtype::BF16 && cp.t.shape.size() == 2 &&
+            cs.t.shape.size() == 2 && cp.t.shape[0] == cs.t.shape[0]) {
+            const int out = int(cp.t.shape[0]);
+            const int in = int(cp.t.shape[1]) * 8;
+            const int groups = int(cs.t.shape[1]);
+            if (groups > 0 && in % groups == 0) {
+                cp.compressed_int4 = true;
+                cp.scales_shard = cs.shard;
+                cp.scales_t = cs.t;
+                cp.gptq_group = in / groups;
+                cp.t.shape = {out, in};
+                // Asymmetric exports (symmetric: false) ship per-group zero
+                // points, packed 8 rows per int32: [N/8][groups].  Without
+                // them every weight was decoded around 8 -- the fluent-free
+                // garbage of Muse-Glimmer-30B-GPTQ-INT4.
+                TensorRef zp = get(base + ".weight_zero_point");
+                if (zp.ok()) { cp.qzeros_shard = zp.shard; cp.qzeros_t = zp.t; }
+                return cp;
+            }
+        }
+        TensorRef qw = get(base + ".qweight");
+        TensorRef qz = get(base + ".qzeros");
+        TensorRef sc = get(base + ".scales");
+        if (!qw.ok() || !qz.ok() || !sc.ok() || qw.t.shape.size() != 2 ||
+            qz.t.shape.size() != 2 || sc.t.shape.size() != 2) return TensorRef{};
+        const int in = int(qw.t.shape[0]) * 8;
+        const int out = int(qw.t.shape[1]);
+        const int groups = int(qz.t.shape[0]);
+        if (groups <= 0 || in % groups) return TensorRef{};
+        qw.gptq = true;
+        qw.qzeros_shard = qz.shard; qw.qzeros_t = qz.t;
+        qw.scales_shard = sc.shard; qw.scales_t = sc.t;
+        qw.gptq_group = in / groups;
+        qw.t.shape = {out, in};
+        return qw;
+    }
 
 bool Qwen35Model::native_view(const TensorRef& r, QuantWeight& out, std::string& err) const {
     if (!r.native || !native_model || r.t.shape.size()!=2) {

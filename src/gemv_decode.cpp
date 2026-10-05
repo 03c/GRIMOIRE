@@ -990,6 +990,102 @@ bool esgemv2_bf16_try(sycl::queue& q, const QuantWeight& w, const float* x, floa
     return true;
 }
 
+// ESIMD decode GEMV for INT4 (M = 1): esgemv2_mxfp4's geometry -- K/512
+// threads, 2 rows, the activation slice in registers split even / odd K --
+// on GRIMOIRE's INT4: asymmetric, a bf16 scale and a u8 zero per GS = 64 or
+// 128 elements, zero 0xff = signed s4 (GPTQ experts XORed with 0x88 at load).
+// Every load of the slice is issued before any arithmetic (256 payload bytes
+// and the scale / zero vectors per row).  (q - z) is exact in fp16: 1024 + q
+// and 1024 + z are fp16 integers, so their difference is too.  The SIMT
+// kernel streamed Qwen3.8-27B-W4A16 at ~280 GB/s (19.9 tok/s against 33.1
+// for its MXFP4 twin).  Summation order differs from the SIMT kernel's (not
+// bit-identical).  GRIMOIRE_ESGEMV_I4=0 = the SIMT kernel.
+constexpr int kEs4MaxKS = 64;
+template <int R, int GS>
+sycl::event esgemv2_int4(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                         const std::vector<sycl::event>& deps) {
+    constexpr int KP = kEs2KP;
+    constexpr int RP = R < 4 ? 4 : R;
+    constexpr int NG = KP / GS;           // groups per slice
+    constexpr int BPG = GS / 2;           // payload bytes per group
+    const int KS = w.K / KP;
+    const uint8_t* pay = w.payload;
+    const uint16_t* scl = static_cast<const uint16_t*>(w.scales);
+    const uint8_t* zer = w.zeros;
+    const int64_t rb = w.row_bytes, rs = w.row_scales;
+    const int n_wg = w.N / R;
+    return q.submit([&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(n_wg) * KS, KS), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+            es::slm_init<kEs4MaxKS * RP * 4>();
+            const int t = int(it.get_local_id(0));
+            const int64_t row0 = int64_t(it.get_group(0)) * R;
+            const int kb = t * KP;
+            es::simd<uint8_t, KP / 2> pb[R];
+            es::simd<uint16_t, NG> sv[R];
+            es::simd<uint8_t, NG> zv[R];
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                pb[r] = es::block_load<uint8_t, KP / 2>(pay + (row0 + r) * rb + kb / 2);
+                sv[r] = es::block_load<uint16_t, NG>(scl + (row0 + r) * rs + kb / GS);
+                zv[r] = es::block_load<uint8_t, NG>(zer + (row0 + r) * rs + kb / GS);
+            }
+            es::simd<float, KP> xs = es::block_load<float, KP>(x + kb);
+            es::simd<float, KP / 2> xe = xs.template select<KP / 2, 2>(0);
+            es::simd<float, KP / 2> xo = xs.template select<KP / 2, 2>(1);
+            es::simd<float, RP> red = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < R; ++r) {
+                es::simd<float, 16> acc = 0.0f;
+                #pragma unroll
+                for (int g = 0; g < NG; ++g) {
+                    const uint32_t zu = uint32_t(zv[r][g]);
+                    const uint32_t sg = (zu + 1u) >> 8;            // zero 0xff = signed s4
+                    const uint16_t xm = uint16_t(sg * 0x88u);
+                    const sycl::half zh = sycl::bit_cast<sycl::half>(uint16_t(0x6400u | (zu - sg * 247u)));
+                    const float s = sycl::bit_cast<float>(uint32_t(sv[r][g]) << 16);
+                    es::simd<uint16_t, BPG> u = pb[r].template select<BPG, 1>(g * BPG);
+                    u ^= xm;
+                    es::simd<uint16_t, BPG> lb = (u & 0xF) | 0x6400;
+                    es::simd<uint16_t, BPG> hb = (u >> 4) | 0x6400;
+                    es::simd<sycl::half, BPG> lh = lb.template bit_cast_view<sycl::half>().read() - zh;
+                    es::simd<sycl::half, BPG> hh = hb.template bit_cast_view<sycl::half>().read() - zh;
+                    es::simd<float, BPG> wl = lh, wh = hh;
+                    es::simd<float, 16> part = 0.0f;
+                    #pragma unroll
+                    for (int b = 0; b < BPG / 16; ++b)
+                        part += wl.template select<16, 1>(16 * b) * xe.template select<16, 1>(g * BPG + 16 * b) +
+                                wh.template select<16, 1>(16 * b) * xo.template select<16, 1>(g * BPG + 16 * b);
+                    acc += part * s;
+                }
+                red[r] = es::reduce<float>(acc, std::plus<>());
+            }
+            if (KS > 1) {
+                es::slm_block_store<float, RP>(t * RP * 4, red);
+                es::barrier();
+                if (t != 0) return;
+                red = 0.0f;
+                for (int j = 0; j < KS; ++j) red += es::slm_block_load<float, RP>(j * RP * 4);
+            }
+            #pragma unroll
+            for (int r = 0; r < R; ++r) y[row0 + r] = red[r];
+        });
+    });
+}
+bool esgemv_i4_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
+                   const std::vector<sycl::event>& deps, sycl::event& out) {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV_I4");
+        return !(e && *e == '0'); }();
+    if (!on || w.fmt != Fmt::INT4 || !w.payload || !w.scales || !w.zeros) return false;
+    const int K = w.K, gs = 1 << w.int4_gshift();
+    if ((gs != 64 && gs != 128) || int64_t(w.row_scales) * gs != K) return false;
+    if (K % kEs2KP != 0 || K / kEs2KP > kEs4MaxKS || w.N % 2 != 0 ||
+        w.row_bytes < int64_t(K / 2) || w.row_bytes % 64 != 0 || w.row_scales % (kEs2KP / gs) != 0)
+        return false;
+    out = gs == 64 ? esgemv2_int4<2, 64>(q, w, x, y, deps) : esgemv2_int4<2, 128>(q, w, x, y, deps);
+    return true;
+}
+
 bool esgemv_try(sycl::queue& q, const QuantWeight& w, const float* x, float* y,
                 const std::vector<sycl::event>& deps, sycl::event& out) {
     static const bool on = [] { const char* e = std::getenv("GRIMOIRE_ESGEMV");
@@ -1024,6 +1120,10 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
     if constexpr (F == Fmt::BF16 && MB == 1) {
         sycl::event ev;
         if (esgemv2_bf16_try(q, w, x, y, deps, ev)) return ev;
+    }
+    if constexpr (F == Fmt::INT4 && MB == 1) {
+        sycl::event ev;
+        if (esgemv_i4_try(q, w, x, y, deps, ev)) return ev;
     }
     int epl = gemv_epl_override();
     if (epl != 16 && epl != 32 && epl != 64) epl = GemvGeom<F>::EPL_DEFAULT;
