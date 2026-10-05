@@ -59,6 +59,9 @@
 using b70::json_escape;
 
 int main(int argc, char** argv) {
+    // Level Zero sysman reports the card's free VRAM, which sizes prefill
+    // chunks (Grimoire::prefill_token_budget); it must be on before SYCL starts.
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
     std::string model_dir, host = "0.0.0.0", dflash_model;
     b70::Fmt proj_fmt = b70::Fmt::INT4;
     int max_seq = 8192, port = 8000;

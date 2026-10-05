@@ -3293,6 +3293,15 @@ struct Grimoire {
                       const std::vector<int>& slots,
                       const std::vector<int>& poss,
                       std::vector<int32_t>& out);
+    void mtp_follow_batch(const std::vector<int32_t>& next, const std::vector<int>& slots,
+                          const std::vector<int>& poss);
+    // Tokens one prefill() call may take without overflowing VRAM (see the
+    // definition).  0 = no limit.
+    int prefill_token_budget();
+    double pf_per_token = 0;        // prefill scratch bytes per token, measured
+    size_t pf_req_bytes = 0;        // scratch requested by the current call
+    size_t pf_cache_bytes = 0;      // scratch held by the prefill cache
+    size_t drafter_bytes = 0;       // per-slot drafter caches beyond load()
     // Step ONE resident sequence by one token the way a single-request
     // server does: M=1 kernels, recorded decode graph.  Returns the next
     // token.  solo_ok() says whether the scheduler may use it.
@@ -6686,6 +6695,12 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
           : !batched_ok   ? "SEQUENTIAL fallback (not a GPU, no matrix hardware) -- "
                             "do not benchmark this as prompt-processing throughput"
                           : "batched");
+        if (batched_ok && !tp_enabled() && !pp_enabled()) {
+            const int budget = prefill_token_budget();
+            if (budget > 0)
+                std::printf("    prefill chunk up to %d tokens per call (VRAM budget; "
+                            "longer prompts and admission batches are split)\n", budget);
+        }
         {
             // Report what set_norm_convention actually installed, not a
             // second copy of the decision.  The old line was a ternary on
@@ -7062,6 +7077,87 @@ bool Grimoire::decode_batch(const std::vector<int32_t>& toks,
     return prefill(toks, &out, &b);
 }
 
+// Tokens one prefill() call may take.  Its scratch is ~5 rows of the widest
+// projection per token and is cached grow-only (pf_cache), so a call larger
+// than the free VRAM fills the card and the driver evicts to system RAM.
+// MEASURED 2026-10-05, Qwen3.8-27B GPTQ (gate_up 34,816 wide, ~1 MB per prompt
+// token): 8 x 4096 prompt tokens in one batched admission took 49 s, the decode
+// steps after it 10 s each, and the driver's eviction job timed out (GT reset).
+// Budget = free VRAM (the driver's figure when Level Zero sysman answers, else
+// device size - what load() made resident - drafter caches) + what the cache
+// already holds - 1 GiB, over the bytes per token: the shapes' estimate
+// until a prefill of 256+ tokens has measured it.  Admission batches are capped
+// at it and longer prompts go in chunks.  GRIMOIRE_PREFILL_CHUNK=<tokens>
+// overrides (0 = no limit).
+int Grimoire::prefill_token_budget() {
+    static const int forced = [] { const char* v = std::getenv("GRIMOIRE_PREFILL_CHUNK");
+        return v && *v ? std::max(0, std::atoi(v)) : -1; }();
+    if (forced >= 0) return forced;
+    if (pp_enabled() || tp_enabled()) return 0;    // their own chunking
+    const double H = double(cfg.hidden);
+    static double W_cached = 0;      // prefill()'s scratch width, as it computes it
+    if (W_cached <= 0) {
+        double W = mtp.ok ? 2 * H : H;
+        for (const auto& d : L) {
+            const DevQuant* ws[] = {&d.la_qkv,&d.la_z,&d.la_out,&d.la_ab,&d.la_all,&d.q_proj,&d.k_proj,
+                &d.v_proj,&d.o_proj,&d.router,&d.sh_gu,&d.sh_down,&d.sh_gate_q,&d.o_gate};
+            for (auto* w : ws) { W = std::max(W, double(w->output_rows())); W = std::max(W, double(w->w.K)); }
+        }
+        W_cached = W;
+    }
+    const double W = W_cached;
+    const double tk = double(std::max(1, cfg.top_k)), I = double(std::max(1, cfg.moe_inter));
+    const double gdn = 2.0 * (2.0 * cfg.lin_k_heads * cfg.lin_k_dim + double(cfg.lin_v_heads) * cfg.lin_v_dim) +
+                       2.0 * cfg.lin_v_heads;
+    // the allocations of prefill(): float rows, then bf16 rows, then MoE rows
+    const double est = 4.0 * (4 * H + 5 * W + 12352 + 2 * tk + std::max(1, cfg.n_experts) + tk * I + gdn +
+                              tk * H) +
+                       2.0 * (2 * W + H + tk * std::max(H, 2 * I));
+    const double per = pf_per_token > 0 ? pf_per_token : est;
+    const auto dev = q.get_device();
+    double free_b = -1;
+    if (dev.has(sycl::aspect::ext_intel_free_memory)) {
+        try { free_b = double(dev.get_info<sycl::ext::intel::info::device::free_memory>()); }
+        catch (...) { free_b = -1; }
+    }
+    if (free_b < 0)
+        free_b = double(dev.get_info<sycl::info::device::global_mem_size>()) -
+                 vram_gb * 1073741824.0 - double(drafter_bytes);
+    const bool sysman = dev.has(sycl::aspect::ext_intel_free_memory);
+    free_b += double(pf_cache_bytes) - 1.0 * 1073741824.0;
+    long n = free_b > 0 ? long(free_b / per) : 0;
+    n = std::clamp(n, 256L, 32768L) / 256 * 256;
+    static const bool dbg = std::getenv("GRIMOIRE_BUDGET_DEBUG") != nullptr;
+    if (dbg)
+        std::fprintf(stderr, "    prefill budget: free %.2f GiB (%s) + cache %.2f - 1.0 margin, "
+                     "resident %.2f GiB, drafter %.2f GiB, W %.0f, per token %.3f MiB (%s) -> %ld tokens\n",
+                     (free_b - double(pf_cache_bytes) + 1.0 * 1073741824.0) / 1073741824.0,
+                     sysman ? "sysman" : "accounted", double(pf_cache_bytes) / 1073741824.0, vram_gb,
+                     double(drafter_bytes) / 1073741824.0, W, per / 1048576.0,
+                     pf_per_token > 0 ? "measured" : "estimate", n);
+    return int(n);
+}
+
+// A plain batched step while an MTP head is loaded (the scheduler speculates
+// only while few sequences are live): leave each sequence's drafter exactly
+// as a speculative round that accepted nothing would -- the head's K/V for
+// the position just processed and the last hidden state -- so a later round
+// drafts from a complete context instead of a cache with holes in it.
+void Grimoire::mtp_follow_batch(const std::vector<int32_t>& next,
+                                const std::vector<int>& slots,
+                                const std::vector<int>& poss) {
+    if(!mtp.ok || dflash2.ok || !spec_hidden_valid || next.size()!=slots.size() ||
+       slots.size()!=poss.size() || slots.size()>size_t(kSpecBatch)) return;
+    for(size_t r=0;r<slots.size();++r) {
+        bind_seq_slot(slots[r]);
+        mtp_warm(spec_hidden_steps+int64_t(r)*cfg.hidden,next[r],poss[r]);
+        q.memcpy(draft_slots[size_t(seq_slot)].hidden,spec_hidden_steps+int64_t(r)*cfg.hidden,
+                 size_t(cfg.hidden)*sizeof(float));
+    }
+    spec_hidden_valid=false;
+    sync();
+}
+
 // One live sequence: step it like the one-at-a-time server.
 //
 // With GRIMOIRE_SEQ_SLOTS >= 2 every request used to go through
@@ -7257,6 +7353,7 @@ void Grimoire::init_draft_slots() {
     }
     draft_slots.swap(built);
     batch_conv_steps=conv_steps;
+    drafter_bytes=extra;
     // Allocated by build()'s closing reset() and never passed to acct(),
     // so the "GiB resident" figure printed at load does not include it.
     // For a DFlash drafter it is dominated by the tap buffer: max_seq *
@@ -7410,7 +7507,10 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
     // spans: they would process the burst row by row and return a token per
     // row -- correct after the fallback below, but every prompt ingested
     // twice.  Admit those one prompt at a time.
-    if (pp_enabled() || tp_enabled() || mtp.ok || dflash2.ok || prefix_cache_usable() ||
+    // An MTP head is fine: prefill() warms each span's head cache (2026-10-05;
+    // admitting MTP prompts one at a time held 8-user prefill at one prompt's
+    // speed).  A DFlash drafter still admits one prompt at a time.
+    if (pp_enabled() || tp_enabled() || dflash2.ok || prefix_cache_usable() ||
         cfg.is_muse || cfg.is_gemma4 || cfg.is_qwen4_exp ||
         !batch_unsupported_reason().empty())
         return false;
@@ -7506,7 +7606,19 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
             const char* v = std::getenv("GRIMOIRE_PP_CHUNK");
             return v && *v ? std::max(0, std::atoi(v)) : 2048; }();
         auto prefill_tail = [&]() -> bool {
-            if (!pp_enabled() || pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
+            // one card: whole prompts unless the scratch would not fit
+            if (!pp_enabled()) {
+                const int budget = prefill_token_budget();
+                if (budget <= 0 || int(tail.size()) <= budget)
+                    return prefill(tail, nullptr, nullptr, false);
+                for (size_t off = 0; off < tail.size(); off += size_t(budget)) {
+                    const size_t len = std::min(size_t(budget), tail.size() - off);
+                    const std::vector<int32_t> chunk(tail.begin() + off, tail.begin() + off + len);
+                    if (!prefill(chunk, nullptr, nullptr, false)) return false;
+                }
+                return true;
+            }
+            if (pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
                 return prefill(tail, nullptr, nullptr, false);
             std::fprintf(stderr, "    PP chunked prefill: %zu tokens in chunks of %d (rank %d)\n",
                          tail.size(), pp_chunk, pp_rank);
@@ -13215,7 +13327,7 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         }
         // configurations the per-run code below does not cover: the caller
         // admits one prompt at a time instead
-        bool unsupported = pp_enabled() || tp_enabled() || mtp.ok || dflash2.ok ||
+        bool unsupported = pp_enabled() || tp_enabled() || dflash2.ok ||
                            cfg.is_qwen4_exp || dflash2.target_aux;
         for (const auto& d : L) unsupported = unsupported || d.k2_sparse || d.ple || d.tiered;
         if (unsupported) return false;
@@ -13255,16 +13367,18 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     static const bool pf_free = std::getenv("GRIMOIRE_PREFILL_SCRATCH_FREE") != nullptr;
     static std::vector<std::tuple<void*, size_t, bool>> pf_cache;
     size_t pf_ci = 0;
+    pf_req_bytes = 0;
     auto pf_alloc = [&](size_t bytes, bool shared) -> void* {
         const size_t b = std::max<size_t>(bytes, 64);
+        pf_req_bytes += b;
         if (pf_free) return shared ? sycl::malloc_shared(b, q) : sycl::malloc_device(b, q);
         const size_t i = pf_ci++;
         if (i >= pf_cache.size()) pf_cache.emplace_back(nullptr, size_t(0), shared);
         auto& [p, sz, sh] = pf_cache[i];
         if (p && sz >= b && sh == shared) return p;
-        if (p) { q.wait(); sycl::free(p, q); p = nullptr; sz = 0; }
+        if (p) { q.wait(); sycl::free(p, q); pf_cache_bytes -= sz; p = nullptr; sz = 0; }
         p = shared ? sycl::malloc_shared(b, q) : sycl::malloc_device(b, q);
-        sz = p ? b : 0; sh = shared;
+        sz = p ? b : 0; sh = shared; pf_cache_bytes += sz;
         return p;
     };
     auto df = [&](size_t n) { return static_cast<float*>(pf_alloc(n * sizeof(float), false)); };
@@ -14174,6 +14288,12 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // into the runtime.  Test the buffer, not the caller's shape.
     const bool capture_spec =
         next_tokens && M <= kSpecBatch && spec_hidden_steps && (!seqb || seqb->verify);
+    // A plain batched step with an MTP head keeps the rows' hidden states
+    // (only those -- no per-row recurrent snapshots): mtp_follow_batch()
+    // warms each sequence's head with them.
+    const bool capture_rows_hidden =
+        next_tokens && M <= kSpecBatch && spec_hidden_steps && seqb && !seqb->verify &&
+        !seqb->spans && mtp.ok && !dflash2.ok;
     const bool spec_route_diag = capture_spec &&
         std::getenv("GRIMOIRE_MTP_ROUTE_DIAG") != nullptr;
     size_t spec_route_total = 0, spec_route_unique = 0;
@@ -15532,10 +15652,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
     // not, so a verify batch wider than kSpecBatch marked a buffer valid
     // that nothing had written -- the exact bug the flag exists to stop,
     // and on a B70 (where batched prefill works) it is reachable.
-    if (capture_spec) {
+    if (capture_spec || capture_rows_hidden) {
         q.memcpy(spec_hidden_steps, bh, size_t(M) * H * sizeof(float));
         spec_hidden_valid = true;
     }
+    if (M >= 256) pf_per_token = std::max(pf_per_token, double(pf_req_bytes) / double(M));
     if (seqb) {
         // NOTHING about the engine's single cursor is meaningful here.
         // The rows belong to M different conversations, so there is no
@@ -15615,6 +15736,45 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         launch_kv_append_batched(q,t0,t2,mtp.L.k_cache,mtp.L.v_cache,M,start_pos,
             mtp.L.kv_heads,mtp.L.head_dim,max_seq);
         set_cursor(pos);q.wait_and_throw();
+    }
+    // Batched admission with an MTP head: the block above, per prompt span.
+    // The projections run once over every row; rope and the cache append run
+    // per span into that sequence's own head cache (bind_seq_slot switches
+    // mtp.L's caches), and each span's last hidden state seeds its first
+    // draft -- what admit_sequence() leaves for a single prompt.
+    if(mtp.ok && !dflash2.ok && spans_mode) {
+        std::vector<int32_t> shifted(size_t(M),0);
+        for(size_t r=0;r<runs.size();++r) {
+            const auto& run=runs[r];
+            for(int i=0;i+1<run.count;++i)
+                shifted[size_t(run.row0+i)]=tokens[size_t(run.row0+i+1)];
+            if(next_tokens && r<next_tokens->size())   // the span's first answer token
+                shifted[size_t(run.row0+run.count-1)]=(*next_tokens)[r];
+        }
+        q.memcpy(dtok,shifted.data(),size_t(M)*sizeof(int32_t));
+        launch_embed_batched(q,embed,dtok,r0,M,H,{});
+        launch_rmsnorm_residual_batched(q,r0,nullptr,nullptr,mtp.pre_e,bn,M,H,cfg.rms_eps);
+        launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        q.parallel_for(sycl::range<2>(M,H),[=](sycl::id<2> id) {
+            const size_t row=id[0],col=id[1];
+            t0[row*2*H+col]=bn[row*H+col];
+            t0[row*2*H+H+col]=r1[row*H+col];
+        });
+        mm(mtp.fc,t0,t1);
+        launch_rmsnorm_residual_batched(q,t1,nullptr,nullptr,mtp.L.in_norm,r0,M,H,cfg.rms_eps);
+        mm(mtp.L.k_proj,r0,t0);mm(mtp.L.v_proj,r0,t2);
+        const int64_t kvd=int64_t(mtp.L.kv_heads)*mtp.L.head_dim;
+        for(const auto& run:runs) {
+            bind_seq_slot(run.slot);
+            launch_qk_norm_rope_batched(q,nullptr,t0+run.row0*kvd,nullptr,mtp.L.k_norm,run.count,0,
+                mtp.L.kv_heads,mtp.L.head_dim,run.pos0,mtp.L.rope_theta,
+                mtp.L.partial_rope,cfg.rms_eps);
+            launch_kv_append_batched(q,t0+run.row0*kvd,t2+run.row0*kvd,mtp.L.k_cache,mtp.L.v_cache,
+                run.count,run.pos0,mtp.L.kv_heads,mtp.L.head_dim,max_seq);
+            q.memcpy(draft_slots[size_t(run.slot)].hidden,bh+int64_t(run.row0+run.count-1)*H,
+                     size_t(H)*sizeof(float));
+        }
+        q.wait_and_throw();
     }
 
     if (!next_tokens && start_pos == 0) save_prefix(tokens);
@@ -16239,14 +16399,23 @@ void GrimoireScheduler::run() {
             const char* v = std::getenv("GRIMOIRE_ADMIT_BATCH_TOKENS");
             return v && *v ? std::max(0, std::atoi(v)) : 32768; }();
         static const bool adm_timing_b = std::getenv("GRIMOIRE_BATCH_HOST_TIMING") != nullptr;
-        while (batchable && admit_batch_tokens > 0 && taking.size() >= 2) {
+        // ... and never more than one prefill's VRAM budget (Qwen3.8-27B:
+        // ~1 MB of scratch per prompt token -- 8 x 4096 overflowed the card).
+        // Asked only when there is a batch to admit: the budget queries the
+        // driver for free VRAM, which every decode step would otherwise pay
+        // (single-user MTP lost ~10% to it).
+        std::vector<std::shared_ptr<SchedJob>> admitted_round;
+        const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2) ? [&] {
+            const int b = e.prefill_token_budget();
+            return b > 0 ? std::min(admit_batch_tokens, b) : admit_batch_tokens; }() : 0;
+        while (batchable && admit_cap > 0 && taking.size() >= 2) {
             std::vector<std::shared_ptr<SchedJob>> group;
             std::vector<const std::vector<int32_t>*> prompts;
             size_t tot = 0;
             const size_t free_slots = size_t(std::count(slot_busy.begin(), slot_busy.end(), false));
             for (auto& j : taking) {
                 if (cancelled(j) || group.size() >= free_slots) continue;
-                if (tot + j->prompt.size() > size_t(admit_batch_tokens)) continue;
+                if (tot + j->prompt.size() > size_t(admit_cap)) continue;
                 group.push_back(j); prompts.push_back(&j->prompt); tot += j->prompt.size();
             }
             if (group.size() < 2) break;
@@ -16270,18 +16439,28 @@ void GrimoireScheduler::run() {
                 j->pos  = int(j->prompt.size());
                 j->next = bfirst[k];
                 slot_busy[size_t(j->slot)] = true;
-                const bool stop = (j->eos >= 0 && j->next == j->eos) ||
-                                  (j->eot >= 0 && j->next == j->eot);
-                if (stop) retire(j, FinishReason::Stop);
-                else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
-                else if (j->budget <= 1) retire(j, FinishReason::Length);
-                else active.push_back(j);
+                admitted_round.push_back(j);
             }
             std::vector<std::shared_ptr<SchedJob>> rest;
             for (auto& j : taking)
                 if (std::find(group.begin(), group.end(), j) == group.end()) rest.push_back(j);
             taking.swap(rest);
         }
+        // First tokens of the round's batched waves go out together, after
+        // the last wave: the VRAM budget can split a burst into waves (Ornith,
+        // 8 x 4096 prompt tokens: 6 + 2), and answering the first wave ~0.8 s
+        // early left its requests' clocks running -- llama-benchy pp4096/tg32
+        // c8 total 390 -> 168 tok/s.  One batch (v1.6) also answered everyone
+        // at the end, so the first token is no later than it was then.
+        for (auto& j : admitted_round) {
+            const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                              (j->eot >= 0 && j->next == j->eot);
+            if (stop) retire(j, FinishReason::Stop);
+            else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
+            else if (j->budget <= 1) retire(j, FinishReason::Length);
+            else active.push_back(j);
+        }
+        admitted_round.clear();
         for (auto& j : taking) {
             if (cancelled(j)) { finish(j, FinishReason::Cancelled); continue; }
             int slot = -1;
@@ -16424,7 +16603,17 @@ void GrimoireScheduler::run() {
                     if (!e.pp_send_request(request))
                         throw std::runtime_error("pipeline batch broadcast failed");
                 }
-                if(e.speculative_batch()) {
+                // Speculate only while few sequences are live: at 8 users each
+                // gets one draft and the verify rows cost more than plain
+                // batching (Qwen3.8-27B GPTQ + MTP, llama-benchy pp512/tg128
+                // total tok/s at 1/2/4/8 users: MTP 52.5 / 61.6 / 67.0 / 78.4,
+                // plain 34.8 / 48.1 / 86.4 / 145.3).  GRIMOIRE_SPEC_MAX_SEQS.
+                static const int spec_max_seqs = [] {
+                    const char* v = std::getenv("GRIMOIRE_SPEC_MAX_SEQS");
+                    return v && *v ? std::max(1, std::atoi(v)) : 2; }();
+                const bool spec_now = e.speculative_batch() &&
+                    (e.dflash2.ok || int(toks.size()) <= spec_max_seqs);
+                if(spec_now) {
                     std::vector<int> remaining;
                     for(size_t k:which) {
                         const auto& job=active[k];
@@ -16439,7 +16628,10 @@ void GrimoireScheduler::run() {
                 } else {
                     if(!e.decode_batch(toks,slots,poss,got) || got.size()!=toks.size()) {
                         failed=true; err="batched decode step failed";
-                    } else for(int32_t token:got) blocks.push_back({token});
+                    } else {
+                        for(int32_t token:got) blocks.push_back({token});
+                        if(e.speculative_batch()) e.mtp_follow_batch(got,slots,poss);
+                    }
                 }
             } catch (const std::exception& ex) { failed = true; err = ex.what(); }
         }

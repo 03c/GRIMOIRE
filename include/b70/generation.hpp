@@ -67,6 +67,15 @@ inline int generation_budget(const std::vector<int32_t>& ids, int requested, int
     return std::min(requested,capacity-int(ids.size()));
 }
 
+namespace gen_detail {
+// The engine's per-call prefill token budget when it has one (host test
+// engines do not): 0 = no limit.
+template<class E> auto prefill_budget(E& e, int) -> decltype(int(e.prefill_token_budget())) {
+    return e.prefill_token_budget();
+}
+template<class E> int prefill_budget(E&, long) { return 0; }
+} // namespace gen_detail
+
 // Production control flow is a template to allow stateful, deterministic host
 // tests without emulating GPU numerics. Errors propagate, never masquerade as EOS.
 template<class Engine>
@@ -187,7 +196,19 @@ int generate_tokens(Engine& e, const std::vector<int32_t>& prompt,
         static const int pp_first = [] {
             const char* v = std::getenv("GRIMOIRE_PP_CHUNK_FIRST");
             return v && *v ? std::max(0, std::atoi(v)) : 0; }();
-        if(!e.pp_enabled() || pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
+        // One card: whole prompts, unless the prefill scratch would not fit
+        // in VRAM (Grimoire::prefill_token_budget) -- then chunks of that size.
+        if(!e.pp_enabled()) {
+            const int budget = gen_detail::prefill_budget(e, 0);
+            if(budget <= 0 || int(tail.size()) <= budget) return e.prefill(tail);
+            for(size_t off = 0; off < tail.size(); off += size_t(budget)) {
+                const size_t len = std::min(size_t(budget), tail.size() - off);
+                if(!e.prefill(std::vector<int32_t>(tail.begin() + off, tail.begin() + off + len)))
+                    return false;
+            }
+            return true;
+        }
+        if(pp_chunk <= 0 || int(tail.size()) < 2 * pp_chunk)
             return e.prefill(tail);
         static const bool pp_timing = std::getenv("GRIMOIRE_PP_TIMING") != nullptr;
         const auto pt0 = std::chrono::steady_clock::now();
