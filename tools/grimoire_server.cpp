@@ -56,7 +56,23 @@
 #include "b70/grimoire_api.hpp"
 #include "b70/http_request.hpp"
 #include <memory>
+#include <random>
+#include <cctype>
 using b70::json_escape;
+
+// OpenAI tool_calls array; streaming deltas also carry each call's index.
+static std::string tool_calls_json(const std::vector<b70::ParsedToolCall>& calls, bool with_index) {
+    static std::mt19937_64 rng{std::random_device{}()};
+    std::string out="[";
+    for(size_t i=0;i<calls.size();++i) {
+        char id[32];std::snprintf(id,sizeof id,"call_%016llx",static_cast<unsigned long long>(rng()));
+        if(i)out+=",";
+        out+="{"+(with_index?"\"index\":"+std::to_string(i)+",":std::string())+"\"id\":\""+id+
+             "\",\"type\":\"function\",\"function\":{\"name\":\""+json_escape(calls[i].name)+
+             "\",\"arguments\":\""+json_escape(calls[i].arguments)+"\"}}";
+    }
+    return out+"]";
+}
 
 int main(int argc, char** argv) {
     std::string model_dir, host = "0.0.0.0", dflash_model;
@@ -192,20 +208,23 @@ int main(int argc, char** argv) {
     });
     auto handle=[&](const httplib::Request& req,httplib::Response& res,bool chat) {
         const auto request=b70::parse_completion_request(req.body,chat);
-        const std::string prompt=chat?tk.apply_chat_template(request.messages):request.prompt;
+        const std::string prompt=chat?tk.apply_chat_template(request.messages,request.chat):request.prompt;
+        const bool think=chat&&!harmony_model&&request.chat.enable_thinking;
+        const std::vector<b70::Json> tools=request.tools;
         const auto ids=tk.encode(prompt);
         const int budget=b70::generation_budget(ids,request.max_tokens,max_seq,int(tk.vocab_size()));
         const std::string model=json_escape(model_dir);
         const auto request_id=std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         if(request.stream) {
             res.set_chunked_content_provider("text/event-stream",
-                [&,ids,budget,chat,model,request_id](size_t,httplib::DataSink& sink) {
+                [&,ids,budget,chat,model,request_id,think,tools](size_t,httplib::DataSink& sink) {
                     auto send=[&](const std::string& payload) {
                         const auto line="data: "+payload+"\n\n";return sink.write(line.data(),line.size());
                     };
                     const std::string prefix="{\"id\":\"cmpl-"+request_id+"\",\"object\":\""+
                         (chat?"chat.completion.chunk":"text_completion")+"\",\"model\":\""+model+"\"";
-                    b70::ResponseDecoder decoder(tk,chat&&harmony_model);
+                    b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
+                    if(chat&&!tools.empty())decoder.enable_tools();
                     bool connected=true;
                     auto emit=[&](const std::string& piece,bool reasoning) {
                         const std::string value=chat?"\"delta\":{\""+std::string(reasoning?"reasoning_content":"content")+
@@ -220,9 +239,19 @@ int main(int argc, char** argv) {
                             tk.eos(),tk.special_id("<|eot|>"),out,
                             [&](int32_t t){return decoder.push(t,emit);},&finish);
                         if(connected)connected=decoder.finish(emit);
+                        std::string reason=b70::finish_reason_name(finish);
+                        if(connected && !decoder.tool_call_text().empty()) {
+                            const auto calls=b70::parse_xml_tool_calls(decoder.tool_call_text(),tools);
+                            if(calls.empty())connected=emit(decoder.tool_call_text(),false);
+                            else {
+                                connected=send(prefix+",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":"+
+                                    tool_calls_json(calls,true)+"},\"finish_reason\":null}]}");
+                                reason="tool_calls";
+                            }
+                        }
                         if(connected)send(prefix+",\"choices\":[{\"index\":0,"+
                             (chat?"\"delta\":{}":"\"text\":\"\"")+",\"finish_reason\":\""+
-                            b70::finish_reason_name(finish)+"\"}],\"usage\":{\"prompt_tokens\":"+
+                            reason+"\"}],\"usage\":{\"prompt_tokens\":"+
                             std::to_string(ids.size())+",\"completion_tokens\":"+std::to_string(n)+
                             ",\"total_tokens\":"+std::to_string(ids.size()+n)+"}}");
                     } catch(const std::exception& ex) {
@@ -238,16 +267,28 @@ int main(int argc, char** argv) {
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
                 tk.special_id("<|eot|>"),out,{},&finish);
             std::string content,reasoning;
-            b70::ResponseDecoder decoder(tk,chat&&harmony_model);
+            b70::ResponseDecoder decoder(tk,chat&&harmony_model,think);
+            if(chat&&!tools.empty())decoder.enable_tools();
             auto emit=[&](const std::string& p,bool r){(r?reasoning:content)+=p;return true;};
             for(auto t:out)decoder.push(t,emit);
             decoder.finish(emit);
-            const std::string answer=chat?"\"message\":{\"role\":\"assistant\",\"content\":\""+
-                json_escape(content)+"\""+(reasoning.empty()?"":",\"reasoning_content\":\""+json_escape(reasoning)+"\"")+"}":
+            std::string reason=b70::finish_reason_name(finish), calls_json;
+            if(!decoder.tool_call_text().empty()) {
+                const auto calls=b70::parse_xml_tool_calls(decoder.tool_call_text(),tools);
+                if(calls.empty())content+=decoder.tool_call_text();
+                else {
+                    calls_json=tool_calls_json(calls,false);reason="tool_calls";
+                    while(!content.empty() && std::isspace(static_cast<unsigned char>(content.back())))content.pop_back();
+                }
+            }
+            const std::string content_json=!calls_json.empty()&&content.empty()?"null":"\""+json_escape(content)+"\"";
+            const std::string answer=chat?"\"message\":{\"role\":\"assistant\",\"content\":"+content_json+
+                (reasoning.empty()?"":",\"reasoning_content\":\""+json_escape(reasoning)+"\"")+
+                (calls_json.empty()?"":",\"tool_calls\":"+calls_json)+"}":
                 "\"text\":\""+json_escape(content)+"\"";
             res.set_content("{\"id\":\"cmpl-"+request_id+"\",\"object\":\""+(chat?"chat.completion":"text_completion")+
                 "\",\"model\":\""+model+"\",\"choices\":[{\"index\":0,"+answer+",\"finish_reason\":\""+
-                b70::finish_reason_name(finish)+"\"}],\"usage\":{\"prompt_tokens\":"+std::to_string(ids.size())+
+                reason+"\"}],\"usage\":{\"prompt_tokens\":"+std::to_string(ids.size())+
                 ",\"completion_tokens\":"+std::to_string(n)+",\"total_tokens\":"+std::to_string(ids.size()+n)+"}}","application/json");
         }
     };

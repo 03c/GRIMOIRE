@@ -46,9 +46,25 @@
 
 namespace b70 {
 
+// One function call of an assistant turn, arguments in their order with each
+// value as the template prints it (a string as is, anything else as JSON).
+struct ChatToolCall {
+    std::string name;
+    std::vector<std::pair<std::string, std::string>> args;
+};
 struct ChatMessage {
     std::string role;
     std::string content;
+    std::string reasoning;                 // assistant reasoning_content
+    bool has_reasoning = false;
+    std::vector<ChatToolCall> tool_calls;  // assistant tool_calls
+};
+// Request-level template inputs: tool definitions (already tojson-printed),
+// thinking on/off and the reasoning effort ("" = the template default).
+struct ChatOptions {
+    std::vector<std::string> tools;
+    bool enable_thinking = true;
+    std::string reasoning_effort;
 };
 
 class Tokenizer {
@@ -85,6 +101,13 @@ public:
     // Render an ordered conversation without dropping prior turns. Harmony
     // models use recipient channels; Qwen/Ornith retain ChatML formatting.
     std::string apply_chat_template(const std::vector<ChatMessage>& messages) const;
+    std::string apply_chat_template(const std::vector<ChatMessage>& messages,
+                                    const ChatOptions& opt) const;
+    // The checkpoint's chat_template.jinja is the Qwen3.5-family template with
+    // XML tool calls (<tool_call><function=...>): Qwen3.8 / Agnes / Ornith.
+    // Only then are tools rendered and parsed; other templates refuse them.
+    bool supports_tools() const { return tmpl_xml_tools_; }
+    bool thinking_template() const { return special_by_text_.count("</think>") != 0; }
 
 private:
     std::vector<std::string>                     id_to_tok_;
@@ -95,6 +118,11 @@ private:
 
     int32_t bos_ = -1, eos_ = -1;
     size_t  bad_merges_ = 0;
+    // read from the checkpoint's chat template (chat_template.jinja or
+    // tokenizer_config.json), see apply_chat_template
+    bool tmpl_xml_tools_ = false;      // the Qwen3.5-family tool block
+    bool tmpl_effort_ = false;         // Qwen3.8: reasoning-effort system text
+    bool tmpl_think_split_ = false;    // Ornith: reasoning recovered from content
 
     // byte <-> placeholder-codepoint tables
     std::string byte_to_uni_[256];
