@@ -8,7 +8,118 @@ GRIMOIRE is a native inference engine written in C++ with SYCL and Level Zero. I
 
 The aim is straightforward: make high-performance local LLM inference possible on this hardware, using kernels and memory paths designed for the GPU instead of relying on a general-purpose inference stack.
 
-> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. A ready-to-use inference image or downloadable model package will be added here later.
+> **Project status: Experimental.** GRIMOIRE is actively developed, but it is not yet a stable, production-ready release. Expect incomplete features, changing model support, and performance or compatibility issues. Ready-to-use Docker images are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page; [Run a model](#run-a-model) below lists every model with its Hugging Face download, launch flags and measured speed.
+
+## Run a model
+
+### 1. Get the image
+
+```
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.7/grimoire-b70-v1.7.tar.gz
+docker load < grimoire-b70-v1.7.tar.gz        # -> grimoire-b70:latest
+```
+
+All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
+build the image yourself: `docker build -t grimoire-b70 .`
+
+### 2. Download a model
+
+Every number in this README was measured with a checkpoint from the table below. Download the
+Hugging Face repository into a folder, for example:
+
+```
+hf download Qwen/Qwen3.8-27B-FP8 --local-dir /path/to/models/Qwen3.8-27B-FP8
+```
+
+### 3. Find the B70's render node
+
+```
+ls -l /dev/dri/by-path/      # the B70 is the pci-<its PCI address>-render entry, e.g. renderD128
+```
+
+The number can change after a reboot, so check again after every reboot.
+
+### 4. Launch
+
+```
+docker run -d --name grimoire --init --stop-timeout 300 \
+    --device /dev/dri/renderD128 \
+    -v /path/to/models:/models -p 8000:8000 \
+    -e GRIMOIRE_SEQ_SLOTS=8 \
+    grimoire-b70:latest \
+    server --model /models/Qwen3.8-27B-FP8 --proj mxfp4 --ctx 32000 --port 8000
+```
+
+Only three things change from one model to another: the `--model` folder, `--proj`, and the extra
+flags in the table. The server is OpenAI-compatible at `http://<host>:8000/v1`.
+
+- `--init` and `--stop-timeout 300` are required: killing a container with GPU work in flight can
+  drop the card off the PCI bus until a power cycle.
+- `-e GRIMOIRE_SEQ_SLOTS=8` lets up to 8 requests decode together. Without it the server answers
+  one request at a time.
+- Decoding is greedy (leave `temperature` out or send 0). Tool calling (`tools`), `stop`,
+  `logprobs` and `response_format` are not supported yet; requests that use them get HTTP 400.
+
+### Models, downloads, launch flags and measured speed
+
+Measured on one Arc Pro B70 with llama-benchy 0.4.0, release v1.7 unless marked (v1.6 = not
+re-measured; the code paths for that row did not change). Decode = generated tokens/s; "8 users" is
+the total over 8 concurrent requests with `-e GRIMOIRE_SEQ_SLOTS=8`; prompt = prefill tokens/s at one
+user.
+
+| Model | Download from Hugging Face | `--proj` | Extra flags | Decode, 1 user | Decode, 8 users | Prompt |
+|---|---|---|---|---:|---:|---:|
+| **Qwen3.8-27B** + MTP | [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) | `int4` | `-e GRIMOIRE_MTP=1 -e GRIMOIRE_MTP_K=3` | **50 - 55** | 78 <sup>a</sup> | 1,746 (pp4096) |
+| Qwen3.8-27B, plain | same | `int4` | | 34.8 <sup>b</sup> | 145.3 <sup>b</sup> | 870 (pp512) |
+| **Qwen3.8-27B** + DFlash2 | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) and the draft [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | `mxfp4` | `--dflash-model /models/Qwen3.8-27B-DFlash2` (server argument; measured without `GRIMOIRE_SEQ_SLOTS`) | **57.1** | -- | 1,294 (pp512) |
+| Qwen3.8-27B + MTP | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | `mxfp4` | `-e GRIMOIRE_MTP=1 -e GRIMOIRE_MTP_K=3` | 48.5 | -- | 1,415 (pp512) |
+| Qwen3.8-27B, plain | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) or the BF16 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | `mxfp4` | | 33.1 | **162.2** | 1,412 (pp512), ~2,050 (pp4096) |
+| **Ornith-1.5-35B-A3B** | [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) (BF16), [-FP8](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8) or [-NVFP4](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-NVFP4) | `mxfp4` | | **193** | **460 - 466** | 7,000 - 7,400 (pp512) |
+| Ornith-1.5-35B-A3B, GPTQ | [SergiioB/Ornith-1.5-35B-A3B-GPTQ-Int4-sym-G128-MTP-BF16-MixedCal-v2](https://huggingface.co/SergiioB/Ornith-1.5-35B-A3B-GPTQ-Int4-sym-G128-MTP-BF16-MixedCal-v2) | `int4` | | 100 (v1.6) | 122 (v1.6) | 308 (v1.6) |
+| Qwen3.6-35B-A3B, GPTQ | [palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4](https://huggingface.co/palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4) | `int4` | | 100 (v1.6) | 122 (v1.6) | 322 (v1.6) |
+| Muse-Glimmer-30B | [dudeman2512/Muse-Glimmer-30B-INT4-W4A16](https://huggingface.co/dudeman2512/Muse-Glimmer-30B-INT4-W4A16) | `int4` | leave out `GRIMOIRE_SEQ_SLOTS` | 26.9 | -- | 702 (pp512) |
+| Muse-Glimmer-30B | [olka-fi/Muse-Glimmer-30B-MXFP4](https://huggingface.co/olka-fi/Muse-Glimmer-30B-MXFP4) | `mxfp4` | leave out `GRIMOIRE_SEQ_SLOTS` | 24.8 (v1.6) | -- | |
+| Agnes-3.0-Flash | [Agnes-AI/Agnes-3.0-Flash](https://huggingface.co/Agnes-AI/Agnes-3.0-Flash) | `mxfp4` | | runs; not benchmarked yet | | |
+| K2-Horizon-MoVA-36B-A4B | [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) | `mxfp4` | | runs; not benchmarked yet | | |
+| Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | `bf16` | `-e GRIMOIRE_EXPERT_VRAM_PER_LAYER=112 -e GRIMOIRE_PLE_FILE=/models/flash-next-ple.bin`, see [FLASH-NEXT-TIERED.md](FLASH-NEXT-TIERED.md) | runs (too large for one B70: VRAM + RAM + SSD); not benchmarked yet | | |
+
+<sup>a</sup> MTP together with `GRIMOIRE_SEQ_SLOTS=8`: 52.5 / 61.6 / 67.0 / 78.4 tok/s at 1 / 2 / 4 / 8 users
+(measured on the Swift-1.5 fine-tune below, same format).
+For 4 or more users, plain batching (no MTP) gives more total throughput.
+<sup>b</sup> Measured on [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
+a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
+
+**Fine-tunes in the same format work the same way** (`--proj int4`, MTP flags as above). Tested:
+[bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16)
+(MTP 51.3 tok/s) and
+[greglechin/Swift-1.5-Qwen3.8-27B-Uncensored-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/greglechin/Swift-1.5-Qwen3.8-27B-Uncensored-GPTQ-Int4-sym-G128-MTP-BF16)
+(MTP 47.2 tok/s, CLI).
+
+**Speculative decoding (MTP / DFlash2).**
+
+- **MTP** uses the checkpoint's own multi-token-prediction head, so there is nothing extra to
+  download: add `-e GRIMOIRE_MTP=1 -e GRIMOIRE_MTP_K=3`. The head drafts 3 tokens per step (K=3
+  measured best: K=2 46.3, K=3 48.4, K=4 39.0 tok/s).
+- **DFlash2** is a separate draft model: download it next to the checkpoint and add
+  `--dflash-model /models/<draft folder>` after `server`.
+- Today both are faster than plain decoding on Qwen3.8-27B only. On Ornith they are not faster
+  yet, so leave them off there.
+
+**Prefill (prompt) speed on INT4.** GPTQ / INT4 checkpoints prefill more slowly than MXFP4 for
+now (1,746 vs ~2,050 tok/s at 4,096 tokens on Qwen3.8-27B): the fast prefill kernel exists for
+MXFP4 only. An INT4 prefill kernel is the next item. For the fastest prompt processing, use the
+FP8 or BF16 release with `--proj mxfp4`.
+
+### About the `-MXFP4-GRIMOIRE` folders in older results
+
+Some older results and commit notes name `Ornith-1.5-35B-A3B-MXFP4-GRIMOIRE` or
+`Qwen3.8-27B-MXFP4-GRIMOIRE`. These are **not on Hugging Face**: they are pre-converted copies
+made on the developer's machine with GRIMOIRE's offline converter (`tools/b70_compile_model.cpp`)
+from the official BF16 releases ([ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B),
+[Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)). You do not need them: loading the
+BF16 (or FP8 / NVFP4) release with `--proj mxfp4` quantizes to the same MXFP4 format at startup
+and runs at the same speed (measured: 193 tok/s on Ornith from the FP8 and NVFP4 releases and
+from the converted copy). The converted copy only starts faster.
 
 ## Why GRIMOIRE was created
 
@@ -44,8 +155,9 @@ These are results recorded in the linked project commits on the developer's Arc 
 
 | Workload | Recorded result | Context |
 |---|---:|---|
-| Ornith-1.5-35B-A3B token generation | **198.6 tokens/s** | Single B70; 256 generated tokens in the recorded run. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/9cd4a9191ea4ee704f9214861b3cb1c9802b3291) |
-| Ornith-1.5-35B-A3B prefill | **10,030–10,165 tokens/s** | Two-GPU pipeline-parallel run, 5,987-token prompt. Output matched the single-B70 run for the checked text. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/b970875d52cf3e6cea8d354808dd7ab5ff030323) |
+| Ornith-1.5-35B-A3B token generation | **198.6 tokens/s** | Single B70, command-line run, 256 generated tokens; model: the MXFP4 conversion of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) (see [Run a model](#run-a-model)). Through the HTTP server with llama-benchy: 193 tokens/s. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/9cd4a9191ea4ee704f9214861b3cb1c9802b3291) |
+| Ornith-1.5-35B-A3B prefill | **10,030–10,165 tokens/s** | Two-GPU pipeline-parallel run, 5,987-token prompt, same model. Output matched the single-B70 run for the checked text. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/b970875d52cf3e6cea8d354808dd7ab5ff030323) |
+| Qwen3.8-27B with MTP / DFlash2 | **50–55 / 57 tokens/s** | Single B70, one user, llama-benchy through the HTTP server, release v1.7 (plain decoding: 33–35). Exact checkpoints and flags in [Run a model](#run-a-model). [Release v1.7](https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.7) |
 | TP decode communication batching | **59.3–60.0 tokens/s** | Recorded TP run after combining independent projection gathers; see the commit for the setup and comparison. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/33757bb631606293a3af87ab76409c479a3c3015) |
 
 The two-GPU figures demonstrate an actively developed path. Tensor and pipeline parallelism are intended for models that need multiple GPUs for capacity; they are not automatically faster for a model that already fits on one card.
@@ -64,8 +176,9 @@ attention, or MoE code, not as a one-time check.
 | Ornith-1.5-35B-A3B | MXFP4, NVFP4, FP8, GPTQ-Int4, INT4 (AutoRound W4A16), bf16 source | target | 35B MoE, 256 experts / top-8. 198.6 tok/s decode, 10,030–10,165 tok/s prefill (2×B70), both above |
 | Ornith-1.5-35B-A3B-DFlash2 | MXFP4 | speculative draft | for Ornith-1.5-35B-A3B |
 | Qwen3.8-27B | MXFP4 (two independent conversions), NVFP4, FP8, W4A16, GPTQ-Int4, INT4 (AutoRound), bf16 source | target | reference point for the vLLM/OpenVINO int4-ov baseline this project compares against |
-| Qwen3.8-27B + native MTP head | MXFP4 or GPTQ-Int4 | target | multi-token prediction |
-| Qwen3.8-27B-DFlash2 | MXFP4 | speculative draft | for Qwen3.8-27B |
+| Qwen3.8-27B + native MTP head | GPTQ-Int4 (BF16 head), FP8 | target | multi-token prediction, faster than plain decoding since v1.7 |
+| Qwen3.8-27B fine-tunes: Swift-1.5, Swift-1.5 Uncensored | GPTQ-Int4 + BF16 MTP head | target | same format as Qwen3.8-27B GPTQ-Int4 |
+| Qwen3.8-27B-DFlash2 | MXFP4 | speculative draft | for Qwen3.8-27B ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)); faster than plain decoding since v1.7 |
 | Qwen3.6-35B-A3B-GPTQ-Int4 | GPTQ-Int4 | target | 35B MoE |
 | Qwen3.6-35B-A3B-DFlash | bf16 | speculative draft | for its own GPTQ-Int4 target |
 | Qwen3.5-35B-A3B-DFlash | bf16 | speculative draft | for Ornith, which shares its base architecture |
@@ -81,27 +194,8 @@ Tensor-parallel and pipeline-parallel both run correctly across two B70s, but th
 for checkpoints whose own footprint doesn't fit one card's VRAM — every model in the
 table fits a single B70 and runs fastest that way.
 
-Speculative decoding (the MTP and DFlash2 rows above) is currently correct but *slower*
-than plain decode on every model it's paired with — functional, not yet a throughput win.
-
-## Getting started
-
-The engine and build scripts are in this repository, along with a `Dockerfile` that
-builds a minimal runtime image -- just GRIMOIRE's own binaries plus Intel's GPU driver
-stack, nothing else:
-
-```
-docker build -t grimoire-b70 .
-docker run --init --stop-timeout 300 --device /dev/dri/renderDXXX \
-    -v /path/to/your/models:/models -p 8000:8000 \
-    grimoire-b70 server --model /models/<checkpoint> --proj mxfp4 --port 8000
-```
-
-`--init` and a generous `--stop-timeout` are not optional: GPU work in flight when a
-container is killed without them can wedge the card hard enough to need a power cycle.
-Replace `server` with `generate -m ... -p "..." -n <tokens>` for a one-shot CLI run
-instead of the HTTP server. Check the project status and the model table above before
-choosing a model or format.
+Speculative decoding is faster than plain decoding on Qwen3.8-27B since v1.7 (MTP ~1.5x,
+DFlash2 ~1.7x for one user). On the other models it is not faster yet, so leave it off there.
 
 ## Development notes
 
