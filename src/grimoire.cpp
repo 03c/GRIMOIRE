@@ -5290,13 +5290,21 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             bool mok = true;
             // Preserve raw BF16 heads. Native packed heads retain their own
             // encoding; the target --proj format cannot silently lower precision.
+            // GRIMOIRE_MTP_HEAD_FMT=mxfp4|int4|fp8 quantizes a raw BF16 head at
+            // load (opt-in: it changes the drafts, never an emitted token --
+            // every token is the target's argmax).
+            static const Fmt head_fmt = [] {
+                const char* e = std::getenv("GRIMOIRE_MTP_HEAD_FMT");
+                const std::string v = e ? e : "";
+                return v == "mxfp4" ? Fmt::MXFP4 : v == "int4" ? Fmt::INT4 :
+                       v == "fp8" ? Fmt::FP8_E4M3 : Fmt::BF16; }();
             auto mtp_fmt = [&](const TensorRef& r) {
                 if(r.native && r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
                     QuantWeight w;std::string why;
                     if(!ck.native_view(r,w,why))throw std::invalid_argument(why);
                     return w.fmt;
                 }
-                return Fmt::BF16;
+                return head_fmt;
             };
             auto shape_ok=[](const TensorRef& r,std::initializer_list<int64_t> shape) {
                 return r.ok() && r.t.shape==std::vector<int64_t>(shape);
@@ -15610,14 +15618,20 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
                 launch_gemv_int4sym_batch(q, lm_head.i4, lm_head.i4s, bn,
                     batch_logits, lm_head.w.N, lm_head.w.K, M, {});
             }
-        } else if (lm_head.w.fmt == Fmt::MXFP4 && lm_head.w.payload) {
+        } else if ((lm_head.w.fmt == Fmt::MXFP4 ||
+                    (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr)))
+                   && lm_head.w.payload) {
             // Verification is a matrix multiplication, not M independent
             // decode GEMVs.  Load the large vocabulary matrix once per batch.
+            // INT4 too since 2026-10-05: four 248K-row GEMVs were 4.5 ms of a
+            // 46 ms Qwen3.8-27B GPTQ MTP verify.
             mm(lm_head, bn, batch_logits);
         }
+        const bool lm_batched = lm_head.w.fmt == Fmt::MXFP4 ||
+            (lm_head.w.fmt == Fmt::INT4 && M <= 16 && int4_smallm_ok(lm_head.w, M, nullptr, nullptr));
         for (int r = 0; r < M; ++r) {
             float* row = batch_logits + int64_t(r) * cfg.vocab;
-            if (!tp_enabled() && !lm_head.has_i4() && lm_head.w.fmt != Fmt::MXFP4)
+            if (!tp_enabled() && !lm_head.has_i4() && !lm_batched)
                 launch_gemv(q, lm_head.w, bn + int64_t(r) * H, row, {});
             launch_argmax(q, row, cfg.vocab, s.d_tok, s.d_val, {});
             q.memcpy(dtok + r, s.d_tok, sizeof(int32_t));

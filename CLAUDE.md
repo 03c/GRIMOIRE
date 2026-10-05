@@ -2,6 +2,18 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
+**2026-10-05: Qwen3.8-27B GPTQ-Int4 + MTP is the focus** (Reddit asks for its
+llama-benchy numbers).  Released v1.7 (191e05b) and v1.7.1 (9c403c8).  Branch
+`int4-mtp-wip` (NOT on main yet) holds the next step: INT4 prefill streaming
+dequant (1,682 -> 2,001 tok/s at 4K tokens, same text), the INT4 small-M GEMM
+at M <= 8 with 128 registers and a new split-K plan (MTP verify 42.2 -> 38.0
+ms), and opt-in `GRIMOIRE_MTP_HEAD_FMT=mxfp4` (draft 9.2 -> 5.1 ms).  Its
+commit message lists what is left before it can go to main: regression on
+every INT4 model, llama-benchy, release v1.7.2.  On the Tower, create
+containers ONLY from the Unraid templates
+(`grimoire-runs/bench-1003/create_from_template.php <Name>`), never with plain
+`docker run`.
+
 **2026-10-03: READ `HANDOFF-2026-10-03-SERVED.md` FIRST.** Served decode now
 equals engine decode.  llama-benchy on Ornith gives 195 / 183 / 172 tok/s at
 depth ~0 / 2K / 4K (127.6 / 101.3 at 2K / 4K on 10-02).  There were two

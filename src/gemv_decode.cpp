@@ -34,6 +34,7 @@
 //  the loads are not coalescing, not that the card is slow.
 // =====================================================================
 #include "kernels.hpp"
+#include "int4_smallm.hpp"
 #include <algorithm>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include "gemv_step.hpp"
@@ -1269,6 +1270,43 @@ sycl::event dispatch(sycl::queue& q, const QuantWeight& w, const float* x,
     return gemv_impl<F, 16, 4, 0, ROWS_PER_SG, MB>(q, w, x, y, deps, mc);
 }
 } // namespace
+
+// The w4a16 DPAS small-M GEMM (int4_smallm.hpp) at M <= 8: speculative
+// verify (MTP k = 3 verifies 4 rows) and batched decode of <= 8 sequences.
+// Built here, with 128 registers per thread and so twice the threads per
+// Xe core of libgrimoire_gemm.so's 256, and with its own split-K plan: the
+// MXFP4 kernel's plan (KS while tiles * KS < 4096) left the INT4 kernel
+// latency-bound.  MEASURED 2026-10-05, tools/i4rows_probe.cpp, Qwen3.8-27B
+// shapes at M = 4, weights streamed from DRAM (old plan in the 256-GRF
+// library -> this):
+//   gate_up N=34816 K=5120    225 -> 183 us  (410 -> 510 GB/s)  KS 2 -> 4
+//   down    N=5120  K=17408   113 ->  94 us  (413 -> 499)       KS 16 -> 4
+//   dn_qkv  N=10240 K=5120     77 ->  62 us  (357 -> 445)       KS 8 -> 20
+//   attn_q  N=12288 K=5120     87 ->  71 us  (379 -> 461)       KS 8 -> 20
+//   z / out N=6144 / 5120      45 / 47 -> 42 / 41 us            KS 14 / 16 -> 20 / 24
+//   lm_head N=248320          1324 -> 1179 us (503 -> 564)      KS 1 -> 4
+// The fp32 decode GEMV reaches ~585 GB/s at M = 1; the rest of the gap is
+// the decode ALU (~10%: without it this kernel streams ~540-565 GB/s).  An
+// fp32 FMA kernel over the rows (each weight decoded once, the decode
+// GEMV's access pattern) was ALU-bound at ~250 GB/s for M = 4.
+// GRIMOIRE_I4_SMALLM_256=1 = the library's kernel and plan for every M.
+sycl::event launch_int4_smallm(sycl::queue& q, const QuantWeight& w, const sycl_bf16* X,
+                               float* Y, int M, const std::vector<sycl::event>& deps) {
+    static const bool old = [] { const char* e = std::getenv("GRIMOIRE_I4_SMALLM_256");
+        return e && *e == '1'; }();
+    if (old || M > 8) return launch_int4_smallm_wide(q, w, X, Y, M, deps);
+    const int N = w.N, K = w.K, tiles = N / 16;
+    // Wide outputs and long K: 4 K slices; otherwise 256-element slices.
+    int KS = tiles >= 1024 || K >= 12288 ? 4 : std::min(32, std::max(1, K / 256));
+    int kc = (K + KS - 1) / KS;
+    kc = (kc + 127) / 128 * 128;
+    KS = (K + kc - 1) / kc;
+    int TPT = 1;
+    while (TPT * KS < 8 && TPT * 2 * KS <= 32) TPT *= 2;
+    return (1 << w.int4_gshift()) == 64
+        ? int4_smallm_impl<1, 64>(q, w, X, Y, M, KS, kc, TPT, deps)
+        : int4_smallm_impl<1, 128>(q, w, X, Y, M, KS, kc, TPT, deps);
+}
 
 // ---------------------------------------------------------------------
 //  BATCHED symmetric-int4 GEMV: MB token rows against one weight matrix.
