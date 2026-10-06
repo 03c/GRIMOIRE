@@ -37,14 +37,31 @@ a 4K-token prompt while user A was streaming an answer.
 
 B's answer was identical either way.
 
-### Unchanged
+### Speed
 
-llama-benchy, Qwen3.8-27B GPTQ + MTP (8 slots, `--ctx 16384`): tg128 67.6 / 187.2 tok/s at
-1 / 8 users after pp512, prompt pp4096 2,079 tok/s, coherence test passed. pp512 reads ~9% lower
-(1,297 vs ~1,420) only because the server now sends Qwen3.8's real template, with its
-reasoning-effort system text, which llama-benchy does not count as prompt.
+The server now sends Qwen3.8's official chat template, the same prompt vLLM sends. It adds the
+template's reasoning-effort system text, and the model's reasoning, and so how many of MTP's
+drafts it accepts, shifts a little.
+
+| | 1 user, tg128 after pp512 (llama-benchy, 4 runs) |
+|---|---:|
+| v1.8.1 | 63.8 ± 5.1 tok/s |
+| v1.8.2 | 58.3 ± 6.5 tok/s |
+
+vLLM 0.30.1 with the same checkpoint and flags measured 45.1. Release validation on the v1.8.2
+image (8 slots, `--ctx 16384`, coherence test passed):
+
+| Test | 1 user | 8 users |
+|---|---:|---:|
+| pp512 / tg128 | 50.5 | 187.4 |
+| pp4096 / tg128 | 44.9 | 148.9 |
+| prompt pp4096 | 2,020 | |
+
+pp512 reads lower (1,305 vs ~1,420) only because llama-benchy does not count the template's
+system text as prompt.
 
 ### Image
 
-`grimoire-b70-v1.8.2.tar.gz`, SIZE bytes, sha256 `SHA256`, built from commit COMMIT (image id
-`IMAGEID`).
+`grimoire-b70-v1.8.2.tar.gz`, 640,927,385 bytes, sha256
+`b0a0e542b697719db53171d04f202bc5655f6d364e1a795c7532f3f2ee3cb1b5`, built from commit 1ac79b4 (image id
+`83b3d39a3d01`).
