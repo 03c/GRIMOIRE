@@ -2557,6 +2557,7 @@ struct Grimoire {
         float   *x   = nullptr;    // [H]
         float   *h2  = nullptr;    // [H] normed
         float   *resid = nullptr;  // [H]
+        float   *hn  = nullptr;    // [H] target hidden after the final norm
     } mtp;
 
     // ---- DFlash masked block drafter ------------------------------
@@ -3293,6 +3294,8 @@ struct Grimoire {
                       const std::vector<int>& slots,
                       const std::vector<int>& poss,
                       std::vector<int32_t>& out);
+    static bool mtp_prenorm();
+    const float* mtp_target_hidden(const float* h);
     void mtp_follow_batch(const std::vector<int32_t>& next, const std::vector<int>& slots,
                           const std::vector<int>& poss);
     // Tokens one prefill() call may take without overflowing VRAM (see the
@@ -5288,16 +5291,22 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
             err="MTP requested but required head tensors are missing or incompatible";return false;
         } else {
             bool mok = true;
-            // Preserve raw BF16 heads. Native packed heads retain their own
-            // encoding; the target --proj format cannot silently lower precision.
-            // GRIMOIRE_MTP_HEAD_FMT=mxfp4|int4|fp8 quantizes a raw BF16 head at
-            // load (opt-in: it changes the drafts, never an emitted token --
-            // every token is the target's argmax).
+            // Native packed heads keep their own encoding, and the target's
+            // --proj format is never applied to the head.  A raw BF16 head is
+            // quantized to MXFP4 at load by default: it only drafts, so it
+            // changes which drafts are proposed, never an emitted token
+            // (every token is the target's greedy argmax).
+            // MEASURED 2026-10-05/06, Qwen3.8-27B GPTQ, MTP K=3: draft 9.16 ->
+            // 5.09 ms per step, acceptance 51.3% -> 55.6% (story prompt);
+            // served llama-benchy at K=4, tg128 after pp512 / pp4096: BF16
+            // head 64.9 / 55.6, MXFP4 head 63.5 / 69.6 tok/s.
+            // GRIMOIRE_MTP_HEAD_FMT=bf16|mxfp4|int4|fp8 (int4: 4.97 ms, 50.5%;
+            // fp8: 8.59 ms -- the FP8 GEMV is slow).
             static const Fmt head_fmt = [] {
                 const char* e = std::getenv("GRIMOIRE_MTP_HEAD_FMT");
-                const std::string v = e ? e : "";
-                return v == "mxfp4" ? Fmt::MXFP4 : v == "int4" ? Fmt::INT4 :
-                       v == "fp8" ? Fmt::FP8_E4M3 : Fmt::BF16; }();
+                const std::string v = e ? e : "mxfp4";
+                return v == "bf16" ? Fmt::BF16 : v == "int4" ? Fmt::INT4 :
+                       v == "fp8" ? Fmt::FP8_E4M3 : Fmt::MXFP4; }();
             auto mtp_fmt = [&](const TensorRef& r) {
                 if(r.native && r.native->encoding!=uint32_t(NativeEncoding::RAW)) {
                     QuantWeight w;std::string why;
@@ -6362,6 +6371,7 @@ bool Grimoire::build(const std::string& dir, const UploadOptions& opt, std::stri
         mtp.x     = sycl::malloc_device<float>(size_t(cfg.hidden), q);
         mtp.h2    = sycl::malloc_device<float>(size_t(cfg.hidden), q);
         mtp.resid = sycl::malloc_device<float>(size_t(cfg.hidden), q);
+        mtp.hn    = sycl::malloc_device<float>(size_t(cfg.hidden), q);
     }
 
     // EVERY pipeline stage needs these, not just the one holding the head:
@@ -7206,6 +7216,13 @@ int Grimoire::decode_solo(int32_t tok, int slot, int position) {
 // condition reset() already gives every request today.
 long g_spec_batch_steps=0, g_spec_batch_proposals=0, g_spec_batch_accepted=0, g_spec_batch_sequences=0;
 
+// MTP draft depth when GRIMOIRE_MTP_K is not set.  MEASURED 2026-10-06,
+// Qwen3.8-27B GPTQ-Int4 + its BF16 MTP head drafting in MXFP4, served,
+// llama-benchy 0.4.0 tg128 at 1 user after pp512 / pp4096: K=3 61.9 / 56.0,
+// K=4 63.5 / 69.6, K=5 66.2 / 65.0 tok/s (K=3 was best before the draft
+// position fix and the faster INT4 verify).  vLLM's MTP recipe uses 4 too.
+constexpr int kMtpDefaultDepth = 4;
+
 bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
         const std::vector<int>& slots, const std::vector<int>& positions,
         const std::vector<int>& remaining, std::vector<std::vector<int32_t>>& replies,
@@ -7219,7 +7236,7 @@ bool Grimoire::decode_spec_batch(const std::vector<int32_t>& tokens,
     std::vector<int> candidate_slots, candidate_positions, begin, lengths;
     const char* configured=std::getenv("GRIMOIRE_MTP_K");
     const int requested=dflash2.ok?dflash_block_rows()-1:
-        std::clamp(configured?std::atoi(configured):3,0,15);
+        std::clamp(configured?std::atoi(configured):kMtpDefaultDepth,0,15);
     const int max_depth=std::max(0,std::min(requested,kSpecBatch/n-1));
     for(int row=0;row<n;++row) {
         sync(); bind_seq_slot(slots[size_t(row)]);
@@ -7963,7 +7980,7 @@ void Grimoire::release() {
         d.sh_gate_q.release(q); d.router.release(q);
         for (void* p : {(void*)mtp.pre_h, (void*)mtp.pre_e, (void*)mtp.norm,
                         (void*)mtp.cat, (void*)mtp.x, (void*)mtp.h2,
-                        (void*)mtp.resid, (void*)d.in_norm,
+                        (void*)mtp.resid, (void*)mtp.hn, (void*)d.in_norm,
                         (void*)d.post_norm, (void*)d.q_norm, (void*)d.k_norm,
                         (void*)d.gu_pack, (void*)d.gu_scale,
                         (void*)d.dn_pack, (void*)d.dn_scale,
@@ -10399,6 +10416,30 @@ const float* Grimoire::forward(int token) {
 //  k_proj/v_proj -> k_norm -> RoPE -> kv_append. No attention, no FFN and no
 //  lm_head, which is what makes warming a few hundred positions affordable.
 // ---------------------------------------------------------------------
+// The MTP head's hidden input is the target's hidden state AFTER the
+// model's final norm -- the vector the lm_head reads -- with the head's own
+// pre_fc_norm_hidden on top.  vLLM: Qwen3NextModel.forward returns
+// self.norm(hidden_states, residual), the runner hands exactly that to the
+// drafter as target_hidden_states (only DeepSeek V4 overrides it, through
+// get_mtp_target_hidden_states), and qwen3_5_mtp.py normalizes it again.
+// GRIMOIRE fed the raw residual stream instead: the final norm's per-channel
+// weights never reached the head, and Qwen3.8-27B accepted ~52% of its
+// drafts against vLLM's ~90% on the same checkpoint.  The stored hidden
+// states (s.h, spec_hidden_steps, draft slots) stay the raw residual; the
+// norm is applied where the head reads them.  GRIMOIRE_MTP_PRENORM=1 = the
+// old input, for A/B.
+bool Grimoire::mtp_prenorm() {
+    static const bool on = [] { const char* e = std::getenv("GRIMOIRE_MTP_PRENORM");
+        return e && *e == '1'; }();
+    return on;
+}
+const float* Grimoire::mtp_target_hidden(const float* h) {
+    if (mtp_prenorm() || !fnorm) return h;
+    launch_rmsnorm_residual(q, const_cast<float*>(h), nullptr, fnorm, mtp.hn,
+                            cfg.hidden, cfg.rms_eps, {});
+    return mtp.hn;
+}
+
 void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
     if (!mtp.ok) return;
     if(position<0||position>=max_seq||next_token<0||next_token>=cfg.vocab)throw std::out_of_range("invalid MTP warm position/token");
@@ -10408,8 +10449,9 @@ void Grimoire::mtp_warm(const float* hidden, int next_token, int position) {
 
     set_cursor(position);
 
-    // Same concat order as mtp_draft: EMBEDDING FIRST.
-    launch_rmsnorm_residual(q, const_cast<float*>(hidden), nullptr, mtp.pre_h,
+    // Same concat order as mtp_draft: EMBEDDING FIRST.  Same input too: the
+    // target hidden after the final norm (mtp_target_hidden).
+    launch_rmsnorm_residual(q, const_cast<float*>(mtp_target_hidden(hidden)), nullptr, mtp.pre_h,
                             mtp.cat + H, H, cfg.rms_eps, none);
     // embed_one, not launch_embed: under TP the embedding table is row
     // sharded, so a global token id indexes the WRONG row on every rank
@@ -10447,7 +10489,17 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     const std::vector<sycl::event> none{};
     LayerDev& d = mtp.L;
 
-    // position for this draft: token t+1 sits at `position`
+    // Callers pass the position of token t+1 (the anchor, then each draft).
+    // The pair the head consumes -- hidden of token t, embedding of t+1 --
+    // belongs at token t's position: mtp_warm, the batched warm in prefill()
+    // and decode_spec_batch all store it there, and vLLM's proposer runs it
+    // there (target_positions, then +1 per chained step).  Drafting at t+1's
+    // position put every draft query one position late and gave its cache a
+    // second copy of the newest pair (warm at t, draft at t+1).
+    // GRIMOIRE_MTP_POS_OLD=1 = the old position, for A/B.
+    static const bool pos_old = [] { const char* e = std::getenv("GRIMOIRE_MTP_POS_OLD");
+        return e && *e == '1'; }();
+    if (!pos_old && position > 0) --position;
     set_cursor(position);
 
     // cat order.  DeepSeek/Qwen MTP is fc([norm(embedding) ; norm(hidden)]),
@@ -10472,7 +10524,7 @@ int Grimoire::mtp_draft(int next_token, int position, bool from_mtp_hidden) {
     // (grimoire.cpp ~3161) and never used. It now holds it across calls.
     // GRIMOIRE_MTP_CHAIN_OLD=1 restores the previous behaviour for A/B.
     static const bool chain_old = std::getenv("GRIMOIRE_MTP_CHAIN_OLD") != nullptr;
-    const float* hsrc = from_mtp_hidden ? (chain_old ? mtp.x : mtp.h2) : s.h;
+    const float* hsrc = from_mtp_hidden ? (chain_old ? mtp.x : mtp.h2) : mtp_target_hidden(s.h);
     launch_rmsnorm_residual(q, const_cast<float*>(hsrc), nullptr, mtp.pre_h,
                             p_hid, H, cfg.rms_eps, none);
     // TP-aware: see the note in mtp_warm.
@@ -15735,7 +15787,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         q.memcpy(dtok,shifted.data(),size_t(M)*sizeof(int32_t));
         launch_embed_batched(q,embed,dtok,r0,M,H,{});
         launch_rmsnorm_residual_batched(q,r0,nullptr,nullptr,mtp.pre_e,bn,M,H,cfg.rms_eps);
-        launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        if(mtp_prenorm()) launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        else {   // final norm first: see mtp_target_hidden
+            launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,fnorm,t1,M,H,cfg.rms_eps);
+            launch_rmsnorm_residual_batched(q,t1,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        }
         q.parallel_for(sycl::range<2>(M,H),[=](sycl::id<2> id) {
             const size_t row=id[0],col=id[1];
             t0[row*2*H+col]=bn[row*H+col];
@@ -15768,7 +15824,11 @@ bool Grimoire::prefill(const std::vector<int32_t>& tokens,
         q.memcpy(dtok,shifted.data(),size_t(M)*sizeof(int32_t));
         launch_embed_batched(q,embed,dtok,r0,M,H,{});
         launch_rmsnorm_residual_batched(q,r0,nullptr,nullptr,mtp.pre_e,bn,M,H,cfg.rms_eps);
-        launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        if(mtp_prenorm()) launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        else {   // final norm first: see mtp_target_hidden
+            launch_rmsnorm_residual_batched(q,bh,nullptr,nullptr,fnorm,t1,M,H,cfg.rms_eps);
+            launch_rmsnorm_residual_batched(q,t1,nullptr,nullptr,mtp.pre_h,r1,M,H,cfg.rms_eps);
+        }
         q.parallel_for(sycl::range<2>(M,H),[=](sycl::id<2> id) {
             const size_t row=id[0],col=id[1];
             t0[row*2*H+col]=bn[row*H+col];
@@ -16028,7 +16088,7 @@ int grimoire_serve_generate(Grimoire& e, const std::vector<int32_t>& prompt_ids,
     // with no error where it happened.
     o.draft_depth=o.dflash
         ?(e.pp_enabled()?e.pp_dflash-1:e.dflash_block_rows()-1)
-        :std::clamp(depth?std::atoi(depth):3,0,15);
+        :std::clamp(depth?std::atoi(depth):kMtpDefaultDepth,0,15);
     // spec_active() is the PIPELINE's answer, not this rank's: under PP
     // only the last stage holds the head, and if the ranks disagreed
     // here they would run different decode loops and deadlock.
@@ -16460,21 +16520,12 @@ void GrimoireScheduler::run() {
                 if (std::find(group.begin(), group.end(), j) == group.end()) rest.push_back(j);
             taking.swap(rest);
         }
-        // First tokens of the round's batched waves go out together, after
-        // the last wave: the VRAM budget can split a burst into waves (Ornith,
-        // 8 x 4096 prompt tokens: 6 + 2), and answering the first wave ~0.8 s
-        // early left its requests' clocks running -- llama-benchy pp4096/tg32
-        // c8 total 390 -> 168 tok/s.  One batch (v1.6) also answered everyone
-        // at the end, so the first token is no later than it was then.
-        for (auto& j : admitted_round) {
-            const bool stop = (j->eos >= 0 && j->next == j->eos) ||
-                              (j->eot >= 0 && j->next == j->eot);
-            if (stop) retire(j, FinishReason::Stop);
-            else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
-            else if (j->budget <= 1) retire(j, FinishReason::Length);
-            else active.push_back(j);
-        }
-        admitted_round.clear();
+        // Prompts of this round that go through the one-at-a-time loop below
+        // (too long to share a prefill call: Qwen3.8-27B at --ctx 16384 x 8
+        // slots takes ~5,900 tokens per call, so two 4,096-token prompts)
+        // hold their first token for the round as well -- see the flush
+        // after the loop.
+        const bool defer_round = batchable && admitted_round.size() + taking.size() >= 2;
         for (auto& j : taking) {
             if (cancelled(j)) { finish(j, FinishReason::Cancelled); continue; }
             int slot = -1;
@@ -16568,6 +16619,10 @@ void GrimoireScheduler::run() {
                                  j->prompt.size(), a, lg[size_t(a)], b, lg[size_t(b)]);
                 }
                 slot_busy[size_t(slot)] = true;
+                if (defer_round) {
+                    admitted_round.push_back(j);
+                    continue;
+                }
                 const bool stop = (j->eos >= 0 && j->next == j->eos) ||
                                   (j->eot >= 0 && j->next == j->eot);
                 if (stop) {
@@ -16583,6 +16638,23 @@ void GrimoireScheduler::run() {
                 retire(j, FinishReason::Length, false, ex.what());
             }
         }
+        // First tokens of the round's admissions go out together, after the
+        // last prefill.  Nothing decodes while a round is being admitted, so
+        // a request answered early only waits for the others' prefills with
+        // its clock running.  Batched waves: the VRAM budget can split a burst
+        // (Ornith, 8 x 4096 prompt tokens: 6 + 2), and answering the first
+        // wave ~0.8 s early cut llama-benchy pp4096/tg32 c8 from 390 to 168
+        // tok/s total.  Prompts admitted one at a time (above) likewise:
+        // Qwen3.8-27B GPTQ + MTP pp4096/tg128 at 2 users.
+        for (auto& j : admitted_round) {
+            const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                              (j->eot >= 0 && j->next == j->eot);
+            if (stop) retire(j, FinishReason::Stop);
+            else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
+            else if (j->budget <= 1) retire(j, FinishReason::Length);
+            else active.push_back(j);
+        }
+        admitted_round.clear();
         if (int(active.size()) > busy_peak) busy_peak = int(active.size());
         if (active.empty()) continue;
 
@@ -16619,12 +16691,15 @@ void GrimoireScheduler::run() {
                 }
                 // Speculate only while few sequences are live: at 8 users each
                 // gets one draft and the verify rows cost more than plain
-                // batching (Qwen3.8-27B GPTQ + MTP, llama-benchy pp512/tg128
-                // total tok/s at 1/2/4/8 users: MTP 52.5 / 61.6 / 67.0 / 78.4,
-                // plain 34.8 / 48.1 / 86.4 / 145.3).  GRIMOIRE_SPEC_MAX_SEQS.
+                // batching.  MEASURED 2026-10-06, Qwen3.8-27B GPTQ + MTP K=4
+                // (MXFP4 draft head), llama-benchy pp512/tg128 total tok/s at
+                // 2 / 4 / 8 users: limit 2 -> 80.2 / 104.2 / 187.1, limit 8 ->
+                // 90.4 / 118.7 / 153.7, limit 4 -> 93.7 / 118.2 / 187.0
+                // (vLLM 0.30.1 MTP-4 on the same card: 85.2 / 130.4 / 122.3).
+                // GRIMOIRE_SPEC_MAX_SEQS.
                 static const int spec_max_seqs = [] {
                     const char* v = std::getenv("GRIMOIRE_SPEC_MAX_SEQS");
-                    return v && *v ? std::max(1, std::atoi(v)) : 2; }();
+                    return v && *v ? std::max(1, std::atoi(v)) : 4; }();
                 const bool spec_now = e.speculative_batch() &&
                     (e.dflash2.ok || int(toks.size()) <= spec_max_seqs);
                 if(spec_now) {

@@ -2,16 +2,18 @@
 
 ## >>> CURRENT PRIORITY (read this before anything else) <<<
 
-**2026-10-05: Qwen3.8-27B GPTQ-Int4 + MTP is the focus** (Reddit asks for its
-llama-benchy numbers).  Released v1.7 (191e05b) and v1.7.1 (9c403c8).  Branch
-`int4-mtp-wip` (NOT on main yet) holds the next step: INT4 prefill streaming
-dequant (1,682 -> 2,001 tok/s at 4K tokens, same text), the INT4 small-M GEMM
-at M <= 8 with 128 registers and a new split-K plan (MTP verify 42.2 -> 38.0
-ms), and opt-in `GRIMOIRE_MTP_HEAD_FMT=mxfp4` (draft 9.2 -> 5.1 ms).  Its
-commit message lists what is left before it can go to main: regression on
-every INT4 model, llama-benchy, release v1.7.2.  On the Tower, create
-containers ONLY from the Unraid templates
-(`grimoire-runs/bench-1003/create_from_template.php <Name>`), never with plain
+**2026-10-06: release v1.8 -- Qwen3.8-27B GPTQ-Int4 + MTP is the focus** (Reddit
+compares GRIMOIRE with the vLLM "B70 inference cookbook").  llama-benchy, 1 user:
+MTP 63-70 tok/s (v1.7.1: 49-51), prompt 2,078 tok/s at 4K (1,731); 8 users 187.
+Stock vLLM 0.30.1 with the cookbook's MTP-4 flags on the same card: 40-45 tok/s,
+1,948 prompt (tools/bench/vllm_mtp_*.sh; vLLM only ever runs in its own
+container).  The MTP head drafted at the wrong position and from the pre-norm
+hidden state; both fixed (mtp_draft, mtp_target_hidden).  Defaults now: 4 drafts,
+MXFP4 draft head, drafting while <= 4 requests.  Open: several long prompts are
+prefilled one after another (pp4096 at 2-4 users 46-48 vs vLLM 58-64 total) --
+mix prefill chunks into decode steps; tool calling (branch `server-tools`).
+On the Tower, create containers ONLY from the Unraid templates
+(`grimoire-runs/bench-1003/create_from_template.php <Name>`), never plain
 `docker run`.
 
 **2026-10-03: READ `HANDOFF-2026-10-03-SERVED.md` FIRST.** Served decode now
