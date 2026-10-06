@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cctype>
 #include <ctime>
+#include <stdexcept>
 
 namespace b70 {
 namespace {
@@ -217,6 +218,23 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
         }
     }
 
+    // ---- chat template family ----------------------------------------
+    // The checkpoint's own template decides how tools and past turns are
+    // rendered.  Markers that only the Qwen3.5-family XML-tool template
+    // (Qwen3.8 / Agnes / Ornith) has -- the Qwen3.6 template words its tool
+    // block differently and keeps its own (legacy) rendering here.
+    {
+        std::string tmpl = read_file(dir + "/chat_template.jinja");
+        if (tmpl.empty()) tmpl = read_file(dir + "/tokenizer_config.json");
+        tmpl_xml_tools_ = tmpl.find("<function=example_function_name>") != std::string::npos &&
+                          tmpl.find("do not tell the user about function calls") != std::string::npos &&
+                          tmpl.find("multi_step_tool=true") != std::string::npos;
+        tmpl_effort_ = tmpl_xml_tools_ &&
+                       tmpl.find("Reasoning effort is set to xhigh.") != std::string::npos;
+        tmpl_think_split_ = tmpl_xml_tools_ &&
+                            tmpl.find("content.split('</think>')") != std::string::npos;
+    }
+
     // ---- special tokens ----------------------------------------------
     p = js.find("\"added_tokens\"");
     if (p != std::string::npos) {
@@ -231,7 +249,24 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
             if (cp == std::string::npos || cp > end) break;
             r = js.find('"', js.find(':', cp)) ;
             const std::string content = json_string(js, r);
-            special_ids_[id] = 1;
+            // Only tokens flagged "special": true are control tokens that
+            // decoding hides (HF skip_special_tokens).  Qwen-family
+            // <think>, </think>, <tool_call>, </tool_call> are added but NOT
+            // special, and every client parses them from the text: hiding
+            // them turned a tool call into a bare <function=...> block and
+            // erased the reasoning / answer boundary (2026-10-05).  A token
+            // without the flag stays hidden, as before.
+            {
+                const size_t nx = js.find("\"id\"", idp + 1);
+                const size_t sp = js.find("\"special\"", cp);
+                bool special = true;
+                if (sp != std::string::npos && sp < std::min(nx, end)) {
+                    size_t v = js.find(':', sp) + 1;
+                    skip_ws(js, v);
+                    special = js.compare(v, 4, "true") == 0;
+                }
+                if (special) special_ids_[id] = 1;
+            }
             special_by_text_[content] = id;
             // Added/special tokens are almost always appended AFTER the base
             // BPE vocab, at ids beyond id_to_tok_'s initial size (set from
@@ -681,6 +716,135 @@ std::string Tokenizer::apply_chat_template(
                    "<|im_end|>\n";
     }
     out += "<|im_start|>assistant\n<think>\n";
+    return out;
+}
+
+namespace {
+std::string tmpl_trim(const std::string& s) {
+    const char* ws = " \t\n\r\f\v";
+    const size_t b = s.find_first_not_of(ws);
+    if (b == std::string::npos) return {};
+    return s.substr(b, s.find_last_not_of(ws) - b + 1);
+}
+const char* kToolInstructions =
+    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n"
+    "</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\n"
+    "that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\n"
+    "Reminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> "
+    "block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be "
+    "specified\n- You may provide optional reasoning for your function call in natural language "
+    "BEFORE the function call, but NOT after\n- If there is no function call available, answer the "
+    "question like normal with your current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
+const char* kEffortXhigh =
+    "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+    "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+    "clarity in the final answer.";
+const char* kEffortLow =
+    "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
+    "conclusion without unnecessary elaboration.";
+} // namespace
+
+// The server's renderer.  For the Qwen3.5-family XML-tool template it is that
+// template, line for line (tools block, reasoning-effort system text, past
+// turns with their <think> block, tool calls, grouped tool responses);
+// anything else keeps the legacy rendering above.
+std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messages,
+                                           const ChatOptions& opt) const {
+    if (special_by_text_.count("<|begin_of_text|>") || !tmpl_xml_tools_) {
+        if (!opt.tools.empty())
+            throw std::invalid_argument("this model's chat template has no tool-call format GRIMOIRE renders");
+        std::string out = apply_chat_template(messages);
+        if (!opt.enable_thinking && !special_by_text_.count("<|begin_of_text|>")) {
+            const std::string open = "<think>\n";
+            if (out.size() >= open.size() && out.compare(out.size() - open.size(), open.size(), open) == 0)
+                out += "\n</think>\n\n";
+        }
+        return out;
+    }
+    if (messages.empty()) throw std::invalid_argument("No messages provided.");
+    std::string ri;
+    if (tmpl_effort_ && opt.enable_thinking) {
+        std::string effort = opt.reasoning_effort.empty() ? "xhigh" : opt.reasoning_effort;
+        if (effort == "high") effort = "xhigh";
+        if (effort != "xhigh" && effort != "medium" && effort != "low")
+            throw std::invalid_argument("Unexpected reasoning effort " + effort +
+                                        ". Supported types are xhigh (default), medium, and low.");
+        ri = effort == "xhigh" ? kEffortXhigh : effort == "low" ? kEffortLow : "";
+    }
+    std::string out;
+    const bool first_system = messages[0].role == "system";
+    if (!opt.tools.empty()) {
+        out += "<|im_start|>system\n";
+        if (!ri.empty()) out += ri + "\n\n";
+        out += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+        for (const auto& t : opt.tools) out += "\n" + t;
+        out += "\n</tools>";
+        out += kToolInstructions;
+        if (first_system) {
+            const std::string c = tmpl_trim(messages[0].content);
+            if (!c.empty()) out += "\n\n" + c;
+        }
+        out += "<|im_end|>\n";
+    } else if (first_system) {
+        const std::string c = tmpl_trim(messages[0].content);
+        if (!tmpl_effort_) out += "<|im_start|>system\n" + c + "<|im_end|>\n";
+        else if (!c.empty()) out += "<|im_start|>system\n" + (ri.empty() ? "" : ri + "\n\n") + c + "<|im_end|>\n";
+        else if (!ri.empty()) out += "<|im_start|>system\n" + ri + "<|im_end|>\n";
+    } else if (!ri.empty()) {
+        out += "<|im_start|>system\n" + ri + "<|im_end|>\n";
+    }
+    bool have_query = false;
+    for (size_t i = messages.size(); i-- > 0;) {
+        if (messages[i].role != "user") continue;
+        const std::string c = tmpl_trim(messages[i].content);
+        const std::string a = "<tool_response>", b = "</tool_response>";
+        if (!(c.compare(0, a.size(), a) == 0 && c.size() >= b.size() &&
+              c.compare(c.size() - b.size(), b.size(), b) == 0)) { have_query = true; break; }
+    }
+    if (!have_query) throw std::invalid_argument("No user query found in messages.");
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const ChatMessage& m = messages[i];
+        std::string c = tmpl_trim(m.content);
+        if (m.role == "system") {
+            if (i != 0) throw std::invalid_argument("System message must be at the beginning.");
+        } else if (m.role == "user") {
+            out += "<|im_start|>user\n" + c + "<|im_end|>\n";
+        } else if (m.role == "assistant") {
+            std::string r;
+            if (m.has_reasoning) r = m.reasoning;
+            else if (tmpl_think_split_ && c.find("</think>") != std::string::npos) {
+                std::string head = c.substr(0, c.find("</think>"));
+                while (!head.empty() && head.back() == '\n') head.pop_back();
+                const size_t o = head.rfind("<think>");
+                if (o != std::string::npos) head = head.substr(o + 7);
+                r = head.substr(std::min(head.find_first_not_of('\n'), head.size()));
+                c = c.substr(c.rfind("</think>") + 8);
+                c = c.substr(std::min(c.find_first_not_of('\n'), c.size()));
+            }
+            r = tmpl_trim(r);
+            out += "<|im_start|>assistant\n<think>\n" + r + "\n</think>\n\n" + c;
+            for (size_t j = 0; j < m.tool_calls.size(); ++j) {
+                const ChatToolCall& tc = m.tool_calls[j];
+                if (j == 0) out += std::string(tmpl_trim(c).empty() ? "" : "\n\n") +
+                                   "<tool_call>\n<function=" + tc.name + ">\n";
+                else out += "\n<tool_call>\n<function=" + tc.name + ">\n";
+                for (const auto& kv : tc.args)
+                    out += "<parameter=" + kv.first + ">\n" + kv.second + "\n</parameter>\n";
+                out += "</function>\n</tool_call>";
+            }
+            out += "<|im_end|>\n";
+        } else if (m.role == "tool") {
+            if (i > 0 && messages[i - 1].role != "tool") out += "<|im_start|>user";
+            out += "\n<tool_response>\n" + c + "\n</tool_response>";
+            if (i + 1 == messages.size() || messages[i + 1].role != "tool") out += "<|im_end|>\n";
+        } else {
+            throw std::invalid_argument("Unexpected message role.");
+        }
+    }
+    out += "<|im_start|>assistant\n";
+    out += opt.enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
     return out;
 }
 

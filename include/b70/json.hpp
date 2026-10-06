@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <map>
@@ -37,6 +38,8 @@ struct Json {
     std::string string;
     std::vector<Json> array;
     std::map<std::string, Json> object;
+    std::vector<std::string> keys;   // object keys in document order
+    std::string literal;             // a number's text as written
 
     const Json* find(const std::string& key) const {
         if (kind != Kind::Object) return nullptr;
@@ -69,6 +72,9 @@ struct Json {
         auto* v=find(k); return v?v->text():d;
     }
     static Json parse(std::string_view input);
+    // Python json.dumps(ensure_ascii=False) -- what chat templates' tojson
+    // prints: keys in document order, ", " / ": " separators, non-ASCII as is.
+    std::string dump() const;
 };
 
 inline void append_utf8(std::string& out, uint32_t c) {
@@ -164,6 +170,7 @@ struct Parser {
             v.kind=Json::Kind::Object; if(eat('}'))return v;
             do {auto k=str();if(!eat(':'))fail();
                 if(!v.object.emplace(k,value(depth+1)).second)fail();
+                v.keys.push_back(k);
             }while(eat(','));
             if(!eat('}'))fail();
             return v;
@@ -192,12 +199,52 @@ struct Parser {
         const std::string n(s.substr(begin,p-begin));char* end=nullptr;
         v.number=std::strtod(n.c_str(),&end);
         if(end!=n.c_str()+n.size()||!std::isfinite(v.number))fail();
-        v.kind=Json::Kind::Number;return v;
+        v.kind=Json::Kind::Number;v.literal=n;return v;
     }
 };
 }
 inline Json Json::parse(std::string_view input) {
     json_detail::Parser p{input}; auto v=p.value();p.ws();if(p.p!=input.size())p.fail();return v;
+}
+inline std::string json_dump_string(std::string_view s) {
+    std::string out="\"";
+    const char* hex="0123456789abcdef";
+    for(unsigned char c:s) {
+        switch(c) {
+            case '"':out+="\\\"";break; case '\\':out+="\\\\";break;
+            case '\n':out+="\\n";break; case '\r':out+="\\r";break; case '\t':out+="\\t";break;
+            case '\b':out+="\\b";break; case '\f':out+="\\f";break;
+            default:
+                if(c<32){out+="\\u00";out+=hex[c>>4];out+=hex[c&15];}
+                else out+=char(c);
+        }
+    }
+    return out+"\"";
+}
+inline std::string Json::dump() const {
+    switch(kind) {
+        case Kind::Null: return "null";
+        case Kind::Boolean: return boolean?"true":"false";
+        case Kind::Number: {
+            if(!literal.empty())return literal;
+            char buf[32];std::snprintf(buf,sizeof buf,"%.17g",number);return buf;
+        }
+        case Kind::String: return json_dump_string(string);
+        case Kind::Array: {
+            std::string out="[";
+            for(size_t i=0;i<array.size();++i){if(i)out+=", ";out+=array[i].dump();}
+            return out+"]";
+        }
+        case Kind::Object: {
+            std::string out="{";
+            for(size_t i=0;i<keys.size();++i) {
+                if(i)out+=", ";
+                out+=json_dump_string(keys[i])+": "+object.at(keys[i]).dump();
+            }
+            return out+"}";
+        }
+    }
+    return "null";
 }
 inline std::string json_escape(std::string_view s) {
     std::string out;
