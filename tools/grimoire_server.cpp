@@ -220,7 +220,7 @@ int main(int argc, char** argv) {
                         b70::FinishReason finish;
                         std::vector<int32_t> out;
                         const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,
-                            tk.eos(),tk.special_id("<|eot|>"),out,
+                            tk.eos(),tk.eos2(),out,
                             [&](int32_t t){return decoder.push(t,emit);},&finish);
                         if(connected)connected=decoder.finish(emit);
                         if(connected)send(prefix+",\"choices\":[{\"index\":0,"+
@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
             b70::FinishReason finish;
             std::vector<int32_t> out;
             const int n=b70::grimoire_scheduler_generate(*sched,ids,budget,tk.eos(),
-                tk.special_id("<|eot|>"),out,{},&finish);
+                tk.eos2(),out,{},&finish);
             std::string content,reasoning;
             b70::ResponseDecoder decoder(tk,chat&&harmony_model);
             auto emit=[&](const std::string& p,bool r){(r?reasoning:content)+=p;return true;};

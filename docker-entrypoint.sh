@@ -38,13 +38,59 @@ case "${1:-server}" in
         shift
         run /grimoire/bin/grimoire "$@"
         ;;
+    multi)
+        # Several GPUs in one container: one grimoire-server rank per card.
+        #   multi [PP|TP] <grimoire-server args...>
+        # PP (default) gives each rank a block of layers (GRIMOIRE_PP_SPLIT =
+        # layers on rank 0 with two ranks, or GRIMOIRE_PP_LAYERS=a,b,...); TP
+        # gives every rank a slice of every weight.  GRIMOIRE_MULTI_GPUS ranks
+        # (default 2): pass exactly that many render nodes with --device and
+        # ZE_AFFINITY_MASK=0,1[,2,...].  Only rank 0 binds the HTTP port; the
+        # others follow it.  The same launcher as tools/serve_pp2_worker.sh,
+        # inside the image so an Unraid template can run it.
+        shift
+        mode=PP
+        case "${1:-}" in PP|TP) mode=$1; shift ;; esac
+        n="${GRIMOIRE_MULTI_GPUS:-2}"
+        if [ "$mode" = TP ]; then
+            export GRIMOIRE_TP_WORLD_SIZE="$n"
+            export GRIMOIRE_TP_SOCKET="${GRIMOIRE_TP_SOCKET:-/tmp/grimoire-tp-serve.sock}"
+            sock="$GRIMOIRE_TP_SOCKET"
+        else
+            export GRIMOIRE_PP_WORLD_SIZE="$n"
+            export GRIMOIRE_PP_SOCKET="${GRIMOIRE_PP_SOCKET:-/tmp/grimoire-pp-serve.sock}"
+            sock="$GRIMOIRE_PP_SOCKET"
+        fi
+        rm -f "${sock}"* 2>/dev/null || true
+        pids=()
+        # Later ranks listen and earlier ones connect, so start from the back.
+        # Process substitution keeps $! the server's PID (not the log
+        # prefixer's) -- see tools/serve_pp2_worker.sh.
+        for ((r = n - 1; r >= 0; --r)); do
+            env "GRIMOIRE_${mode}_RANK=$r" /grimoire/bin/grimoire-server "$@" \
+                > >(sed -u "s/^/[rank$r] /") 2>&1 &
+            pids[r]=$!
+        done
+        # docker stop reaches this script (tini forwards to it), not the
+        # servers: hand the TERM on and keep waiting so GPU work can drain.
+        trap 'kill -TERM "${pids[@]}" 2>/dev/null' TERM INT
+        reap() { local st=0; wait "$1"; st=$?
+                 while kill -0 "$1" 2>/dev/null; do wait "$1"; st=$?; done; return "$st"; }
+        reap "${pids[0]}"; st=$?
+        kill -TERM "${pids[@]}" 2>/dev/null || true
+        for ((r = 1; r < n; ++r)); do reap "${pids[r]}" || true; done
+        echo "front end (rank 0) exited $st"
+        exit "$st"
+        ;;
     /grimoire/bin/*|bin/*)
         run "$@"
         ;;
     *)
-        echo "usage: docker run ... <image> {server|generate} [args...]" >&2
+        echo "usage: docker run ... <image> {server|multi|generate} [args...]" >&2
         echo "  server   -> bin/grimoire-server (OpenAI-compatible HTTP), e.g.:" >&2
         echo "              server --model /models/K2-Horizon-MoVA-36B-A4B --proj mxfp4 --ctx 8192 --port 8000" >&2
+        echo "  multi    -> one server rank per GPU (pipeline parallel; 'multi TP' = tensor parallel), e.g.:" >&2
+        echo "              multi --model /models/Ornith-1.5-35B-A3B-FP8 --proj fp8 --ctx 32000 --port 8000" >&2
         echo "  generate -> bin/grimoire (one-shot CLI), e.g.:" >&2
         echo "              generate -m /models/K2-Horizon-MoVA-36B-A4B --proj mxfp4 --ctx 8192 -p \"...\" -n 256" >&2
         exit 2

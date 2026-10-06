@@ -77,6 +77,11 @@ public:
         auto it = special_by_text_.find(text);
         return it == special_by_text_.end() ? -1 : it->second;
     }
+    // The second token that ends an answer, or -1: Harmony's <|eot|>, K2's
+    // <|ifm|endoftext|>, ChatML's <|endoftext|> (generation_config.json lists
+    // it next to the end-of-turn token).  A server that stops on eos() alone
+    // runs past the answer on any model whose turn ends with the other one.
+    int32_t eos2() const { return eos2_; }
 
     // Apply the chat template. Qwen uses the ChatML form; the exact
     // strings come from tokenizer_config.json when present.
@@ -93,7 +98,7 @@ private:
     std::unordered_map<int32_t, int32_t>         special_ids_;
     std::unordered_map<std::string, int32_t>     special_by_text_;
 
-    int32_t bos_ = -1, eos_ = -1;
+    int32_t bos_ = -1, eos_ = -1, eos2_ = -1;
     size_t  bad_merges_ = 0;
 
     // byte <-> placeholder-codepoint tables

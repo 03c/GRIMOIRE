@@ -15,8 +15,8 @@ The aim is straightforward: make high-performance local LLM inference possible o
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.8/grimoire-b70-v1.8.tar.gz
-docker load < grimoire-b70-v1.8.tar.gz          # -> grimoire-b70:latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.8.1/grimoire-b70-v1.8.1.tar.gz
+docker load < grimoire-b70-v1.8.1.tar.gz        # -> grimoire-b70:latest
 ```
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
@@ -83,9 +83,10 @@ user.
 | Qwen3.6-35B-A3B, GPTQ | [palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4](https://huggingface.co/palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4) | `int4` | | 100 (v1.6) | 122 (v1.6) | 322 (v1.6) |
 | Muse-Glimmer-30B | [dudeman2512/Muse-Glimmer-30B-INT4-W4A16](https://huggingface.co/dudeman2512/Muse-Glimmer-30B-INT4-W4A16) | `int4` | leave out `GRIMOIRE_SEQ_SLOTS` | 26.9 | -- | 702 (pp512) |
 | Muse-Glimmer-30B | [olka-fi/Muse-Glimmer-30B-MXFP4](https://huggingface.co/olka-fi/Muse-Glimmer-30B-MXFP4) | `mxfp4` | leave out `GRIMOIRE_SEQ_SLOTS` | 24.8 (v1.6) | -- | |
-| Agnes-3.0-Flash | [Agnes-AI/Agnes-3.0-Flash](https://huggingface.co/Agnes-AI/Agnes-3.0-Flash) | `mxfp4` | | runs; not benchmarked yet | | |
-| K2-Horizon-MoVA-36B-A4B | [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) | `mxfp4` | | runs; not benchmarked yet | | |
-| Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | `bf16` | `-e GRIMOIRE_EXPERT_VRAM_PER_LAYER=112 -e GRIMOIRE_PLE_FILE=/models/flash-next-ple.bin`, see [FLASH-NEXT-TIERED.md](FLASH-NEXT-TIERED.md) | runs (too large for one B70: VRAM + RAM + SSD); not benchmarked yet | | |
+| Agnes-3.0-Flash | [Agnes-AI/Agnes-3.0-Flash](https://huggingface.co/Agnes-AI/Agnes-3.0-Flash) | `mxfp4` | `--ctx 16384` | 28 <sup>c</sup> | | |
+| K2-Horizon-MoVA-36B-A4B | [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) | `mxfp4` | `-e GRIMOIRE_SEQ_SLOTS=4`, `--ctx 16384` (every K2 layer keeps a KV cache, so 4 slots) | 66.8 | 83.4 (4 users) | 919 (pp512) |
+| Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | `bf16` | `-e GRIMOIRE_EXPERT_VRAM_PER_LAYER=112`, optionally `-e GRIMOIRE_PLE_FILE=/models/grimoire-ple/flash-next-ple.bin` (made by `tools/ple_flatten.py`) and `-e GRIMOIRE_EXPERT_HITS=/models/grimoire-ple/flash-next.hits`, `--ctx 65536`; see [FLASH-NEXT-TIERED.md](FLASH-NEXT-TIERED.md) | 22 <sup>c</sup> (too large for one B70: experts in VRAM + pinned RAM, ~50 GB free RAM needed) | | |
+| **Ornith-1.5-35B-A3B** on **two** B70s | [ornith-ai/Ornith-1.5-35B-A3B-FP8](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-FP8) | `fp8` | two GPUs, see [Two GPUs](#two-gpus-models-that-do-not-fit-one-card) | 77 <sup>c</sup> | | |
 
 <sup>a</sup> Release v1.8 image, MTP with `GRIMOIRE_SEQ_SLOTS=8`, `--ctx 16384`, total tok/s at 1 / 2 / 4 /
 8 users: pp512/tg128 53.9 / 87.9 / 121.7 / 187.4; pp4096/tg128 55.2 / 78.9 / 107.9 / 149.0. Every
@@ -94,6 +95,7 @@ at 1 user gave 54 - 72 tok/s after pp512 and 55 - 64 after pp4096. MTP drafts wh
 requests are active (`GRIMOIRE_SPEC_MAX_SEQS`) and switches to plain batched decoding above that.
 <sup>b</sup> Measured on [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
 a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
+<sup>c</sup> v1.8 / v1.8.1, one 128-token request through the server (not llama-benchy).
 
 **Fine-tunes in the same format work the same way** (`--proj int4`, MTP flags as above). Tested:
 [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16)
@@ -115,6 +117,29 @@ a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
 
 **Prefill (prompt) speed on INT4.** Since v1.8 GPTQ / INT4 checkpoints use the same fast prefill
 path as MXFP4: 2,069 - 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.7.1: 1,731).
+
+### Two GPUs (models that do not fit one card)
+
+The image's `multi` mode runs one server rank per GPU in the same container (pipeline parallel:
+each card holds a block of layers; only the first rank serves HTTP). Map exactly the render nodes
+you want, in order, and set `ZE_AFFINITY_MASK` to match:
+
+```
+docker run -d --name grimoire-dual --init --stop-timeout 300 --ipc=host --shm-size=10g \
+    --device /dev/dri/renderD128 --device /dev/dri/renderD131 \
+    -v /dev/dri/by-path:/dev/dri/by-path:ro -v /path/to/models:/models -p 8000:8000 \
+    -e ZE_AFFINITY_MASK=0,1 -e GRIMOIRE_MULTI_GPUS=2 -e GRIMOIRE_PP_SPLIT=20 \
+    -e GRIMOIRE_SEQ_SLOTS=8 -e GRIMOIRE_DEFER_MOE_GATHER=1 \
+    -e GRIMOIRE_BF16_QKV=1 -e GRIMOIRE_BF16_DN_QKV=1 \
+    grimoire-b70:latest \
+    multi --model /models/Ornith-1.5-35B-A3B-FP8 --proj fp8 --ctx 32000 --port 8000
+```
+
+`GRIMOIRE_PP_SPLIT` is the number of layers the first GPU keeps (Ornith has 40; Qwen3.8-27B has 64,
+e.g. `--proj bf16` with split 32). `multi TP` selects tensor parallel instead; it is slower here
+(every projection is gathered through host memory) and is meant only for experiments. Measured:
+Ornith-1.5-35B-A3B-FP8 on two Arc Pro B70s, 77 tok/s for one 128-token request. Use this only for
+checkpoints that do not fit one card -- a model that fits runs faster on one GPU.
 
 ### About the `-MXFP4-GRIMOIRE` folders in older results
 

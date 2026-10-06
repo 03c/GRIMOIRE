@@ -260,8 +260,16 @@ bool Tokenizer::load(const std::string& dir, std::string& err) {
         auto it = special_by_text_.find(t);
         return it == special_by_text_.end() ? -1 : it->second;
     };
+    // End of turn: ChatML's <|im_end|>, K2-Horizon's <|ifm|im_end|> (IFM
+    // prefixes every control token; with neither found K2 had NO stop token
+    // and every answer ran on to max_tokens), else <|endoftext|>.
     eos_ = find_special("<|im_end|>");
+    if (eos_ < 0) eos_ = find_special("<|ifm|im_end|>");
     if (eos_ < 0) eos_ = find_special("<|endoftext|>");
+    for (const char* t : {"<|eot|>", "<|ifm|endoftext|>", "<|endoftext|>"}) {
+        const int32_t id = find_special(t);
+        if (id >= 0 && id != eos_) { eos2_ = id; break; }
+    }
     bos_ = find_special("<|im_start|>");
 
     return true;
@@ -644,6 +652,25 @@ std::string Tokenizer::apply_chat_template(
             }
         }
         out += "<|start|>assistant";
+        return out;
+    }
+    // K2-Horizon (IFM): ChatML-like with its own markers, the BOS token
+    // first, NO newline between turns, and an assistant turn that opens a
+    // <ifm|think> block (reasoning_effort "high", the template's default).
+    // Byte-identical to the checkpoint's Jinja template for system / user /
+    // assistant turns (rendered with jinja2, 2026-10-06); an earlier assistant
+    // turn is replayed with an empty think block, as the template does when
+    // no reasoning is supplied.
+    if (special_by_text_.count("<|ifm|im_start|>")) {
+        std::string out = "<|ifm|begin_of_text|>";
+        for (const auto& message : messages) {
+            if (message.role == "system" || message.role == "user")
+                out += "<|ifm|im_start|>" + message.role + "\n" + message.content + "<|ifm|im_end|>";
+            else if (message.role == "assistant")
+                out += "<|ifm|im_start|>assistant<ifm|think>\n</ifm|think>" + message.content +
+                       "<|ifm|im_end|>";
+        }
+        out += "<|ifm|im_start|>assistant\n<ifm|think>\n";
         return out;
     }
     std::string out;
