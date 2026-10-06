@@ -56,5 +56,6 @@ Qwen3.8-27B GPTQ + MTP is unchanged from v1.8: llama-benchy tg128 62.9 at 1 user
 
 ### Image
 
-`grimoire-b70-v1.8.1.tar.gz`, SIZE bytes, sha256 `SHA256`, built from commit COMMIT (image id
+`grimoire-b70-v1.8.1.tar.gz`, 640,834,579 bytes, sha256
+`794cee4159a03ab8a693a09ee6d85f6bfd3924a2dfbfdeb62995feeeb4b9d40e`, built from commit d702908 (image id
 `0de8c1a47ecb`).
