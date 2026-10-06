@@ -15,8 +15,8 @@ The aim is straightforward: make high-performance local LLM inference possible o
 ### 1. Get the image
 
 ```
-curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.8.1/grimoire-b70-v1.8.1.tar.gz
-docker load < grimoire-b70-v1.8.1.tar.gz        # -> grimoire-b70:latest
+curl -LO https://github.com/doopeworld/GRIMOIRE/releases/download/v1.8.2/grimoire-b70-v1.8.2.tar.gz
+docker load < grimoire-b70-v1.8.2.tar.gz        # -> grimoire-b70:latest
 ```
 
 All releases are on the [Releases](https://github.com/doopeworld/GRIMOIRE/releases) page. You can also
@@ -61,8 +61,18 @@ flags in the table. The server is OpenAI-compatible at `http://<host>:8000/v1`.
   slots, `--ctx 32000` takes 8.4 GB of KV cache and leaves room for only ~1,500 prompt tokens per
   prefill pass (longer prompts are split, which is slower); `--ctx 16384` leaves ~5,900. The
   server prints the figure at startup: `prefill chunk up to N tokens per call`.
-- Decoding is greedy (leave `temperature` out or send 0). Tool calling (`tools`), `stop`,
-  `logprobs` and `response_format` are not supported yet; requests that use them get HTTP 400.
+- Decoding is greedy (leave `temperature` out or send 0). `stop`, `logprobs` and
+  `response_format` are not supported yet; requests that use them get HTTP 400.
+- **Tool calling** (OpenAI `tools` / `tool_choice`, since v1.8.2) works on Qwen3.8-27B (and its
+  fine-tunes), Ornith-1.5-35B-A3B, Agnes-3.0-Flash and Qwen3.8-Flash-Next: the prompt is rendered
+  byte-for-byte as the checkpoint's own chat template, and the model's `<tool_call>` blocks come back
+  as `tool_calls` (`finish_reason: "tool_calls"`, streamed or not). Qwen3.6-35B-A3B's newer template
+  and the K2 and Muse templates are not supported yet: a request with `tools` gets HTTP 400 there.
+- Thinking models answer with their reasoning in `reasoning_content` and the answer in
+  `content` (`chat_template_kwargs: {"enable_thinking": false}` turns thinking off).
+- A long prompt that arrives while other requests are decoding is processed in chunks of 1,024
+  tokens with the others' decoding in between (`GRIMOIRE_INTERLEAVE_CHUNK`, 0 = off): the others
+  pause for ~0.6 s at a time instead of ~2 s for a 4K prompt.
 
 ### Models, downloads, launch flags and measured speed
 
@@ -95,7 +105,7 @@ at 1 user gave 54 - 72 tok/s after pp512 and 55 - 64 after pp4096. MTP drafts wh
 requests are active (`GRIMOIRE_SPEC_MAX_SEQS`) and switches to plain batched decoding above that.
 <sup>b</sup> Measured on [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
 a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
-<sup>c</sup> v1.8 / v1.8.1, one 128-token request through the server (not llama-benchy).
+<sup>c</sup> v1.8 - v1.8.2, one 128-token request through the server (not llama-benchy).
 
 **Fine-tunes in the same format work the same way** (`--proj int4`, MTP flags as above). Tested:
 [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16)
