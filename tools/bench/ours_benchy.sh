@@ -5,7 +5,7 @@ B=/mnt/storage/isos/grimoire-runs/bench-1003; Z=$B/${ZDIR:-ours}; mkdir -p $Z
 M=Qwen3.8-27B-GPTQ-Int4-MTP-BF16; PORT=6990
 while IFS='|' read -r TAG EXTRA CONC PPS; do
   [ -z "$TAG" ] && continue; case "$TAG" in \#*) continue;; esac
-  export SRV_MODE=hostbin SRV_WAIT=1800 SRV_CTX=16384 BENCH_OUT=$B
+  export SRV_MODE=${SRV_MODE_OVERRIDE:-hostbin} SRV_WAIT=1800 SRV_CTX=16384 BENCH_OUT=$B
   export SRV_ENV="$(echo "GRIMOIRE_SPEC_STATS=1,GRIMOIRE_SEQ_SLOTS=8,$EXTRA" | tr "," "\n")"
   bash $B/srv2.sh up zc-$TAG gpu0 $PORT $M int4 > $Z/$TAG.up 2>&1 || { echo "$TAG: UP FAILED: $(tail -3 $Z/$TAG.up | tr '\n' ' ')"; continue; }
   timeout 3000 uvx llama-benchy@0.4.0 --base-url http://localhost:$PORT/v1 --model /models/$M --tokenizer /mnt/storage/Models/$M \

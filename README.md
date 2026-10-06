@@ -73,7 +73,7 @@ user.
 
 | Model | Download from Hugging Face | `--proj` | Extra flags | Decode, 1 user | Decode, 8 users | Prompt |
 |---|---|---|---|---:|---:|---:|
-| **Qwen3.8-27B** + MTP | [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) | `int4` | `-e GRIMOIRE_MTP=1`, `--ctx 16384` | **63 - 70** | **187** <sup>a</sup> | **2,078** (pp4096) |
+| **Qwen3.8-27B** + MTP | [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16) | `int4` | `-e GRIMOIRE_MTP=1`, `--ctx 16384` | **54 - 72** | **187** <sup>a</sup> | **2,070** (pp4096) |
 | Qwen3.8-27B, plain | same | `int4` | | 34.8 <sup>b</sup> | 145.3 <sup>b</sup> | 870 (pp512) |
 | **Qwen3.8-27B** + DFlash2 | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) and the draft [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) | `mxfp4` | `--dflash-model /models/Qwen3.8-27B-DFlash2` (server argument; measured without `GRIMOIRE_SEQ_SLOTS`) | **57.1** | -- | 1,294 (pp512) |
 | Qwen3.8-27B + MTP | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) | `mxfp4` | `-e GRIMOIRE_MTP=1` | 48.5 (v1.7, 3 drafts) | -- | 1,415 (pp512) |
@@ -87,9 +87,10 @@ user.
 | K2-Horizon-MoVA-36B-A4B | [IFM/K2-Horizon-MoVA-36B-A4B](https://huggingface.co/IFM/K2-Horizon-MoVA-36B-A4B) | `mxfp4` | | runs; not benchmarked yet | | |
 | Qwen3.8-Flash-Next | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) | `bf16` | `-e GRIMOIRE_EXPERT_VRAM_PER_LAYER=112 -e GRIMOIRE_PLE_FILE=/models/flash-next-ple.bin`, see [FLASH-NEXT-TIERED.md](FLASH-NEXT-TIERED.md) | runs (too large for one B70: VRAM + RAM + SSD); not benchmarked yet | | |
 
-<sup>a</sup> Release v1.8, MTP with `GRIMOIRE_SEQ_SLOTS=8`, `--ctx 16384`, total tok/s at 1 / 2 / 4 / 8
-users: pp512/tg128 63.5 / 93.7 / 118.2 / 187.0; pp4096/tg128 69.6 / 48.0 / 46.0 / 48.1 (long prompts
-from several users are prefilled one after another, so the others wait). MTP drafts while at most 4
+<sup>a</sup> Release v1.8 image, MTP with `GRIMOIRE_SEQ_SLOTS=8`, `--ctx 16384`, total tok/s at 1 / 2 / 4 /
+8 users: pp512/tg128 53.9 / 87.9 / 121.7 / 187.4; pp4096/tg128 55.2 / 78.9 / 107.9 / 149.0. Every
+llama-benchy run draws different text from its book and MTP's gain depends on the text: four runs
+at 1 user gave 54 - 72 tok/s after pp512 and 55 - 64 after pp4096. MTP drafts while at most 4
 requests are active (`GRIMOIRE_SPEC_MAX_SEQS`) and switches to plain batched decoding above that.
 <sup>b</sup> Measured on [bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/bjonor/Swift-1.5-Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
 a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
@@ -113,7 +114,7 @@ a Qwen3.8-27B fine-tune in exactly the same format (same kernels, same speed).
   yet, so leave them off there.
 
 **Prefill (prompt) speed on INT4.** Since v1.8 GPTQ / INT4 checkpoints use the same fast prefill
-path as MXFP4: 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.7.1: 1,731).
+path as MXFP4: 2,069 - 2,078 tok/s at 4,096 tokens on Qwen3.8-27B GPTQ-Int4 (v1.7.1: 1,731).
 
 ### About the `-MXFP4-GRIMOIRE` folders in older results
 
@@ -162,7 +163,7 @@ These are results recorded in the linked project commits on the developer's Arc 
 |---|---:|---|
 | Ornith-1.5-35B-A3B token generation | **198.6 tokens/s** | Single B70, command-line run, 256 generated tokens; model: the MXFP4 conversion of [ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) (see [Run a model](#run-a-model)). Through the HTTP server with llama-benchy: 193 tokens/s. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/9cd4a9191ea4ee704f9214861b3cb1c9802b3291) |
 | Ornith-1.5-35B-A3B prefill | **10,030–10,165 tokens/s** | Two-GPU pipeline-parallel run, 5,987-token prompt, same model. Output matched the single-B70 run for the checked text. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/b970875d52cf3e6cea8d354808dd7ab5ff030323) |
-| Qwen3.8-27B GPTQ-Int4 with MTP | **63–70 tokens/s**, prefill **2,078 tokens/s** | Single B70, one user, llama-benchy through the HTTP server, release v1.8 (plain decoding: 33–35); 187 tokens/s total at 8 users. Exact checkpoint and flags in [Run a model](#run-a-model). [Release v1.8](https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.8) |
+| Qwen3.8-27B GPTQ-Int4 with MTP | **54–72 tokens/s**, prefill **2,070 tokens/s** | Single B70, one user, llama-benchy through the HTTP server, release v1.8 (plain decoding: 33–35); 187 tokens/s total at 8 users. Exact checkpoint and flags in [Run a model](#run-a-model). [Release v1.8](https://github.com/doopeworld/GRIMOIRE/releases/tag/v1.8) |
 | TP decode communication batching | **59.3–60.0 tokens/s** | Recorded TP run after combining independent projection gathers; see the commit for the setup and comparison. [Commit](https://github.com/doopeworld/GRIMOIRE/commit/33757bb631606293a3af87ab76409c479a3c3015) |
 
 The two-GPU figures demonstrate an actively developed path. Tensor and pipeline parallelism are intended for models that need multiple GPUs for capacity; they are not automatically faster for a model that already fits on one card.
