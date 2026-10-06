@@ -2515,6 +2515,11 @@ struct Grimoire {
     bool restore_prefix_upto(int n);
     bool save_prefix(const std::vector<int32_t>& tokens, bool output_valid = true);
     int admit_sequence(const std::vector<int32_t>& prompt, const std::vector<bool>& busy);
+    int admit_pick_slot(const std::vector<int32_t>& prompt, const std::vector<bool>& busy, int& reused);
+    bool interleave_ok() const;
+    int admit_begin(const std::vector<int32_t>& prompt, const std::vector<bool>& busy, int& done);
+    void admit_chunk(int slot, int done, const std::vector<int32_t>& chunk);
+    void admit_end(int slot);
     // Several fresh prompts in ONE prefill (see the definition).  false =
     // nothing admitted; the caller admits them one at a time.
     bool admit_batch(const std::vector<const std::vector<int32_t>*>& prompts,
@@ -7569,12 +7574,15 @@ bool Grimoire::admit_batch(const std::vector<const std::vector<int32_t>*>& promp
     return true;
 }
 
-int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
-                            const std::vector<bool>& busy) {
+// The slot a prompt is admitted into: the one holding the longest cached
+// prefix of it (reused = its length), else an idle slot without a valid
+// snapshot, else the least recently used idle one.
+int Grimoire::admit_pick_slot(const std::vector<int32_t>& prompt,
+                              const std::vector<bool>& busy, int& reused) {
     if (busy.size() != size_t(n_seq_slots))
         throw std::invalid_argument("sequence ownership size mismatch");
     sync();
-    int reused = prefix_reuse(prompt, &busy);
+    reused = prefix_reuse(prompt, &busy);
     int slot = reused ? prefix_hit : -1;
     if (slot < 0) {
         for (int i=0; i<n_seq_slots; ++i) {
@@ -7588,6 +7596,63 @@ int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
         }
     }
     if (slot < 0) throw std::runtime_error("no idle sequence slot");
+    return slot;
+}
+
+// Admission in pieces, for the scheduler to run decode steps of the other
+// sequences between them (GRIMOIRE_INTERLEAVE_CHUNK).  admit_begin() picks
+// the slot and restores its cached prefix or clears it (done = the prompt
+// tokens already in it); admit_chunk() feeds the next part of the prompt;
+// admit_end() keeps the last hidden state for the drafter, as
+// admit_sequence() does.  The decode steps in between bind other slots and
+// move the cursor, so every chunk binds its slot and puts the cursor back.
+// One card only (interleave_ok()): under PP / TP every rank runs
+// admit_sequence() on the whole prompt in lockstep.
+bool Grimoire::interleave_ok() const {
+    return !pp_enabled() && !tp_enabled() && !dflash2.ok && !cfg.is_muse && !cfg.is_qwen4_exp;
+}
+int Grimoire::admit_begin(const std::vector<int32_t>& prompt,
+                          const std::vector<bool>& busy, int& done) {
+    int reused = 0;
+    const int slot = admit_pick_slot(prompt, busy, reused);
+    try {
+        if (reused) {
+            prefix_hit = slot;
+            if (!restore_prefix_upto(reused))
+                throw std::runtime_error("sequence prefix restore failed");
+        } else clear_seq_slot(slot);
+    } catch (...) {
+        if (size_t(slot) < prefix_slots.size()) prefix_slots[size_t(slot)].valid=false;
+        throw;
+    }
+    done = reused;
+    return slot;
+}
+void Grimoire::admit_chunk(int slot, int done, const std::vector<int32_t>& chunk) {
+    sync();
+    bind_seq_slot(slot);
+    pos = done; set_cursor(pos);
+    const int budget = prefill_token_budget();
+    for (size_t off = 0; off < chunk.size();) {
+        const size_t len = budget > 0 ? std::min(size_t(budget), chunk.size() - off) : chunk.size() - off;
+        const std::vector<int32_t> part(chunk.begin() + long(off), chunk.begin() + long(off + len));
+        // prefill() declines only before it submits work; the token-at-a-
+        // time path is the same fallback admit_sequence() uses.
+        if (!prefill(part, nullptr, nullptr, false))
+            for (int32_t t : part)
+                if (!forward(t)) throw std::runtime_error("prompt ingestion failed");
+        off += len;
+    }
+}
+void Grimoire::admit_end(int slot) {
+    sync();
+    if(!draft_slots.empty()) q.memcpy(draft_slots[size_t(slot)].hidden,s.h,size_t(cfg.hidden)*sizeof(float)).wait();
+}
+
+int Grimoire::admit_sequence(const std::vector<int32_t>& prompt,
+                            const std::vector<bool>& busy) {
+    int reused = 0;
+    const int slot = admit_pick_slot(prompt, busy, reused);
     if(serving_control && (pp_enabled() || tp_enabled()) && comm_rank()==0) {
         PPRequest request;
         request.kind=2; request.budget=slot; request.prompt=prompt;
@@ -16390,6 +16455,10 @@ struct GrimoireScheduler {
 
 void GrimoireScheduler::run() {
     std::vector<std::shared_ptr<SchedJob>> active;
+    // Prompts being admitted a chunk at a time between decode steps (see
+    // GRIMOIRE_INTERLEAVE_CHUNK below); each holds its slot, j->pos = prompt
+    // tokens processed so far.
+    std::vector<std::shared_ptr<SchedJob>> prefilling;
     std::vector<bool> slot_busy(size_t(std::max(1, e.n_seq_slots)), false);
     auto retire = [&](const std::shared_ptr<SchedJob>& j, FinishReason why,
                       bool cache = true, const std::string& err = std::string{}) {
@@ -16416,7 +16485,7 @@ void GrimoireScheduler::run() {
         std::vector<std::shared_ptr<SchedJob>> taking;
         {
             std::unique_lock<std::mutex> l(m);
-            if (active.empty() && pending.empty()) {
+            if (active.empty() && pending.empty() && prefilling.empty()) {
                 // end of a busy period: remember how concurrent it was
                 if (busy_peak > 0) {
                     prev_peak = busy_peak; busy_peak = 0;
@@ -16426,7 +16495,7 @@ void GrimoireScheduler::run() {
                 cv.wait(l, [&]{ return stopping || !pending.empty(); });
                 if (stopping && pending.empty()) return;
             }
-            while (int(active.size() + taking.size()) < width && !pending.empty()) {
+            while (int(active.size() + prefilling.size() + taking.size()) < width && !pending.empty()) {
                 taking.push_back(pending.front());
                 pending.pop_front();
             }
@@ -16446,7 +16515,7 @@ void GrimoireScheduler::run() {
             // single-user chat never waits.
             const bool lone_burst = taking.size() == 1 && prev_peak >= 2 &&
                 std::chrono::steady_clock::now() - idle_since < std::chrono::seconds(10);
-            if (hold_ms > 0 && batchable && active.empty() &&
+            if (hold_ms > 0 && batchable && active.empty() && prefilling.empty() &&
                 (taking.size() >= 2 || lone_burst) && int(taking.size()) < width) {
                 const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold_ms);
                 while (int(taking.size()) < width && !stopping) {
@@ -16478,6 +16547,34 @@ void GrimoireScheduler::run() {
         // Asked only when there is a batch to admit: the budget queries the
         // driver for free VRAM, which every decode step would otherwise pay
         // (single-user MTP lost ~10% to it).
+        // A long prompt that arrives while other requests are decoding is
+        // admitted in chunks of GRIMOIRE_INTERLEAVE_CHUNK tokens (default
+        // 1024, 0 = off), one chunk per scheduler step, so the others keep
+        // decoding instead of waiting for its whole prefill (~2 s for 4K
+        // tokens on Qwen3.8-27B).  Prompts that fit one chunk, and every
+        // prompt while nothing is decoding, take the paths below unchanged.
+        static const int il_chunk = [] {
+            const char* v = std::getenv("GRIMOIRE_INTERLEAVE_CHUNK");
+            return v && *v ? std::max(0, std::atoi(v)) : 1024; }();
+        if (il_chunk > 0 && batchable && e.interleave_ok() && (!active.empty() || !prefilling.empty())) {
+            std::vector<std::shared_ptr<SchedJob>> rest;
+            for (auto& j : taking) {
+                if (int(j->prompt.size()) <= il_chunk || cancelled(j) ||
+                    std::find(slot_busy.begin(), slot_busy.end(), false) == slot_busy.end()) {
+                    rest.push_back(j); continue;
+                }
+                try {
+                    int done = 0;
+                    j->slot = e.admit_begin(j->prompt, slot_busy, done);
+                    j->pos = done;
+                    slot_busy[size_t(j->slot)] = true;
+                    prefilling.push_back(j);
+                } catch (const std::exception& ex) {
+                    retire(j, FinishReason::Length, false, ex.what());
+                }
+            }
+            taking.swap(rest);
+        }
         std::vector<std::shared_ptr<SchedJob>> admitted_round;
         const int admit_cap = (batchable && admit_batch_tokens > 0 && taking.size() >= 2) ? [&] {
             const int b = e.prefill_token_budget();
@@ -16655,6 +16752,40 @@ void GrimoireScheduler::run() {
             else active.push_back(j);
         }
         admitted_round.clear();
+        // One chunk of the oldest interleaved admission (all of it when
+        // nothing is decoding); its first token goes out when it completes.
+        if (!prefilling.empty()) {
+            auto j = prefilling.front();
+            if (cancelled(j)) {
+                prefilling.erase(prefilling.begin());
+                retire(j, FinishReason::Cancelled, false);
+            } else {
+                try {
+                    const size_t total = j->prompt.size();
+                    do {
+                        const size_t len = std::min(size_t(il_chunk), total - size_t(j->pos));
+                        const std::vector<int32_t> chunk(j->prompt.begin() + j->pos,
+                                                         j->prompt.begin() + j->pos + long(len));
+                        e.admit_chunk(j->slot, j->pos, chunk);
+                        j->pos += int(len);
+                    } while (active.empty() && size_t(j->pos) < total);
+                    if (size_t(j->pos) == total) {
+                        prefilling.erase(prefilling.begin());
+                        e.admit_end(j->slot);
+                        j->next = e.argmax_token();
+                        const bool stop = (j->eos >= 0 && j->next == j->eos) ||
+                                          (j->eot >= 0 && j->next == j->eot);
+                        if (stop) retire(j, FinishReason::Stop);
+                        else if (!push(j, int32_t(j->next))) retire(j, FinishReason::Cancelled);
+                        else if (j->budget <= 1) retire(j, FinishReason::Length);
+                        else active.push_back(j);
+                    }
+                } catch (const std::exception& ex) {
+                    prefilling.erase(prefilling.begin());
+                    retire(j, FinishReason::Length, false, ex.what());
+                }
+            }
+        }
         if (int(active.size()) > busy_peak) busy_peak = int(active.size());
         if (active.empty()) continue;
 
